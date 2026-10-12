@@ -365,16 +365,28 @@ class TestAscendConfig(TestBase):
     ) -> None:
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "lwd_config": {"path": "/not-read-by-ascend.yaml", "role": "edge", "instance_id": 0},
-            "lwd_coordination": {"enabled": False},
+            "lwd_config": {
+                "path": "/not-read-by-ascend.yaml",
+                "role": "edge",
+                "instance_id": 0,
+                "coordination": {"enabled": False},
+            },
         }
-        snapshot = SimpleNamespace(role="edge", instance_id=0)
+        snapshot = SimpleNamespace(
+            role="edge",
+            instance_id=0,
+            coordination=SimpleNamespace(enabled=False),
+            api=SimpleNamespace(api_server_rpc_port="10.0.0.1:25100", api_server_attach=None),
+        )
         test_vllm_config.lwd_config = snapshot
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertIs(test_vllm_config.lwd_config, snapshot)
+        self.assertIs(test_vllm_config.lwd_config.coordination, snapshot.coordination)
+        self.assertIs(test_vllm_config.lwd_config.api, snapshot.api)
         self.assertEqual(test_vllm_config.additional_config["lwd_config"]["path"], "/not-read-by-ascend.yaml")
         self.assertFalse(hasattr(ascend_config, "lwd_config"))
-        self.assertFalse(hasattr(ascend_config, "lwd_coordination"))
+        self.assertFalse(hasattr(test_vllm_config, "lwd_coordination"))
+        self.assertFalse(hasattr(test_vllm_config, "lwd_api_config"))
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
