@@ -23,7 +23,7 @@ from importlib.util import find_spec as real_find_spec
 from statistics import NormalDist
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from vllm.config import KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
@@ -356,6 +356,37 @@ class TestAscendConfig(TestBase):
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertFalse(ascend_config.rl_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.ascend_config.logger")
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_lwd_metadata_is_preserved_without_becoming_platform_options(
+        self, mock_fix_incompatible_config: MagicMock, mock_logger: MagicMock
+    ) -> None:
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "lwd_config": {
+                "path": "/not-read-by-ascend.yaml",
+                "role": "edge",
+                "instance_id": 0,
+                "coordination": {"enabled": False},
+            },
+        }
+        snapshot = SimpleNamespace(
+            role="edge",
+            instance_id=0,
+            coordination=SimpleNamespace(enabled=False),
+            api=SimpleNamespace(api_server_rpc_port="10.0.0.1:25100", api_server_attach=None),
+        )
+        test_vllm_config.lwd_config = snapshot
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertIs(test_vllm_config.lwd_config, snapshot)
+        self.assertIs(test_vllm_config.lwd_config.coordination, snapshot.coordination)
+        self.assertIs(test_vllm_config.lwd_config.api, snapshot.api)
+        self.assertEqual(test_vllm_config.additional_config["lwd_config"]["path"], "/not-read-by-ascend.yaml")
+        self.assertFalse(hasattr(ascend_config, "lwd_config"))
+        self.assertFalse(hasattr(test_vllm_config, "lwd_coordination"))
+        self.assertFalse(hasattr(test_vllm_config, "lwd_api_config"))
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")
