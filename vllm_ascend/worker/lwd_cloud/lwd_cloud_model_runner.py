@@ -49,7 +49,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             if self.use_async_scheduling
             and self.speculative_config is not None
             and self.speculative_config.method == "mtp"
-            and self.pcp_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
             and self.dcp_size == 1
             else None
         )
@@ -259,7 +259,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             self.use_async_spec_decode
             and self.enable_prompt_embeds
             and intermediate_tensors is None
-            and self.pcp_size == 1
+            and self.parallel_config.prefill_context_parallel_size == 1
         ):
             self._lwd_refresh_decode_embedding_mask(scheduler_output)
             if (

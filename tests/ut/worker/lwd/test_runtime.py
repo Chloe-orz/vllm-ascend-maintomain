@@ -37,6 +37,56 @@ def load_method(path: Path, class_name: str, method_name: str, **symbols: Any) -
     return scope[method_name]
 
 
+@pytest.mark.parametrize("pcp", [1, 2])
+def test_cloud_initialization_reads_pcp_from_parallel_config(pcp: int) -> None:
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        use_async_scheduling=True,
+        speculative_config=SimpleNamespace(method="mtp"),
+        dcp_size=1,
+        use_async_spec_decode=False,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    cache = object()
+    initialize = load_method(
+        WORKER / "lwd_cloud/lwd_cloud_model_runner.py",
+        "LwdCloudModelRunner",
+        "__init__",
+        super=lambda: SimpleNamespace(__init__=lambda *_: None),
+        LwdControlDiag=SimpleNamespace(disable_down_enabled=lambda: False),
+        LwdTokenRankEncoder=lambda: None,
+        LwdDraftCache=lambda: cache,
+        hash_layer_count=lambda _: 0,
+    )
+    initialize(runner, SimpleNamespace(lwd_config=None), torch.device("cpu"))
+    assert runner._lwd_draft_cache is (cache if pcp == 1 else None)
+
+
+@pytest.mark.parametrize("pcp", [1, 2])
+def test_cloud_preprocess_reads_pcp_without_legacy_runner_attribute(pcp: int) -> None:
+    refreshed = []
+    runner = SimpleNamespace(
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp),
+        use_async_spec_decode=True,
+        enable_prompt_embeds=True,
+        model_config=SimpleNamespace(is_encoder_decoder=False),
+        supports_mm_inputs=False,
+        _lwd_refresh_decode_embedding_mask=refreshed.append,
+        _lwd_preprocess_prompt_embeds=lambda *_: "remote prompt",
+    )
+    preprocess = load_method(
+        WORKER / "lwd_cloud/lwd_cloud_model_runner.py",
+        "LwdCloudModelRunner",
+        "_preprocess",
+        super=lambda: SimpleNamespace(_preprocess=lambda *_: "native"),
+        get_pp_group=lambda: SimpleNamespace(is_first_rank=True),
+    )
+    scheduled = object()
+    result = preprocess(runner, scheduled, 4)
+    assert result == ("remote prompt" if pcp == 1 else "native")
+    assert refreshed == ([scheduled] if pcp == 1 else [])
+
+
 def test_rank_replay_uses_identical_tie_order_and_rejected_rows() -> None:
     rank = load_module("lwd_ranks", WORKER / "lwd_token_rank.py").LwdTokenRankEncoder()
     logits = torch.tensor([[2.0, 3.0, 3.0, 1.0], [4.0, 4.0, 0.0, 4.0], [0.0, 1.0, 2.0, 3.0]])
