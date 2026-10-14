@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 import torch
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -162,6 +163,20 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
                 input_ids = input_ids.to(torch.int64)
                 tid2eid_ones = self.tid2eid.to(torch.int32) if self.tid2eid is not None else None
+                context = get_forward_context() if is_forward_context_available() else None
+                remote_ids = getattr(context, "lwd_hash_expert_ids", None)
+                if self.tid2eid is not None and remote_ids is not None:
+                    from vllm_ascend.worker.lwd_hash.lwd_hash_routing import merge_hash_expert_ids
+
+                    # Batch-row IDs reuse the native TP/EP row mapping and the
+                    # native gating kernel, preserving its weights and ordering.
+                    tid2eid_ones = merge_hash_expert_ids(
+                        self.tid2eid,
+                        context.input_ids,
+                        remote_ids[:, context.lwd_hash_layer_idx],
+                        context.lwd_hash_prompt_mask,
+                    )
+                    input_ids = torch.arange(remote_ids.shape[0], device=router_logits.device, dtype=torch.int64)
                 if _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER:
                     prepare_finalize = _EXTRA_CTX.moe_comm_method.prepare_finalize
                     input_ids = prepare_finalize.all_gather_input_ids(input_ids)

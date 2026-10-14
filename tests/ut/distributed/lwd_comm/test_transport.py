@@ -236,3 +236,60 @@ def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
     with pytest.raises(RuntimeError, match="non-endpoint"):
         other.ensure_joined(0)
     wire.shutdown()
+
+
+def test_early_receive_reports_failures_instead_of_advancing(transport: SimpleNamespace) -> None:
+    pre_recv = importlib.import_module(transport.types.__package__ + ".pre_recv")
+    pre_recv.register_hint_sender(lambda hint: None)
+    assert pre_recv.hint_fields(pre_recv.make_recv_hint(0, 4)) == (0, 4, 0)
+    for seqno, tokens, aux in [(-1, 4, 0), (0, 0, 0), (0, 4, 1)]:
+        with pytest.raises(ValueError):
+            pre_recv.make_recv_hint(seqno, tokens, aux)
+    with pytest.raises(RuntimeError, match="broken receive"):
+        pre_recv.record_irecv_completions([pre_recv.LwdRecvFailure("broken receive")])
+    assert not pre_recv.is_irecv_complete(transport.types.LwdChannelType.UP, 0)
+    pre_recv.record_irecv_completions([(transport.types.LwdChannelType.UP, 0)])
+    assert pre_recv.is_irecv_complete(transport.types.LwdChannelType.UP, 0)
+
+
+def test_receive_slots_live_until_both_report_and_consumption(transport: SimpleNamespace) -> None:
+    import ast
+    import threading
+
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/lwd_cloud/lwd_cloud_worker.py"
+    tree = ast.parse(path.read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LwdCloudWorker")
+    pre_recv = importlib.import_module(transport.types.__package__ + ".pre_recv")
+    symbols = {
+        "torch": torch,
+        "threading": threading,
+        "LwdWorker": object,
+        "LwdCloudModelRunner": object,
+        "LwdChannelType": transport.types.LwdChannelType,
+        "hint_fields": pre_recv.hint_fields,
+        "_LWD_EARLY_RECV_MAX_INFLIGHT": 3,
+    }
+    module = ast.parse("from __future__ import annotations")
+    module.body.append(cls)
+    exec(compile(module, str(path), "exec"), symbols)
+    worker = symbols["LwdCloudWorker"]()
+    worker._init_lwd_early_recv_state()
+    worker._lwd_build_up_recv_request = lambda seqno, tokens, aux: seqno
+    submitted, reports = [], []
+
+    def submit(seqno: int) -> SimpleNamespace:
+        submitted.append(seqno)
+        return SimpleNamespace(done=lambda: True, result=lambda: None)
+
+    worker.comm_service = SimpleNamespace(submit_recv=submit)
+    worker._irecv_done_mq = SimpleNamespace(enqueue=reports.append)
+    for seqno in range(4):
+        worker.start_early_irecv(pre_recv.make_recv_hint(seqno, 4))
+    assert submitted == [0, 1, 2]
+    worker._report_irecv_completions()
+    assert len(reports) == 3
+    assert submitted == [0, 1, 2]  # Receiving alone must not free the buffer.
+    worker.get_or_post_early_recv(0, 4, 0)
+    assert submitted == [0, 1, 2, 3]
+    worker.start_early_irecv(pre_recv.make_recv_hint(0, 4))
+    assert submitted == [0, 1, 2, 3]  # A late duplicate cannot post another receive.

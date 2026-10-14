@@ -1317,6 +1317,35 @@ def _setup_worker_and_scheduler(
 ) -> None:
     # Select worker class and refresh block size
     parallel_config = vllm_config.parallel_config
+    if vllm_config.lwd_config is not None:
+        lwd = vllm_config.lwd_config
+        link = lwd.runtime_connection
+        ranks = link.edge.ranks if lwd.role == "edge" else link.cloud.ranks
+        if parallel_config.tensor_parallel_size != len(ranks):
+            raise ValueError("[LWD] tensor_parallel_size must match this instance's YAML ranks")
+        if any(
+            size != 1
+            for size in (
+                parallel_config.pipeline_parallel_size,
+                parallel_config.data_parallel_size,
+                parallel_config.prefill_context_parallel_size,
+                parallel_config.decode_context_parallel_size,
+            )
+        ):
+            raise ValueError("[LWD] the single-instance runtime requires PP=DP=PCP=DCP=1")
+        if lwd.topology.feature_ctrl.enable_scramble:
+            raise ValueError("[LWD] payload scrambling has not been migrated to the single-domain runtime")
+        expected_worker = (
+            "vllm_ascend.worker.lwd_edge_worker.LwdEdgeWorker"
+            if lwd.role == "edge"
+            else "vllm_ascend.worker.lwd_cloud.lwd_cloud_worker.LwdCloudWorker"
+        )
+        if parallel_config.worker_cls not in ("auto", expected_worker):
+            raise ValueError("[LWD] custom worker overrides are not supported by this runtime")
+        if lwd.role == "edge":
+            parallel_config.worker_cls = "vllm_ascend.worker.lwd_edge_worker.LwdEdgeWorker"
+        else:
+            parallel_config.worker_cls = "vllm_ascend.worker.lwd_cloud.lwd_cloud_worker.LwdCloudWorker"
     if parallel_config and parallel_config.worker_cls == "auto":
         hardware_profile = get_current_hardware_profile()
         if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(

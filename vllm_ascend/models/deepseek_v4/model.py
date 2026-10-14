@@ -383,6 +383,11 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.hash and is_forward_context_available():
+            context = get_forward_context()
+            if getattr(context, "lwd_hash_expert_ids", None) is not None:
+                context.lwd_hash_layer_idx = self.layer_idx
+                input_ids = context.input_ids
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 

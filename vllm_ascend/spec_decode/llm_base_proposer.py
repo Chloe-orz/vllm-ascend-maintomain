@@ -1165,6 +1165,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             inputs_embeds = None
 
+        inputs_embeds = self._prepare_first_pass_inputs_embeds(
+            inputs_embeds,
+            num_tokens,
+            num_input_tokens,
+            common_attn_metadata,
+        )
+
         # Update slot_mapping for different speculative.
         # NOTE: Currently, we only remake the slot_mapping, because it's the
         # only tensor which will be used in current FIA.
@@ -1413,6 +1420,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             logits = self.model.compute_logits(hidden_states)
             return self._sample_draft_from_logits(logits, sampling_metadata)
+
+    def _prepare_first_pass_inputs_embeds(
+        self,
+        inputs_embeds: torch.Tensor | None,
+        num_tokens: int,
+        num_input_tokens: int,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        return inputs_embeds
 
     def _run_merged_draft(
         self,
