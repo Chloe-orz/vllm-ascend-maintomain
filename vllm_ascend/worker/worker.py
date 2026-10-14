@@ -119,6 +119,8 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_grap
 
 
 class NPUWorker(WorkerBase):
+    model_runner_cls = NPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -502,7 +504,7 @@ class NPUWorker(WorkerBase):
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
         else:
-            self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+            self.model_runner = self.model_runner_cls(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
