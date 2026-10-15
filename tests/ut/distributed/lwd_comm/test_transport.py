@@ -174,6 +174,67 @@ def test_missing_receive_sequence_is_reported_as_queued(transport: SimpleNamespa
     service.shutdown()
 
 
+@pytest.mark.parametrize("is_edge", [True, False])
+@pytest.mark.parametrize("channel", ["up", "down"])
+def test_probe_uses_the_same_bounded_transport_for_either_role(
+    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, is_edge: bool, channel: str
+) -> None:
+    t = transport
+    probe = importlib.import_module(t.types.__package__ + ".probe")
+    t.wire.is_edge, t.wire.domain_rank = is_edge, 0 if is_edge else 1
+    plan = probe.LwdProbePlan(batches=7, tokens=(1, 4, 2), hidden_size=8, window=3, channel=channel)
+    payloads, posts_at_wait = [], []
+
+    def post(channel: object, tensor: torch.Tensor, peer: int | None) -> None:
+        expected = probe.make_payload(len(payloads), tensor.numel())
+        if is_edge == (plan.channel == "up"):
+            assert torch.equal(tensor, expected)
+        else:
+            tensor.copy_(expected)
+        payloads.append(tensor.clone())
+
+    original_wait = t.future.LwdCommFuture.wait
+
+    def wait(future: Any, timeout: float | None = None) -> Any:
+        posts_at_wait.append(len(payloads))
+        return original_wait(future, timeout)
+
+    t.wire.p2p_send = t.wire.p2p_recv = post
+    monkeypatch.setattr(t.future.LwdCommFuture, "wait", wait)
+    service = t.service.LwdCommService(t.wire)
+    probe.run_batches(service, t.wire, plan)
+    assert [tensor.numel() for tensor in payloads] == [8, 32, 16, 8, 32, 16, 8]
+    assert posts_at_wait == [3, 4, 5, 6, 7, 7, 7]
+    service.shutdown()
+
+
+def test_probe_rejects_corrupt_or_reordered_payload(transport: SimpleNamespace) -> None:
+    t = transport
+    probe = importlib.import_module(t.types.__package__ + ".probe")
+    t.wire.is_edge, t.wire.domain_rank = False, 1
+    t.wire.p2p_recv = lambda channel, tensor, peer: tensor.copy_(probe.make_payload(1, tensor.numel()))
+    with pytest.raises(ValueError, match="payload mismatch seqno=0"):
+        probe.run_batches(t.service.LwdCommService(t.wire), t.wire, probe.LwdProbePlan(batches=1))
+
+
+@pytest.mark.parametrize("peer_payload", ['{"code":"old","batches":1}', '{"code":"same","batches":2}'])
+def test_probe_rejects_peer_code_or_plan_mismatch(transport: SimpleNamespace, peer_payload: str) -> None:
+    probe = importlib.import_module(transport.types.__package__ + ".probe")
+    store = SimpleNamespace(
+        set=lambda key, value: None, wait=lambda keys, timeout: None, get=lambda key: peer_payload.encode()
+    )
+    with pytest.raises(ValueError, match="peer plan mismatch"):
+        probe.exchange_check(store, "edge", "plan", '{"code":"same","batches":1}', 1.0)
+    probe.exchange_check(store, "cloud", "plan", peer_payload, 1.0)
+
+
+@pytest.mark.parametrize("invalid", [{"tokens": (0,)}, {"hidden_size": 4}, {"window": 0}, {"batches": 0}])
+def test_probe_rejects_invalid_transfer_plan(transport: SimpleNamespace, invalid: dict[str, object]) -> None:
+    probe = importlib.import_module(transport.types.__package__ + ".probe")
+    with pytest.raises(ValueError):
+        probe.LwdProbePlan(**invalid)
+
+
 def test_post_failure_fails_waiters_without_releasing_possible_dma(transport: SimpleNamespace) -> None:
     t = transport
     service = t.service.LwdCommService(t.wire)
