@@ -10,6 +10,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import logger
 
 from .future import LwdCommFuture
 from .types import LwdChannelType, LwdCommRequest
@@ -53,6 +54,16 @@ class LwdChannel:
                 request = replace(request)
             future = LwdCommFuture(request, producer_event=producer_event)
             self._held[seqno] = future
+            future._trace("queued")
+            if seqno != self._next_seqno:
+                logger.debug(
+                    "[LWD][comm] held connection=%s channel=%s op=%s seqno=%d waiting_for_seqno=%d",
+                    self._wire.key,
+                    self.channel_type.value,
+                    self.op,
+                    seqno,
+                    self._next_seqno,
+                )
             self._drain()
             return future
 
@@ -101,6 +112,7 @@ class LwdChannel:
             self._next_seqno += 1
 
     def _execute(self, future: LwdCommFuture) -> None:
+        future._trace("posting")
         self._wire.ensure_joined()
         stream = self._wire.get_channel_stream(self.channel_type)
         request = future.request
@@ -117,6 +129,7 @@ class LwdChannel:
             event = torch.npu.Event()
             event.record()
         future._bind(event, tensor)
+        future._trace("posted")
 
     def skip_seqno(self, seqno: int) -> None:
         with self._lock:
