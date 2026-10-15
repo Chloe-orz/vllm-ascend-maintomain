@@ -3,11 +3,19 @@
 
 import torch
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 
 
 class LwdMTPProposer(AscendEagleProposer):
+    def _backup_token_id(self, req_state: CachedRequestState, idx: int) -> int:
+        # Cloud prompt IDs are unknown. Zero only fills the backup slot for
+        # unfinished prefill; the first-pass hook supplies remote prompt embeds.
+        if req_state.prompt_token_ids is None and 0 <= idx < req_state.num_prompt_tokens:
+            return 0
+        return req_state.get_token_id(idx)
+
     def _prepare_first_pass_inputs_embeds(
         self,
         inputs_embeds: torch.Tensor | None,

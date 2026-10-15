@@ -5,9 +5,10 @@ import ast
 import importlib.util
 from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -121,6 +122,66 @@ def test_hash_prompt_requires_received_rows_but_decode_uses_real_tokens() -> Non
     assert merged.tolist() == [[6, 7], [4, 5], [6, 7]]
     with pytest.raises(ValueError, match="out of range"):
         state.add_chunk("p", 4, 2, torch.tensor([[[8, 0]]]))
+
+
+def make_mtp_request(prompt_ids: list[int] | None, prompt_len: int, output_ids: list[int]) -> SimpleNamespace:
+    spec = importlib.util.find_spec("vllm")
+    assert spec is not None and spec.origin is not None
+    get_token_id = load_method(
+        Path(spec.origin).parent / "v1/worker/gpu_input_batch.py", "CachedRequestState", "get_token_id"
+    )
+    request = SimpleNamespace(prompt_token_ids=prompt_ids, num_prompt_tokens=prompt_len, output_token_ids=output_ids)
+    request.get_token_id = MethodType(get_token_id, request)
+    return request
+
+
+def test_mtp_backup_handles_chunked_prompt_and_mixed_decode_batch() -> None:
+    path = ROOT / "vllm_ascend/spec_decode/llm_base_proposer.py"
+    prepare = load_method(
+        path,
+        "AscendSpecDecodeBaseProposer",
+        "prepare_next_token_ids_padded",
+        np=np,
+        DeviceOperator=SimpleNamespace(index_fill=torch.index_fill),
+    )
+    backup = load_method(WORKER / "lwd_cloud/lwd_mtp_proposer.py", "LwdMTPProposer", "_backup_token_id")
+    requests = {
+        "chunk": make_mtp_request(None, 1572, []),
+        "tokens": make_mtp_request([41, 42], 2, []),
+        "decode": make_mtp_request(None, 2, [60]),
+        "completed": make_mtp_request(None, 2, [70]),
+    }
+    buffer = SimpleNamespace(np=np.empty(4, dtype=np.int64), gpu=torch.empty(4, dtype=torch.int64))
+    buffer.copy_to_gpu = lambda n: buffer.gpu[:n].copy_(torch.from_numpy(buffer.np[:n]))
+    proposer = SimpleNamespace(backup_next_token_ids=buffer)
+    proposer._backup_token_id = MethodType(backup, proposer)
+    batch = SimpleNamespace(
+        num_reqs=4, req_ids=list(requests), num_tokens_no_spec=np.array([1572, 2, 3, 3]), vocab_size=100
+    )
+    sampled = torch.tensor([[99, -1, -1, -1], [98, -1, -1, -1], [51, 52, -1, -1], [70, -1, -1, -1]])
+    next_ids, valid_counts = prepare(proposer, sampled, requests, batch, torch.tensor([0, 1]), 2)
+    assert buffer.np.tolist() == [0, 42, 60, 70]
+    assert next_ids.tolist() == [0, 42, 52, 70]
+    assert valid_counts.tolist() == [0, 0, 2, 1]
+
+
+@pytest.mark.parametrize("lwd", [False, True])
+def test_mtp_backup_preserves_token_lookup_and_invalid_indices(lwd: bool) -> None:
+    path, cls = (
+        (WORKER / "lwd_cloud/lwd_mtp_proposer.py", "LwdMTPProposer")
+        if lwd
+        else (ROOT / "vllm_ascend/spec_decode/llm_base_proposer.py", "AscendSpecDecodeBaseProposer")
+    )
+    backup = load_method(path, cls, "_backup_token_id")
+    tokens = make_mtp_request([11, 12], 2, [13])
+    assert [backup(None, tokens, i) for i in range(4)] == [11, 12, 13, -1]
+    embeds = make_mtp_request(None, 2, [13])
+    assert backup(None, embeds, 2) == 13
+    with pytest.raises(ValueError, match="ID is unknown"):
+        backup(None, embeds, -1)
+    if not lwd:
+        with pytest.raises(ValueError, match="ID is unknown"):
+            backup(None, embeds, 1)
 
 
 def test_mtp_mixed_batch_shifts_remote_prompt_only() -> None:

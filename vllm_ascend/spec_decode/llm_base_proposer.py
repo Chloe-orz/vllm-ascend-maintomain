@@ -2172,6 +2172,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         return common_attn_metadata, attn_metadata
 
+    def _backup_token_id(self, req_state: CachedRequestState, idx: int) -> int:
+        return req_state.get_token_id(idx)
+
     def prepare_next_token_ids_padded(
         self,
         sampled_token_ids: torch.Tensor,
@@ -2195,7 +2198,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
+            [self._backup_token_id(requests[gpu_input_batch.req_ids[i]], seq_lens_list[i]) for i in range(num_reqs)]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
