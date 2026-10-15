@@ -149,7 +149,7 @@ def test_pending_dma_retains_its_buffer_after_timeout(transport: SimpleNamespace
     service = t.service.LwdCommService(t.wire)
     future = service.submit_send(send(t, 0))
     future._done_event.complete = False
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError, match="seqno=0 timed out stage=device_pending"):
         future.wait(0)
     with pytest.raises(RuntimeError, match="could not drain"):
         service.shutdown(timeout=0)
@@ -159,6 +159,19 @@ def test_pending_dma_retains_its_buffer_after_timeout(transport: SimpleNamespace
     assert future.request.tensor is None
     with pytest.raises(RuntimeError, match="closed"):
         service.submit_send(send(t, 1))
+
+
+def test_missing_receive_sequence_is_reported_as_queued(transport: SimpleNamespace) -> None:
+    t = transport
+    service = t.service.LwdCommService(t.wire)
+    request = t.types.LwdCommRequest(t.types.LwdChannelType.DOWN, "recv", 3, seqno=1, connection_key=t.wire.key)
+    future = service.submit_recv(request)
+    with pytest.raises(TimeoutError, match="lwd_down seqno=1 timed out stage=queued"):
+        future.wait(0)
+    assert not t.events
+    service.submit_recv(replace(request, seqno=0))
+    assert future.wait(0).tensor.tolist() == [9, 9, 9]
+    service.shutdown()
 
 
 def test_post_failure_fails_waiters_without_releasing_possible_dma(transport: SimpleNamespace) -> None:
