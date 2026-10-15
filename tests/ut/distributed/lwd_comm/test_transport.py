@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Host ordering tests with CPU tensors and simulated device completions."""
 
+import ast
 import importlib
 import importlib.util
 import sys
@@ -10,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -317,3 +319,113 @@ def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
     with pytest.raises(RuntimeError, match="non-endpoint"):
         other.ensure_joined(0)
     wire.shutdown()
+
+
+@pytest.fixture
+def startup_probe(transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    probe = importlib.import_module(transport.types.__package__ + ".probe")
+    config = SimpleNamespace(
+        role="edge",
+        topology=SimpleNamespace(deployment=SimpleNamespace(scene="single_instance")),
+        connections=(object(),),
+        instance=SimpleNamespace(dp=(SimpleNamespace(ranks=(0, 1)),)),
+    )
+    parallel = SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1, prefill_context_parallel_size=1)
+    group = SimpleNamespace(world_size=2, rank_in_group=0, broadcast_object=Mock(side_effect=lambda value, src: value))
+    run = Mock(return_value=transport.wire)
+    monkeypatch.setattr(probe, "run_probe", run)
+    return SimpleNamespace(probe=probe, config=config, parallel=parallel, group=group, run=run, wire=transport.wire)
+
+
+@pytest.mark.parametrize("role,size", [("edge", 2), ("cloud", 8)])
+def test_startup_probe_uses_parsed_config_once_per_tp_group(
+    startup_probe: SimpleNamespace, role: str, size: int
+) -> None:
+    t = startup_probe
+    t.config.role = role
+    t.config.instance.dp[0].ranks = tuple(range(size))
+    t.group.world_size = size
+    device = torch.device("cpu")
+    wire = t.probe.run_startup_probe(t.config, t.parallel, device, t.group)
+    assert wire is t.wire
+    t.run.assert_called_once_with(t.config, device, t.probe.LwdProbePlan())
+    t.group.broadcast_object.assert_called_once_with(None, src=0)
+    t.group.rank_in_group = 1
+    assert t.probe.run_startup_probe(t.config, t.parallel, device, t.group) is None
+    assert t.run.call_count == 1
+    assert t.group.broadcast_object.call_count == 2
+
+
+@pytest.mark.parametrize("failure", [TimeoutError("peer absent"), ValueError("payload mismatch")])
+def test_startup_probe_failure_stops_all_local_tp_workers(startup_probe: SimpleNamespace, failure: Exception) -> None:
+    t = startup_probe
+    t.run.side_effect = failure
+    with pytest.raises(RuntimeError, match=str(failure)) as caught:
+        t.probe.run_startup_probe(t.config, t.parallel, torch.device("cpu"), t.group)
+    assert caught.value.__cause__ is failure
+    t.group.broadcast_object.assert_called_once_with(str(failure), src=0)
+    t.group.rank_in_group = 1
+    t.group.broadcast_object.side_effect = None
+    t.group.broadcast_object.return_value = str(failure)
+    with pytest.raises(RuntimeError, match=str(failure)):
+        t.probe.run_startup_probe(t.config, t.parallel, torch.device("cpu"), t.group)
+    assert t.run.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["pipeline_parallel_size", "data_parallel_size", "prefill_context_parallel_size", "ranks", "scene", "links"],
+)
+def test_startup_probe_rejects_ambiguous_endpoints_before_join(startup_probe: SimpleNamespace, fault: str) -> None:
+    t = startup_probe
+    if fault == "ranks":
+        t.config.instance.dp[0].ranks = (0,)
+    elif fault == "scene":
+        t.config.topology.deployment.scene = "cloud_share"
+    elif fault == "links":
+        t.config.connections = (object(), object())
+    else:
+        setattr(t.parallel, fault, 2)
+    with pytest.raises(ValueError):
+        t.probe.run_startup_probe(t.config, t.parallel, torch.device("cpu"), t.group)
+    t.run.assert_not_called()
+    t.group.broadcast_object.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["centralized", "lwd", "failed"])
+def test_worker_startup_only_continues_after_required_wire_check(
+    startup_probe: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    t = startup_probe
+    path = Path(__file__).resolve().parents[4] / "vllm_ascend/worker/worker.py"
+    worker_cls = next(node for node in ast.parse(path.read_text()).body if isinstance(node, ast.ClassDef))
+    method = next(node for node in worker_cls.body if isinstance(node, ast.FunctionDef) and node.name == "init_device")
+    # Exercise the real startup method without loading the NPU backend on CPU CI.
+    module = ast.Module(body=[method], type_ignores=[])
+    runner = Mock()
+    scope = {
+        "get_tp_group": lambda: t.group,
+        "init_workspace_manager": Mock(),
+        "NPUModelRunner": runner,
+        "report_usage_stats": Mock(),
+    }
+    exec(compile(module, str(path), "exec"), scope)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.distributed.lwd_comm.probe", t.probe)
+    worker = SimpleNamespace(
+        _init_device=lambda: torch.device("cpu"),
+        vllm_config=SimpleNamespace(lwd_config=None if mode == "centralized" else t.config),
+        parallel_config=t.parallel,
+        use_v2_model_runner=False,
+        rank=0,
+    )
+    if mode == "failed":
+        t.run.side_effect = TimeoutError("peer absent")
+        with pytest.raises(RuntimeError, match="peer absent"):
+            scope["init_device"](worker)
+        runner.assert_not_called()
+    else:
+        scope["init_device"](worker)
+        runner.assert_called_once_with(worker.vllm_config, worker.device)
+        assert t.run.call_count == (0 if mode == "centralized" else 1)
+        if mode == "lwd":
+            assert worker._lwd_probe_wire is t.wire

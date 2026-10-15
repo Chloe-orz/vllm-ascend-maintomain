@@ -1,9 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Exercise the production LWD transport without a model or control scheduler."""
+"""Check the LWD transport during ordinary centralized worker startup."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import subprocess
 from collections import deque
@@ -20,6 +19,9 @@ from .types import LwdChannelType, LwdCommRequest
 
 if TYPE_CHECKING:
     from torch.distributed import Store
+    from vllm.config import ParallelConfig
+    from vllm.config.lwd import LwdConfig
+    from vllm.distributed.parallel_state import GroupCoordinator
 
     from .future import LwdCommFuture
     from .lwd_wire import LwdWire
@@ -113,28 +115,12 @@ def run_batches(service: LwdCommService, wire: LwdWire, plan: LwdProbePlan) -> N
         complete(pending.popleft())
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True, help="JSON file containing lwd_config")
-    parser.add_argument("--device", type=int, default=0, help="Local index after ASCEND_RT_VISIBLE_DEVICES")
-    parser.add_argument("--batches", type=int, default=200)
-    parser.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 2, 8])
-    parser.add_argument("--hidden-size", type=int, default=5120)
-    parser.add_argument("--window", type=int, default=4, help="Maximum outstanding transfers per endpoint")
-    parser.add_argument("--channel", choices=("up", "down"), default="up")
-    args = parser.parse_args()
-    plan = LwdProbePlan(args.batches, tuple(args.tokens), args.hidden_size, args.window, args.channel)
-
-    # Load the hardware backend only when running, so --help needs no NPU.
-    import torch_npu  # noqa: F401
+def run_probe(config: LwdConfig, device: torch.device, plan: LwdProbePlan) -> LwdWire:
     import vllm.config.lwd as lwd
 
     from .lwd_wire import LwdWire
     from .service import LwdCommService
 
-    config = lwd.LwdConfig.from_dict(json.loads(args.config.read_text())["lwd_config"])
-    torch.npu.set_device(args.device)
-    device = torch.device("npu", args.device)
     wire = LwdWire(config, tp_rank=0, device=device)
     service = LwdCommService(wire)
     topology = asdict(config.topology)
@@ -166,7 +152,39 @@ def main() -> None:
         wire._store.set("lwd_probe/cloud_done", "1")
     service.shutdown(timeout=wire.timeout_s)
     logger.info("[LWD][wire-test] PASS role=%s channel=%s batches=%d", config.role, plan.channel, plan.batches)
+    return wire
 
 
-if __name__ == "__main__":
-    main()
+def run_startup_probe(
+    config: LwdConfig, parallel: ParallelConfig, device: torch.device, tp_group: GroupCoordinator
+) -> LwdWire | None:
+    if config.topology.deployment.scene != "single_instance" or len(config.connections) != 1:
+        raise ValueError("[LWD][wire-test] startup test requires single_instance DP=1")
+    if any(
+        size != 1
+        for size in (
+            parallel.pipeline_parallel_size,
+            parallel.data_parallel_size,
+            parallel.prefill_context_parallel_size,
+        )
+    ):
+        raise ValueError("[LWD][wire-test] startup test requires PP=DP=PCP=1")
+    if len(config.instance.dp[0].ranks) != tp_group.world_size:
+        raise ValueError("[LWD][wire-test] YAML rank count must match the local tensor-parallel size")
+
+    wire = None
+    failure = None
+    if tp_group.rank_in_group == 0:
+        logger.info("[LWD][wire-test] starting before centralized model loading, role=%s", config.role)
+        try:
+            wire = run_probe(config, device, LwdProbePlan())
+        except Exception as exc:
+            failure = exc
+    # Other TP workers wait here, so none enter model collectives before the
+    # endpoint finishes; a failed endpoint stops every local worker.
+    error = tp_group.broadcast_object(str(failure) if failure is not None else None, src=0)
+    if error is not None:
+        raise RuntimeError(f"[LWD][wire-test] startup test failed: {error}") from failure
+    if tp_group.rank_in_group == 0:
+        logger.info("[LWD][wire-test] continuing centralized model loading")
+    return wire
