@@ -254,8 +254,9 @@ def test_post_failure_fails_waiters_without_releasing_possible_dma(transport: Si
     assert channel._failed[0].request.tensor is not None
 
 
+@pytest.mark.parametrize("role,domain_rank", [("edge", 0), ("cloud", 1)])
 def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
-    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, role: str, domain_rank: int
 ) -> None:
     t = transport
     calls = []
@@ -270,12 +271,9 @@ def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
         cloud=SimpleNamespace(addr="cloud", ranks=(4, 0, 3, 1)),
     )
     cfg = SimpleNamespace(
-        role="edge",
+        role=role,
         topology=SimpleNamespace(deployment=SimpleNamespace(scene="single_instance")),
         connections=(link,),
-        transport=SimpleNamespace(
-            post_out_host=None, wire_store_port=29600, wire_timeout_s=1, endpoints=lambda link: {}
-        ),
     )
 
     class PG:
@@ -296,12 +294,21 @@ def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
         send=lambda tensor, peer, comm: None, recv=lambda tensor, peer, comm: tensor.fill_(1 + peer)
     )
     monkeypatch.setitem(sys.modules, hccl.__name__, hccl)
-    monkeypatch.setattr(module.dist, "TCPStore", lambda *args, **kwargs: object())
+    store_calls = []
+
+    def tcp_store(*args: object, **kwargs: object) -> object:
+        store_calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(module.dist, "TCPStore", tcp_store)
     monkeypatch.setattr(module.dist, "PrefixStore", lambda *args: object())
     wire = module.LwdWire(cfg, 0, torch.device("cpu"))
     wire.join_async()
     wire.ensure_joined(1)
-    assert calls == [(0, 2)]
+    assert calls == [(domain_rank, 2)]
+    args, kwargs = store_calls[0]
+    assert args == ("edge", 29600, 2, role == "edge")
+    assert kwargs["timeout"].total_seconds() == 1200
     assert len(wire._streams) == 2 and wire._comm == 123
     assert wire.connection.edge_ranks == (5, 2)
     other = module.LwdWire(cfg, 1, torch.device("cpu"))

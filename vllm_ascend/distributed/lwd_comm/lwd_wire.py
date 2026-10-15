@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 LWD_HCCL_BUFFER_SIZE_MB = 200
 LWD_WARMUP_ELEMENTS = 8
+LWD_WIRE_STORE_PORT_DEFAULT = 29600
+LWD_WIRE_TIMEOUT_S_DEFAULT = 1200.0
 
 
 class LwdWire:
@@ -41,11 +43,10 @@ class LwdWire:
         self.device, self.dtype = device, dtype
         if dtype not in (torch.bfloat16, torch.float16, torch.float32):
             raise ValueError("[LWD] unsupported hidden-state dtype")
-        transport = config.transport
-        transport.endpoints(config.connections[0])
-        self.store_host = transport.post_out_host or config.connections[0].edge.addr
-        self.store_port = transport.wire_store_port
-        self.timeout_s = transport.wire_timeout_s
+        # Keep the no-PP bootstrap separate from the YAML control-plane socket.
+        self.store_host = config.connections[0].edge.addr
+        self.store_port = LWD_WIRE_STORE_PORT_DEFAULT
+        self.timeout_s = LWD_WIRE_TIMEOUT_S_DEFAULT
         self._done = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
