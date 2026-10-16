@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import json
-
 import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import get_tp_group
@@ -60,9 +58,6 @@ class LwdWorker(LwdEarlyRecv, NPUWorker):
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._early_recv_enabled = config.topology.feature_ctrl.enable_early_recv
         self._init_lwd_early_recv_state()
-        self._lwd_probe_round = 0
-        self._lwd_probe_next = {channel: 0 for channel in LwdChannelType}
-        self._lwd_probe_error: str | None = None
         self.lwd_wire.init_lwd_duplex_channels()
         logger.info(
             "[LWD][worker] role=%s tp_rank=%d connection=%s endpoint=%s; transport retained until shutdown",
@@ -88,33 +83,6 @@ class LwdWorker(LwdEarlyRecv, NPUWorker):
         self.lwd_sync_error(error)
         # Include HCCL buffers in profiling before the native KV cache budget is fixed.
         return super().determine_available_memory()
-
-    def send_lwd_tensor(self, tensor: torch.Tensor | None, channel: LwdChannelType, seqno: int) -> LwdCommFuture | None:
-        if not self.lwd_wire.member:
-            return None
-        if tensor is None:
-            raise ValueError("[LWD] sending endpoint requires a tensor")
-        return self.comm_service.submit_send(
-            LwdCommRequest(channel, "send", tensor.numel(), tensor, seqno=seqno, connection_key=self.lwd_wire.key)
-        )
-
-    def submit_lwd_recv(self, numel: int, channel: LwdChannelType, seqno: int) -> LwdCommFuture | None:
-        if not self.lwd_wire.member:
-            return None
-        return self.comm_service.submit_recv(
-            LwdCommRequest(channel, "recv", numel, seqno=seqno, connection_key=self.lwd_wire.key)
-        )
-
-    def wait_lwd_send(self, future: LwdCommFuture | None) -> None:
-        error = None
-        if self.lwd_wire.member:
-            try:
-                if future is None:
-                    raise RuntimeError("[LWD] endpoint is missing its send")
-                future.wait(timeout=self.lwd_wire.timeout_s)
-            except Exception as exc:
-                error = str(exc)
-        self.lwd_sync_error(error)
 
     def receive_lwd_tensor(self, future: LwdCommFuture | None, numel: int) -> torch.Tensor:
         tensor, error = None, None
@@ -148,19 +116,6 @@ class LwdWorker(LwdEarlyRecv, NPUWorker):
             seqno=seqno,
             connection_key=self.lwd_wire.key,
         )
-
-    def lwd_run_probe(self, plan_json: str = "{}") -> dict[str, str | int]:
-        from vllm_ascend.distributed.lwd_comm.probe import LwdProbePlan, run_probe
-
-        if self._lwd_probe_error is not None:
-            raise RuntimeError(f"[LWD] restart after failed probe: {self._lwd_probe_error}")
-        plan = LwdProbePlan(**json.loads(plan_json))
-        try:
-            return run_probe(self, plan)
-        except Exception as exc:
-            # A timed-out device operation may still own buffers; do not reuse its sequence.
-            self._lwd_probe_error = str(exc)
-            raise
 
     def shutdown(self) -> None:
         try:

@@ -38,7 +38,6 @@ class LwdWire:
         self._groups: dict[LwdChannelType, dist.ProcessGroup] = {}
         self._streams: dict[LwdChannelType, Any] = {}
         self._ready = False
-        self._store: dist.Store | None = None
 
     def init_lwd_duplex_channels(self) -> None:
         if self._ready:
@@ -53,7 +52,6 @@ class LwdWire:
         for channel in LwdChannelType:
             self._groups[channel] = dist.new_group(endpoints, backend=backend)
             self._streams[channel] = torch.npu.Stream()
-        self._store = dist.distributed_c10d._get_default_store()
         self.warmup_lwd_duplex_channels()
         self._ready = True
         logger.info(
