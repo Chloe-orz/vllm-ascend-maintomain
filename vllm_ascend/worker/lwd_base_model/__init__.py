@@ -4,4 +4,6 @@
 - ``lwd_worker_base``: common NPUWorker base for the edge/cloud workers
 - ``lwd_pinned_staging``: rotating pinned staging buffers shared by
   edge/cloud host transfers
+- ``lwd_base_model_runner``: LWD runner base (worker back-ref + named
+  lazy staging factory)
 """

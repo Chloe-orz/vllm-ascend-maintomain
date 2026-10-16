@@ -112,8 +112,11 @@ def test_draft_cache_weave_removed() -> None:
 def test_pinned_staging_single_implementation() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     edge = _EDGE.read_text(encoding="utf-8")
-    assert runner.count("LwdPinnedStaging(") == 2  # meta + h2d staging
-    assert edge.count("LwdPinnedStaging(") == 1  # ids staging
+    base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
+    assert base.count("LwdPinnedStaging(") == 1  # 具名惰性工厂是唯一构造点
+    assert runner.count("LwdPinnedStaging(") == 0  # 云侧经 _lwd_staging 委托
+    assert runner.count("self._lwd_staging(") == 2  # down_meta + down_index
+    assert edge.count("LwdPinnedStaging(") == 1  # ids staging(Phase 2 迁移后归零)
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):
         assert stale not in runner, f"hand-rolled rotation leaked: {stale}"
     assert "_lwd_ids_ring_idx" not in edge

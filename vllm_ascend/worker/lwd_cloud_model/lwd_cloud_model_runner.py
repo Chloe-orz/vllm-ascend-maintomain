@@ -24,7 +24,7 @@ from vllm.logger import logger
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend import envs
-from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
+from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
@@ -72,7 +72,7 @@ class LwdDownSelection(NamedTuple):
     seg_lens_host: list[int] | None
 
 
-class LwdCloudModelRunner(NPUModelRunner):
+class LwdCloudModelRunner(LwdBaseModelRunner):
     """NPUModelRunner + prefill_only LWD cloud-side runner logic."""
 
     # Config-derived constants, computed once at first use; lwd_config and
@@ -86,8 +86,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         device: "torch.device",
         worker: "LwdCloudWorker | None" = None,
     ) -> None:
-        super().__init__(vllm_config, device)
-        self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
+        super().__init__(vllm_config, device, worker)
         self._lwd_pending_down_payload = None
         # Stage per-request prompt lengths for device-side mask refresh.
         if self.use_async_spec_decode and self.enable_prompt_embeds:
@@ -1091,11 +1090,9 @@ class LwdCloudModelRunner(NPUModelRunner):
         避免下一/N+2 步的边流拷贝覆盖引擎尚未读完的上一步 meta。
         对当关系:LwdPinnedStaging.next_pinned ≍ 原手写 4 槽列表轮换
         (容量下限 4096 同旧值)。"""
-        ring = getattr(self, "_lwd_meta_ring", None)
-        if ring is None:
-            ring = LwdPinnedStaging(dtype=torch.int32, min_capacity=4096)
-            self._lwd_meta_ring = ring
-        return ring.next_pinned(n)
+        return self._lwd_staging(
+            "down_meta", dtype=torch.int32, min_capacity=4096, device_mirror=False,
+        ).next_pinned(n)
 
     def _lwd_h2d_stage_i64(self, arr: "np.ndarray") -> torch.Tensor:
         """int64 host 索引数组的异步 H2D 暂存(pinned 4 槽轮换 +
@@ -1105,10 +1102,6 @@ class LwdCloudModelRunner(NPUModelRunner):
         防止下步 host 覆写时上步拷贝尚未执行。
         对当关系:LwdPinnedStaging.stage_to_device ≍ 原手写 pinned+device 4 槽对
         轮换(容量下限 1024 同旧值)。"""
-        ring = getattr(self, "_lwd_h2d_ring", None)
-        if ring is None:
-            ring = LwdPinnedStaging(
-                dtype=torch.int64, min_capacity=1024, device=self.device,
-            )
-            self._lwd_h2d_ring = ring
-        return ring.stage_to_device(arr, arr.size)
+        return self._lwd_staging(
+            "down_index", dtype=torch.int64, min_capacity=1024,
+        ).stage_to_device(arr, arr.size)
