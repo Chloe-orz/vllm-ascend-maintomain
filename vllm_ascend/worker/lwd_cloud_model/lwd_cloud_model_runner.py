@@ -96,7 +96,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         else:
             self._lwd_prompt_lens_gpu = None
         self.lwd_hash_state = None
-        # 用空值表示尚未准备真实批次，区分 dummy 前向。
+        # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
@@ -138,29 +138,37 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self, scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: "np.ndarray",
     ) -> "tuple[torch.Tensor, SpecDecodeMetadata | None]":
-        """UP 收割与 mrope 写入在 super() 之前,embeds 覆写在之后。
+        """UP harvest and mrope writes happen before super(); embeds
+        overwrite happens after it.
 
-        mrope 时序契约(多模态迁移复核发现的源分支缺陷修复):super()
-        内部的 _calc_mrope_positions 当步即把 req_state.mrope_positions
-        的窗口行拷上 GPU(model_runner_v1.py:1033-1045)——mrope 写入
-        若晚于 super()(源实现形态),当步 chunk 的 mrope 行永远不被
-        自己的前向看到(所有 chunk 用 ids=None 直通初始化的 arange
-        值,图像行必错)。故收割(端点 host 门 + TP 组内现场广播)与
-        mrope/delta 写入提到 super() 之前。
+        mrope timing contract (fixes a source-branch defect found during
+        the multimodal migration review): _calc_mrope_positions inside
+        super() copies the req_state.mrope_positions window rows to the
+        GPU within the same step (model_runner_v1.py:1033-1045). If the
+        mrope write landed after super() (the original shape), the
+        current chunk's mrope rows would never be seen by its own
+        forward (every chunk uses the ids=None arange initialization,
+        so image rows would be wrong). Hence the harvest (endpoint host
+        gate + in-place TP-group broadcast) and the mrope/delta writes
+        are hoisted before super().
 
-        embeds 保持在 super() 之后:基类填充循环 + copy_to_gpu 只看到
-        零缓冲,随后把收到的 UP embeds 直写 inputs_embeds.gpu 当步调度
-        窗口(后写为权威),经 future 完成事件在流上有序——非阻塞,
-        recv 等待另有 [Lwd][perf] up-recv-wait 计时可见。
+        The embeds overwrite stays after super(): the base fill loop and
+        copy_to_gpu only see zero buffers, then the harvested UP embeds
+        are written straight into the inputs_embeds.gpu scheduling
+        window of the current step (last write wins), ordered on-stream
+        via the future completion event — non-blocking; the recv wait is
+        visible separately via the [Lwd][perf] up-recv-wait timer.
         """
         harvested = self._lwd_harvest_up_batches(num_scheduled_tokens)
-        # 跳过基类填充循环对 LWD 占位行的逐行拷贝(gpu_model_runner
-        # .py:952-996):该循环把 CPU 装配缓冲的当步窗口(此刻恒为
-        # 零值)做 84MB 主机 memcpy + H2D 灌入 inputs_embeds,随后
-        # 注入覆写同一窗口(后写为权威)——纯浪费,实测 super 段
-        # ~17-20ms/chunk。清空映射即整体跳过;注入/释放逻辑在
-        # super() 返回后恢复引用。LWD 云侧请求全是占位行,无真实
-        # prompt-embeds 消费者被误伤。
+        # Skip the base fill loop's per-row copy for LWD placeholder rows
+        # (gpu_model_runner.py:952-996): it host-memcpys 84MB from the CPU
+        # assembly buffer (all zeros at this point) plus an H2D into
+        # inputs_embeds, which the inject then overwrites on the same
+        # window (last write wins) — pure waste, measured ~17-20ms per
+        # chunk in the super() segment. Clearing the map skips it
+        # wholesale; the inject/release logic restores the reference
+        # after super() returns. Every cloud-side LWD request is a
+        # placeholder row, so no real prompt-embeds consumer is hurt.
         embeds_map = self.input_batch.req_prompt_embeds
         self.input_batch.req_prompt_embeds = {}
         try:
@@ -202,27 +210,35 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_rebuild_is_token_ids_mask(
         self, num_scheduled_tokens: "np.ndarray"
     ) -> None:
-        """重建 prompt-embeds 分支的扁平 is_token_ids 掩码。
+        """Rebuild the flattened is_token_ids mask for the prompt-embeds branch.
 
-        根因(async spec decode 乐观值):runner 的 num_computed_tokens_cpu
-        假设上步草稿全被接受(比真实提交位置多 r),而原生扁平化
-        (model_runner_v1.py 的 token_indices = positions + idx*M)用乐观
-        positions 从二维掩码取值——decode 行整体右移 r 位,每段末尾
-        r 行越出 True 标记区读到 False/陈旧值,被 prompt-embeds 分支
-        当作 embeds 行而不做本地嵌入,保留 inputs_embeds.gpu 的陈旧
-        垃圾;这些行恰是被采样行(logits_indices 取段末 1+k 行),
-        垃圾 logits 直接污染已提交 token。原生/phase/单请求不受影响
-        (掩码只在 prompt-embeds 分支被消费,那些形态走 MM 分支)。
+        Root cause (async spec decode optimism): the runner's
+        num_computed_tokens_cpu assumes every previous draft was accepted
+        (r tokens past the real commit position), while the native
+        flattening (token_indices = positions + idx*M in
+        model_runner_v1.py) gathers from the 2D mask with those
+        optimistic positions — decode rows shift right by r and the last
+        r rows of each segment fall past the True-marked region, reading
+        False/stale values. The prompt-embeds branch then treats them as
+        embeds rows, skipping local embedding and leaving stale garbage
+        in inputs_embeds.gpu; those rows are exactly the sampled rows
+        (logits_indices takes the last 1+k rows of each segment), so
+        garbage logits pollute committed tokens directly. Native/phase/
+        single-request shapes are unaffected (the mask is only consumed
+        on the prompt-embeds branch; those shapes take the MM branch).
 
-        LWD 语义里只有注入行(prompt 段)应是 embeds 行(False),
-        decode/草稿行恒为 token id(True)。此处按调度状态确定性重建,
-        不依赖任何乐观值修正:decode 请求的 computed 乐观只会偏大,
-        prefill_rows 恒为 0,天然安全。保留 CPU 视图修复供父类路径使用
-        (.np 与 .cpu 同存储)；异步路径在 _preprocess 中按修正后的
-        设备位置重新生成 GPU 掩码，并直接消费设备 embedding。
+        Under LWD semantics only injected rows (prompt segments) may be
+        embeds rows (False); decode/draft rows are always token ids
+        (True). This rebuild is deterministic from scheduler state and
+        needs no optimistic-value correction: a decode request's
+        optimistic computed only over-estimates, so prefill_rows is
+        always 0 — inherently safe. The CPU-view repair is kept for the
+        parent path (.np and .cpu share storage); the async path
+        regenerates the GPU mask in _preprocess from corrected device
+        positions and consumes the device embedding directly.
         """
         if not self.input_batch.req_prompt_embeds:
-            # 批内无 embeds 缓冲(MM/text 分支,掩码无人读)
+            # No embeds buffers in the batch (MM/text branch; nobody reads the mask)
             return
         mask = self.is_token_ids.np
         computed = self.input_batch.num_computed_tokens_cpu
@@ -251,7 +267,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         "dict[str, Any]",
         "ECConnectorOutput | None",
     ]:
-        """在异步投机位置修正后刷新 decode 掩码，再准备模型输入。"""
+        """Refresh the decode mask after the async speculative-position fix, then prepare model inputs."""
         if (self.use_async_spec_decode and self.enable_prompt_embeds
                 and intermediate_tensors is None and self.pcp_size == 1):
             self._lwd_refresh_decode_embedding_mask(scheduler_output)
@@ -266,17 +282,21 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
 
     # ------------------------------------------------------------------ #
-    # Zero-base-weave seams: LWD 行为全部经子类覆写呈现,基类零接缝。       #
+    # Zero-base-weave seams: all LWD behavior surfaces via subclass    #
+    # overrides; the base classes carry no seams.                       #
     # ------------------------------------------------------------------ #
 
     def _update_states(
         self, scheduler_output: "SchedulerOutput"
     ) -> "Callable[[], None] | None":
-        """LWD:shape-only 占位 embeds 在进基类前就地重建(零基座接缝)。
+        """LWD: rebuild shape-only placeholder embeds in place before they
+        reach the base (zero base seams).
 
-        边云传输只携带形状(prompt_embeds=None + shape),基类的
-        CachedRequestState 构造按 new_req_data.prompt_embeds 直通——
-        此处先重建全零占位,原生路径行为不变。"""
+        The edge-cloud transport carries only the shape
+        (prompt_embeds=None + shape); the base CachedRequestState
+        construction passes new_req_data.prompt_embeds straight
+        through — rebuild the all-zeros placeholder here first, native
+        path behavior unchanged."""
         for new_req in scheduler_output.scheduled_new_reqs:
             if (
                 new_req.prompt_embeds is None
@@ -291,7 +311,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _update_streaming_request(
         self, req_id: str, new_req_data: "NewRequestData"
     ) -> "CachedRequestState":
-        """LWD:流式更新的占位重建(同 _update_states,零基座接缝)。"""
+        """LWD: placeholder rebuild for streaming updates (same as _update_states, zero base seams)."""
         if (
             new_req_data.prompt_embeds is None
             and new_req_data.prompt_embeds_shape is not None
@@ -303,9 +323,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         return super()._update_streaming_request(req_id, new_req_data)
 
     def _init_mrope_positions(self, req_state: "CachedRequestState") -> None:
-        """LWD prompt-embeds-only:纯文本 M-RoPE positions 与 ids 内容
-        无关(扫描仅认 vision 标记),直接按 prompt 长度构造;有 ids 则
-        走原生扫描(零基座接缝)。"""
+        """LWD prompt-embeds-only: text-only M-RoPE positions do not depend
+        on the ids content (the scan only honors vision markers), so build
+        them directly from the prompt length; with ids present, fall back
+        to the native scan (zero base seams)."""
         if req_state.prompt_token_ids is None:
             n = req_state.num_prompt_tokens
             req_state.mrope_positions = (
@@ -317,9 +338,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
     @property
     def supports_mm_inputs(self) -> bool:
-        """LWD 注入批按"本步无 MM"呈现,原生 MM 门自然跳过 encoder
-        (重算的 embeddings 会整批覆写远端注入值);decode/纯文本步
-        返回模型真值。零基座接缝。"""
+        """LWD: present injected batches as "no MM this step" so the native
+        MM gate skips the encoder naturally (recomputed embeddings would
+        wholesale-overwrite the remotely injected values); decode and
+        text-only steps return the model's true value. Zero base seams."""
         input_batch = getattr(self, "input_batch", None)
         if input_batch is not None and input_batch.req_prompt_embeds:
             return False
@@ -327,7 +349,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
     @supports_mm_inputs.setter
     def supports_mm_inputs(self, value: bool) -> None:
-        # 基类 __init__ 直接赋值,存 backing 供 getter 动态呈现。
+        # The base __init__ assigns directly; keep the backing for the dynamic getter.
         self._model_supports_mm_inputs = value
 
     def _lwd_preprocess_prompt_embeds(
@@ -370,11 +392,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_refresh_decode_embedding_mask(
         self, scheduler_output: "SchedulerOutput"
     ) -> None:
-        """根据设备上的实际位置重建掩码，避免 decode 行复用旧 embedding。
+        """Rebuild the mask from actual device positions so decode rows never
+        reuse stale embeddings.
 
-        异步上传各请求的 prompt 长度，复用设备上的请求索引展开到 token 行。
-        掩码直接写入设备缓冲区，由 LWD prompt-embeds 路径在设备上消费；
-        不回传 positions，也不刷新 CPU 掩码。
+        Upload per-request prompt lengths asynchronously and expand them
+        to token rows via the on-device request indices. The mask is
+        written straight into the device buffer and consumed on-device
+        by the LWD prompt-embeds path; positions are not round-tripped
+        and the CPU mask is not refreshed.
         """
         num_reqs = len(self.input_batch.req_ids)
         count = scheduler_output.total_num_scheduled_tokens
@@ -387,10 +412,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         prompt_lens_rows = prompt_lens_gpu[self.req_indices.gpu[:count]]
         self.is_token_ids.gpu[:count] = self.positions[:count] >= prompt_lens_rows
 
-    # 在云侧模拟前向前清除真实批次标记，防止复用上次请求路由。
+    # Clear the real-batch marker before cloud-side dummy forwards, so the
+    # previous step's routing is never reused.
     def _dummy_run(self, *args, **kwargs) -> None:
-        """清除真实批次的 Hash 路由标记，再执行模拟前向。"""
-        # 用空值表示尚未准备真实批次，区分 dummy 前向。
+        """Clear the real-batch Hash routing marker, then run the dummy forward."""
+        # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
         return super()._dummy_run(*args, **kwargs)
 
@@ -400,11 +426,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                        intermediate_tensors: "IntermediateTensors | None" = None,
                        inputs_embeds: "torch.Tensor | None" = None,
                        **model_kwargs) -> "torch.Tensor":
-        """按 SP 布局切分 embedding，并将完整 Hash 路由数据写入前向上下文。"""
+        """Shard embeddings per the SP layout and publish the full Hash routing data into the forward context."""
         context = get_forward_context()
         if (inputs_embeds is not None and intermediate_tensors is None
                 and context.flash_comm_v1_enabled and not self.supports_mm_inputs):
-            # 直接传入 embedding 会绕过原生嵌入层，需要在此补上序列切分。
+            # Passing embeddings directly bypasses the native embedding layer; re-apply the sequence split here.
             tp_group = get_tp_group()
             if tp_group.world_size > 1:
                 if inputs_embeds.shape[0] != num_tokens_padded:
@@ -412,9 +438,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 if context.pad_size:
                     inputs_embeds = torch.nn.functional.pad(inputs_embeds, (0, 0, 0, context.pad_size))
                 inputs_embeds = inputs_embeds.chunk(tp_group.world_size, dim=0)[tp_group.rank_in_group]
-            # 位置、注意力元数据和 Hash 路由表保持完整 token 布局。
+            # Positions, attention metadata and the Hash routing tables keep the full-token layout.
         if self.lwd_hash_state is not None:
-            # 先初始化路由索引缓存，确保补齐行使用合法零索引。
+            # Initialize the routing index cache first so padded rows use the legal zero index.
             self._lwd_hash_token_ids.zero_()
             if self._lwd_hash_step_tokens is None:
                 # Synthetic forwards have no remote prompt; route dummy token 0.
@@ -483,10 +509,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 embeds_map.pop(idx)
 
     def lwd_release_finished(self, finished_req_ids: list[str]) -> None:
-        """完结请求的采集簿记释放(释放路径唯一 owner):Hash chunk 表
-        + prompt-embeds 装配缓冲。由 worker 在引擎 finished_req_ids
-        信号处调用(abort 中途 prefill 的兜底;正常 prefill 完结已在
-        _lwd_release_consumed_prompt_embeds 释放)。"""
+        """Release collection bookkeeping for finished requests (sole owner of
+        the release path): the Hash chunk table plus prompt-embeds assembly
+        buffers. Called by the worker on the engine's finished_req_ids signal
+        (backstop for prefill aborted mid-way; normal prefill completion is
+        already released in _lwd_release_consumed_prompt_embeds)."""
         embeds_map = self.input_batch.req_prompt_embeds
         req_id_to_index = self.input_batch.req_id_to_index
         for req_id in finished_req_ids:
@@ -499,16 +526,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_harvest_up_batches(
         self, num_scheduled_tokens: "np.ndarray"
     ) -> list[tuple[int, LwdEmbedBatch, torch.Tensor, list[tuple[str, int, int]]]]:
-        """UP 批收割(super()._prepare_inputs 之前调用,时序契约见
-        _prepare_inputs)。逐 seqno 三段交错,事件序与拆分前的单循环
-        逐点一致:长度核验(_lwd_stage_up_batch)→ 端点 host 门 + TP
-        广播(_lwd_harvest_tensors_one)→ 窗口核验 + mrope 写入
-        (_lwd_check_up_windows)。
+        """UP batch harvest (called before super()._prepare_inputs; timing
+        contract in _prepare_inputs). Three stages interleave per seqno with
+        an event order that matches the pre-split single loop point for
+        point: length check (_lwd_stage_up_batch) -> endpoint host gate +
+        TP broadcast (_lwd_harvest_tensors_one) -> window check + mrope
+        write (_lwd_check_up_windows).
 
-        返回 [(seqno, meta, up_flat, rows)] 供 super() 后的注入段复用
-        已核验批位。张量段整体后移到 super() 之后与宿主工作重叠属
-        暂缓项 D1(见 docs/refactor/lwd_worker_packages_refactor_plan.md),
-        届时只需把 _lwd_harvest_tensors_one 的调用点挪出本循环。"""
+        Returns [(seqno, meta, up_flat, rows)] so the post-super() inject
+        reuses the validated batch positions. Moving the tensor stage
+        wholesale after super() to overlap host work is deferred item D1
+        (see docs/refactor/lwd_worker_packages_refactor_plan.md); at that
+        point only the _lwd_harvest_tensors_one call site leaves this
+        loop."""
         worker = self.worker
         if worker is None:
             return []
@@ -537,9 +567,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         future: LwdCommFuture | None,
         meta: LwdEmbedBatch,
     ) -> LwdUpStagedBatch:
-        """收割登记段:计算批 token 数并核验 meta 长度契约(拆分前位于
-        host 门之前,顺序保持)。计时起点随记录携带,张量段的
-        up-recv-wait 探针窗口与拆分前一致。"""
+        """Harvest staging: compute the batch token count and check the meta
+        length contract (sat before the host gate pre-split; order kept).
+        The probe start rides on the record so the tensor stage's
+        up-recv-wait window matches the pre-split one."""
         t_wait = time.monotonic()
         num_tokens = sum(len(t) for t in meta.token_ids)
         if not (len(meta.req_ids) == len(meta.token_ids)
@@ -557,16 +588,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         meta: LwdEmbedBatch,
         num_scheduled_tokens: np.ndarray,
     ) -> list[tuple[str, int, int]]:
-        """逐请求窗口核验 + mrope 行写入;返回每行 (req_id, 批位, 行数)。
+        """Per-request window check + mrope row write; returns one
+        (req_id, batch index, row count) per row.
 
-        三类 fail-fast 与拆分前逐字一致:请求不在本步 batch / chunk 行数
-        不等于调度窗口 / chunk 偏移与 computed 不符——继续走下去都会以
-        未注入的脏 embeds 解码(静默乱码),必须当场暴露。
-
-        mrope positions 自 wire_version 2 起经控制面随 meta 到达(逐
-        请求 [3,n] int64 字节,frombuffer 零转置直写 req_state),不再
-        经数据面 aux 帧与 TP 组二次广播;纯文本请求空字节、零路径
-        变化。"""
+        The three fail-fasts match the pre-split code verbatim; proceeding
+        would decode on uninjected dirty embeds (silent corruption), so
+        each is exposed on the spot. Since wire_version 2, mrope
+        positions arrive via the control plane with the meta (per-request
+        [3,n] int64 bytes, frombuffer written straight into req_state
+        with zero transposition), no longer through data-plane aux frames
+        and a second TP broadcast; text-only requests carry empty bytes."""
         num_prompt = self.input_batch.num_prompt_tokens
         computed = self.input_batch.num_computed_tokens_cpu
         mrope_rows = 0
@@ -578,20 +609,24 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             n = len(token_ids)
             idx = self.input_batch.req_id_to_index.get(req_id)
             if idx is None:
-                # fail-fast:embeds 已收齐但请求不在本步 batch——继续
-                # 走下去该请求将用未注入的脏 embeds 解码(静默乱码),
-                # 必须当场暴露而非丢弃。出现即调度/数据面时序契约
-                # 被破坏,需要修的是上游而不是这里。
+                # Fail-fast: the embeds arrived but the request is not in
+                # this step's batch — proceeding would decode it on
+                # uninjected dirty embeds (silent corruption); expose on
+                # the spot instead of dropping. Seeing this means the
+                # scheduler/data-plane timing contract is broken; the fix
+                # belongs upstream, not here.
                 raise RuntimeError(
                     f"[Lwd][cloud-runner] INJECT req={req_id} seqno="
                     f"{batch_seqno} rows={n}: req not in input_batch "
                     f"(batch={self.input_batch.req_ids})"
                 )
             if n > 0:
-                # fail-fast:本 chunk 行数必须恰等于该请求本步调度 token
-                # 数。不等(调度窗口 ≠ 边侧 chunk,如预算挤压截断)时
-                # 注入会越窗踩邻请求行/留下未注入尾巴——静默乱码源,
-                # 直接暴露。
+                # Fail-fast: the chunk row count must equal exactly the
+                # request's scheduled token count this step. When it does
+                # not (scheduled window != edge chunk, e.g. budget-squeeze
+                # truncation), injection would overrun into neighbor rows
+                # or leave an uninjected tail — a silent-corruption source;
+                # expose directly.
                 scheduled = (
                     int(num_scheduled_tokens[idx])
                     if idx < len(num_scheduled_tokens) else 0
@@ -612,16 +647,17 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                         f"start={start}, computed={int(computed[idx])}, rows={n}, prompt={prompt_len}"
                     )
                 if meta.has_mrope[k]:
-                    # positions 字节随 meta 经控制面到达([3,n] int64),
-                    # frombuffer 成 CPU 张量零转置直写 req_state;
-                    # 空字节 = 边云版本错配,fail-fast
+                    # Positions bytes arrive via the control plane with
+                    # the meta ([3,n] int64); frombuffer builds the CPU
+                    # tensor and writes req_state with zero transposition;
+                    # empty bytes = edge/cloud version mismatch, fail-fast
                     payload = meta.mrope_positions[k]
                     if not payload:
                         raise RuntimeError(
                             f"[Lwd][cloud-runner] mrope payload missing "
                             f"req={req_id} seqno={batch_seqno}: "
-                            f"has_mrope=True 但控制面 positions 为空"
-                            f"(边云版本错配,须同版本部署)"
+                            f"has_mrope=True but control-plane positions "
+                            f"are empty (edge/cloud version mismatch; deploy matching versions)"
                         )
                     cpu_ms, delta_ms = self._lwd_inject_mrope_positions(
                         req_id, start, n,
@@ -635,9 +671,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     mrope_rows += n
             rows.append((req_id, idx, n))
         if mrope_rows > 0:
-            # [Lwd][perf] mrope 注入探针:cpu=positions 字节 frombuffer
-            # +CPU 直写 req_state(控制面送达,无设备往返);delta=末
-            # chunk max() 自推,逐请求累加
+            # [Lwd][perf] mrope inject probe: cpu = positions-byte
+            # frombuffer + direct CPU write into req_state (control-plane
+            # delivery, no device round-trip); delta = last-chunk max()
+            # self-derivation, accumulated per request
             logger.info(
                 "[Lwd][perf] cloud mrope-inject seqno=%s rows=%d "
                 "cpu=%.2f delta=%.2fms",
@@ -649,13 +686,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_harvest_tensors_one(
         self, staged: LwdUpStagedBatch,
     ) -> torch.Tensor | None:
-        """收割张量段(单批):端点过 host 门 + TP 组内现场广播收主帧
-        embeds(each frame its own launch+wait atomic pair on the current
-        stream — the prefill_only_demo_br discipline; 跨流排序不可依赖
-        是此前广播段交付残缺的根因)。端点 res.tensor 为 None 时返回
-        None(拆分前同款 continue 语义)。"""
-        # get_tp_group 保持函数内导入:v4 迁移测试经 sys.modules 按调用
-        # 打桩 parallel_state,模块级名字在裁剪命名空间里不可见。
+        """Harvest tensor stage (single batch): endpoint passes the host gate,
+        then an in-place TP-group broadcast lands the main embeds frame
+        (each frame is its own launch+wait atomic pair on the current
+        stream — the prefill_only_demo_br discipline; unreliable
+        cross-stream ordering was the root cause of truncated broadcast
+        deliveries before). Returns None when the endpoint res.tensor is
+        None (the pre-split continue semantics)."""
+        # get_tp_group stays imported inside the function: the v4 migration
+        # tests stub parallel_state per call via sys.modules, so the
+        # module-level name is invisible in their trimmed namespace.
         import torch.distributed as dist
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -667,26 +707,30 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             staged.num_tokens, hidden_size, num_hash_layers, top_k,
         )
         if is_endpoint:
-            # 端点:先过 host 就绪门(demo 的 wait gate):done_event
-            # 轮询通过即 P2P 数据已完整落 buffer;超时显式报错而非
-            # 静默乱码。门通过后再广播,广播读到的必然是完整数据。
+            # Endpoint: pass the host readiness gate first (the demo's
+            # wait gate): once the done_event poll succeeds the P2P data
+            # has fully landed in the buffer; a timeout raises explicitly
+            # instead of silent corruption. Only after the gate does the
+            # broadcast read — guaranteed complete data.
             res = staged.future.wait(timeout=_LWD_UP_HOST_GATE_TIMEOUT_S)
             up_flat = res.tensor
             if up_flat is None:
                 return None
         else:
-            # 非端点:现场分配接收 buffer,等端点广播转发。
+            # Non-endpoint: allocate the receive buffer on the spot and wait for the endpoint's broadcast.
             up_flat = torch.empty(numel, dtype=torch.bfloat16, device="npu")
         if tp.world_size > 1:
-            # demo 同款:直接用框架 TP 通信域(建组顺序由框架保证,
-            # PD 分离路径已验证),不再使用自建 _LWD_EMBED_BCAST_GROUP。
+            # Same as the demo: reuse the framework TP communication domain
+            # (group construction order guaranteed by the framework, verified
+            # on the PD-disaggregation path); no self-managed
+            # _LWD_EMBED_BCAST_GROUP.
             work = dist.broadcast(
                 up_flat,
                 src=tp.ranks[0],
                 group=tp.device_group,
                 async_op=True,
             )
-            work.wait()  # 桥接广播完成到当前(计算)流,后续 copy 有序
+            work.wait()  # Bridge broadcast completion onto the current (compute) stream so later copies are ordered
         logger.info(
             "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
             staged.seqno, (time.monotonic() - staged.t_wait) * 1000,
@@ -706,8 +750,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         ] | None,
         num_scheduled_tokens: "np.ndarray",
     ) -> None:
-        """Device-side inject(super() 之后):把收割到的 UP embeds 直写
-        ``inputs_embeds.gpu`` 各请求的当步调度窗口。
+        """Device-side inject (after super()): write the harvested UP embeds
+        straight into each request's current scheduling window in
+        ``inputs_embeds.gpu``.
 
         The flattened output offsets reproduce the native fill loop's
         accumulation (per-request scheduled segment start), so rows land
@@ -718,8 +763,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         gone.  The base fill loop is skipped for LWD placeholder rows
         (see ``_prepare_inputs``); our device write is authoritative.
 
-        批位直接复用收割段携带的 rows(重复的"req not in batch"防线
-        已收敛到收割段一处;此处索引必为已核验值)。
+        Batch positions reuse the rows carried by the harvest stage (the
+        duplicated "req not in batch" defense has been consolidated into
+        the harvest stage alone; indices here are pre-validated).
         """
         if not harvested:
             return
@@ -727,8 +773,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         hidden_size = self.model_config.get_hidden_size()
         gpu_embeds = self.inputs_embeds.gpu
 
-        # Flattened output offset per request (native fill loop 同款累计):
-        # 每个请求的调度段在扁平 token 序列中的起点,按批位索引。
+        # Flattened output offset per request (same accumulation as the
+        # native fill loop): each request's scheduling-segment start in the
+        # flattened token sequence, indexed by batch position.
         offsets: list[int] = []
         off = 0
         for i in range(len(self.input_batch.req_ids)):
@@ -763,20 +810,26 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                             req_id, int(num_prompt[idx]), start, expert_ids[row:row + n],
                         )
                     out = offsets[idx]
-                    # stream 上直接写 inputs_embeds.gpu 的调度窗口
+                    # Write the scheduling window of inputs_embeds.gpu directly on-stream
                     gpu_embeds[out : out + n].copy_(
                         embeds[row : row + n], non_blocking=True
                     )
-                    # 不再 D2H 写 CPU 装配缓冲:draft provider 已改为
-                    # 直读 inputs_embeds.gpu 同窗口(本行即权威副本),
-                    # 消除每 chunk 84MB 的 D2H 同步长尾
+                    # No D2H write into the CPU assembly buffer anymore:
+                    # the draft provider reads the same window straight from
+                    # inputs_embeds.gpu (this write is the authoritative
+                    # copy), eliminating the per-chunk 84MB synchronous
+                    # D2H tail
                     self.input_batch.is_token_ids[idx, start : start + n] = False
                 row += n
-            # 跨流生命周期登记:端点 recv buffer 由通道流分配与复用
-            # (同尺寸 chunk 下分配器几乎总给同一块),本步 copy 在计算流。
-            # 不登记 record_stream,分配器可在本批 copy 尚未执行时把块交给
-            # 下一 seqno 的 irecv 覆写——深异步队列下表现为跨 seqno 串
-            # 数据(多请求乱码)。登记后复用即被正确排序。
+            # Cross-stream lifetime registration: the endpoint recv buffer
+            # is allocated and recycled by the channel stream (with
+            # same-size chunks the allocator nearly always hands back the
+            # same block), while this step's copy runs on the compute
+            # stream. Without record_stream the allocator could hand the
+            # block to the next seqno's irecv before this batch's copy has
+            # executed — under deep async queues this shows up as
+            # cross-seqno data bleeding (multi-request corruption).
+            # Registration orders the reuse correctly.
             up_flat.record_stream(torch.npu.current_stream())
 
     # ------------------------------------------------------------------ #
@@ -792,18 +845,21 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         chunk_positions: torch.Tensor,
         prompt_len: int,
     ) -> tuple[float, float]:
-        """写入一个 chunk 的 mrope positions([3,n] int64,CPU——控制面
-        RangeItem.mrope_positions 字节 frombuffer 而来)到请求缓存的
-        [3, prompt] 窗口;末 chunk 落地时自推 delta(=
-        positions.max()+1-prompt_len,与边侧逐值一致)供 decode 期
-        原生 _calc_mrope_positions 现算 completion 段位置。
+        """Write one chunk's mrope positions ([3,n] int64, CPU — frombuffer
+        of the control-plane RangeItem.mrope_positions bytes) into the
+        request's cached [3, prompt] window; when the last chunk lands,
+        self-derive delta (= positions.max()+1-prompt_len, value-identical
+        to the edge side) for the native _calc_mrope_positions to compute
+        completion-segment positions during decode.
 
-        req_state.mrope_positions 由 ids=None 直通初始化(arange 纯文
-        本位置)——多模态请求的窗口被逐 chunk 覆盖,纯文本请求永不走
-        本路径(边侧不给它发 positions)。
+        req_state.mrope_positions is initialized pass-through with
+        ids=None (arange text-only positions) — multimodal requests have
+        their window overwritten chunk by chunk; text-only requests never
+        take this path (the edge sends them no positions).
 
-        返回 (cpu_ms, delta_ms):CPU 直写与末 chunk delta 自推的耗时
-        打点,由调用方按 seqno 聚合。"""
+        Returns (cpu_ms, delta_ms): timings of the direct CPU write and
+        the last-chunk delta derivation, aggregated per seqno by the
+        caller."""
         req_state = self.requests.get(req_id)
         assert chunk_positions.shape == (3, n), (
             f"mrope payload shape {tuple(chunk_positions.shape)} != "
@@ -844,8 +900,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
         from vllm.distributed.parallel_state import get_tp_group
 
-        # 只有云 TP 组首卡(= DOWN 通道端点 rank)采集/发送;
-        # 其余 rank 无通道 peer,采集即弃也一并省掉(8 卡冗余)。
+        # Only the cloud TP-group first rank (= the DOWN channel endpoint
+        # rank) collects/sends; the other ranks have no channel peer, so
+        # their collect-and-discard is skipped too (8-card redundancy).
         wire_endpoint = get_tp_group().is_first_rank
         captured = None
         if wire_endpoint and self.execute_model_state is not None:
@@ -854,9 +911,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             #  spec_decode_common_attn_metadata, hidden_states,
             #  sample_hidden_states, ...)
             state = self.execute_model_state
-            # 批序/掩码也一并快照:batch queue 重叠时,下一步的
-            # _prepare_inputs 可能在 collect 前重排 input_batch,
-            # 现读会拿到批序B去切批序A的张量(高并发错位根因)
+            # Snapshot the batch order/mask as well: with overlapping
+            # batch queues, the next step's _prepare_inputs may reorder
+            # input_batch before the collect; reading live state would
+            # slice batch-A tensors with batch-B order (the root cause of
+            # high-concurrency misalignment)
             captured = (
                 state[5], state[1], state[2], state[0],
                 list(self.input_batch.req_ids),
@@ -864,8 +923,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
-        # VLLM_ASCEND_LWD_DISABLE_DOWN=1 诊断:不做 collect(云引擎改走
-        # token_ids 直通通告),payload 为 None 时 worker 自然跳过 DOWN send
+        # VLLM_ASCEND_LWD_DISABLE_DOWN=1 diagnostics: skip the collect (the
+        # cloud engine switches to token_ids pass-through notify); a None
+        # payload makes the worker skip the DOWN send naturally
         if (captured is not None
                 and self._lwd_captured_sampler_output is not None
                 and not envs.VLLM_ASCEND_LWD_DISABLE_DOWN):
@@ -878,7 +938,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def take_lwd_pending_down_payload(
         self,
     ) -> "tuple[torch.Tensor, torch.Tensor, None, list[str], None] | None":
-        """worker 层取走本步 DOWN payload(单槽覆盖写,每步必被取走)。"""
+        """The worker layer takes away this step's DOWN payload (single-slot overwrite, consumed every step)."""
         payload = getattr(self, "_lwd_pending_down_payload", None)
         self._lwd_pending_down_payload = None
         return payload
@@ -894,21 +954,26 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         discard_mask_np: "np.ndarray",
         sampler_output: "SamplerOutput",
     ) -> "tuple[torch.Tensor, torch.Tensor, None, list[str], None] | None":
-        """生产级 DOWN 采集(rank-replay):hidden 组包 + 全局秩 + num_accepted。
+        """Production DOWN collection (rank-replay): hidden packaging + global
+        ranks + num_accepted.
 
-        编排:行选择/秩计算按 spec 与否分流(_lwd_pack_plain_down_rows /
-        _lwd_pack_spec_down_rows),meta 拼包与就绪事件在
-        _lwd_stage_down_meta;计算关键路径零新增同步,批序/掩码取捕获
-        时刻快照(防 batch queue 重叠重排)。返回:
+        Orchestration: row selection / rank computation branches on spec
+        vs non-spec (_lwd_pack_plain_down_rows / _lwd_pack_spec_down_rows);
+        meta packaging and the readiness event live in
+        _lwd_stage_down_meta. Zero added synchronization on the compute
+        critical path; batch order/mask come from the capture-time
+        snapshot (guards against batch-queue overlap reordering).
+        Returns:
           (hidden_packet, pinned_view, None, req_ids, None)
-        或 None(本步无在途请求)。
+        or None (no in-flight requests this step).
         """
         _t0 = time.monotonic()
         sampled = sampler_output.sampled_token_ids
         if sampled is None or sampled.dim() != 2 or logits is None:
             return None
-        # batch_req_ids/discard_mask 来自捕获时刻快照(与 logits/hidden
-        # 同批序),不读活的 input_batch
+        # batch_req_ids/discard_mask come from the capture-time snapshot
+        # (same batch order as logits/hidden); the live input_batch is
+        # never read here
         valid = ~discard_mask_np[: len(batch_req_ids)]
         if spec_decode_metadata is None:
             packed = self._lwd_pack_plain_down_rows(
@@ -924,9 +989,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         hidden_packet, ranks_list, counts_dev, seg_lens_host = packed
         if seg_lens_host is not None:
             meta_dev = torch.cat(ranks_list + [counts_dev])
-            # seg_lens 不上设备(host 直写 pinned 尾段):与 D2H 前缀
-            # 区域不相交,且引擎读 pinned 发生在 ready_event 同步
-            # (更晚)之后,无竞态。
+            # seg_lens stay off-device (host writes the pinned tail
+            # segment): disjoint from the D2H prefix region, and the
+            # engine reads the pinned buffer only after the ready_event
+            # sync (later still) — no race.
         else:
             n_req = sum(1 for i in range(len(batch_req_ids)) if valid[i])
             counts_dev = torch.ones(n_req, dtype=torch.int32,
@@ -936,7 +1002,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         pinned_view, _n_meta = self._lwd_stage_down_meta(
             meta_dev, seg_lens_host,
         )
-        # [Lwd][perf] 采集分段:rank=秩+行收集;pinned=meta 拼包+拷贝
+        # [Lwd][perf] Collection segments: rank = rank computation + row
+        # gathering; pinned = meta packaging + copy
         logger.info(
             "[Lwd][perf] collect rows=%d rank=%.2f pinned=%.2f total=%.2fms",
             hidden_packet.shape[0],
@@ -960,11 +1027,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         valid: np.ndarray,
         batch_req_ids: list[str],
     ) -> LwdDownSelection | None:
-        """非 spec 路径的行选择与秩计算(对当关系:等价于原
-        _lwd_collect_down_payload 的 not is_spec 分支)。
+        """Non-spec row selection and rank computation (correspondence:
+        equivalent to the not-is_spec branch of the original
+        _lwd_collect_down_payload).
 
-        廉价计算:bf16 直比(logits 原生 bf16,与 cast 后逐位等价)、
-        批全覆盖时整行直接算(不做高级索引取材)。"""
+        Cheap computation: direct bf16 comparison (logits are natively
+        bf16, bit-identical to a cast) and full-batch rows computed
+        wholesale when fully covered (no fancy-index gathers)."""
         idx = [i for i in range(len(batch_req_ids)) if valid[i]]
         if not idx:
             return None
@@ -990,24 +1059,32 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         valid: np.ndarray,
         batch_req_ids: list[str],
     ) -> LwdDownSelection | None:
-        """全零同步 spec 路径(向量化)的行选择与秩计算(对当关系:等价
-        于原 _lwd_collect_down_payload 的 is_spec 分支)。
+        """All-zero synchronous spec row selection and rank computation
+        (vectorized; correspondence: equivalent to the is_spec branch of
+        the original _lwd_collect_down_payload).
 
-        段长按 host 侧 scheduled_spec_decode_tokens 推(1+draft_len),
-        按完整段打包(含被拒行,边侧按 num_accepted 取有效前缀);
-        段长取 spec_decode_metadata.num_draft_tokens(host list,
-        运行期真实布局,与 sample_hidden_states 段结构一致);
-        不用 scheduler_output.scheduled_spec_decode_tokens
-        (调度输入,可能与实际运行不一致)。
-        counts 从同一个 sampled 张量 device 推导(与秩/行同源,
-        天然按批位对齐);seg_lens/counts 只收 valid 请求,
-        保证 [ranks|counts|seg_lens] 三段长度一致。
-        host 一趟建索引,替代逐请求 device 循环(原实现每请求
-        ~6 次小 kernel 发射,rank 段随并发涨到 20+ms;向量化后
-        发射数与 N 无关)。索引语义与原循环逐位等价:
-        vidx/vlen = 有效请求批位/实际行数(按总段长封顶,
-        = 原 rows_i);req_idx/pos_idx = 每行的请求位/行内位
-        (原 sampled[i, :rows_i]);row_sel = 有效行全局行号。"""
+        Segment lengths derive from the host-side
+        scheduled_spec_decode_tokens (1+draft_len); rows are packed as
+        whole segments (rejected rows included; the edge takes the valid
+        prefix by num_accepted). Lengths come from
+        spec_decode_metadata.num_draft_tokens (host list, the real
+        runtime layout, matching the sample_hidden_states segment
+        structure), NOT from
+        scheduler_output.scheduled_spec_decode_tokens (scheduler input
+        that may disagree with what actually ran). counts derive from
+        the same sampled tensor on-device (same source as ranks/rows,
+        naturally batch-position aligned); seg_lens/counts only include
+        valid requests so [ranks|counts|seg_lens] stay length-aligned.
+        One host pass builds the indices, replacing the per-request
+        device loop (the original issued ~6 small kernels per request
+        and the rank segment grew past 20ms with concurrency; after
+        vectorization the launch count is independent of N). Index
+        semantics are bitwise-equivalent to the original loop:
+        vidx/vlen = valid request batch position / actual row count
+        (capped by total segment length, = the original rows_i);
+        req_idx/pos_idx = per-row request position / in-segment offset
+        (the original sampled[i, :rows_i]); row_sel = global row number
+        of each valid row."""
         seg_lens = [
             d + 1 for d in spec_decode_metadata.num_draft_tokens
         ]
@@ -1031,8 +1108,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             np.cumsum(vlen_np) - vlen_np, vlen_np
         )
         row_sel_np = np.repeat(starts_v, vlen_np) + pos_idx_np
-        # 全部索引一次 pinned 异步 H2D(pageable 同步 H2D 会在
-        # 主流上等设备排空,见 seg_lens 同款教训)
+        # All indices go through one pinned async H2D (a pageable
+        # synchronous H2D would stall the main stream waiting for the
+        # device to drain — the same lesson as seg_lens)
         buf = self._lwd_h2d_stage_i64(
             np.concatenate(
                 [req_idx_np, pos_idx_np, row_sel_np, vidx_np, vlen_np]
@@ -1045,7 +1123,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         vlen_d = buf[3 * n_rows + n_valid :]
         sampled_rows = sampled[req_d, pos_d]
         if n_rows == total_rows:
-            # 全 valid 无封顶:行即连续前缀,免 gather
+            # All valid with no capping: rows are a contiguous prefix; skip the gather
             lg_rows = logits[:n_rows]
             hidden_packet = sample_hidden_states[:n_rows]
         else:
@@ -1053,9 +1131,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             hidden_packet = sample_hidden_states[sel_d]
         thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
         ranks = [(lg_rows > thresh).sum(dim=1).to(torch.int32)]
-        # 过期 sampled 位(spec 未运行的请求可能残留上个 spec 步的
-        # token):accepted/秩/段长一律按实际 hidden 行数封顶——
-        # 行数才是真实采样位置的真相
+        # Stale sampled slots (requests the spec step skipped may retain
+        # the previous spec step's tokens): accepted/ranks/seg_lens are
+        # all capped by the actual hidden row count — the row count is
+        # the ground truth of real sampling positions
         counts_dev = torch.minimum(counts_all[vidx_d], vlen_d).to(
             torch.int32
         )
@@ -1069,10 +1148,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         meta_dev: torch.Tensor,
         seg_lens_host: list[int] | None,
     ) -> tuple[torch.Tensor, int]:
-        """meta 拼包与就绪事件:pinned 拷贝排主流末尾(异步),紧随记录
-        就绪事件(经 worker.note_lwd_meta_ready);由 worker 响应入队处
-        在发送前 synchronize——"响应发出 ⟹ pinned 就绪"成为硬保证
-        (同步在输出线程,不在计算关键路径)。返回 (pinned 视图, 长度)。"""
+        """Meta packaging and readiness event: the pinned copy is queued at
+        the main-stream tail (async), immediately followed by the readiness
+        event (via worker.note_lwd_meta_ready); the worker's response-enqueue
+        path synchronizes before sending — making "response sent ⟹ pinned
+        ready" a hard guarantee (the sync runs on the output thread, off the
+        compute critical path). Returns (pinned view, length)."""
         n_dev = meta_dev.numel()
         n_meta = n_dev + (len(seg_lens_host) if seg_lens_host is not None else 0)
         pinned = self._lwd_meta_pinned(n_meta)
@@ -1083,22 +1164,26 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         return pinned[:n_meta], n_meta
 
     def _lwd_meta_pinned(self, n: int) -> "torch.Tensor":
-        """轮换 pinned 缓冲(深度 4 > batch_queue 深度 2 + 引擎滞后 1):
-        避免下一/N+2 步的边流拷贝覆盖引擎尚未读完的上一步 meta。
-        对当关系:LwdPinnedStaging.next_pinned ≍ 原手写 4 槽列表轮换
-        (容量下限 4096 同旧值)。"""
+        """Rotate the pinned buffers (depth 4 > batch_queue depth 2 + one step
+        of engine lag): prevents a later edge-stream copy from overwriting
+        the previous step's meta before the engine has read it.
+        Correspondence: LwdPinnedStaging.next_pinned ≍ the original
+        hand-rolled 4-slot list rotation (capacity floor 4096 unchanged)."""
         return self._lwd_staging(
             "down_meta", dtype=torch.int32, min_capacity=4096, device_mirror=False,
         ).next_pinned(n)
 
     def _lwd_h2d_stage_i64(self, arr: "np.ndarray") -> torch.Tensor:
-        """int64 host 索引数组的异步 H2D 暂存(pinned 4 槽轮换 +
-        non_blocking):替代 torch.tensor(arr, device=...) 的 pageable
-        同步拷贝——后者在主流上等设备排空(MTP 下即 draft propose
-        尾巴)。环深与 meta ring 同理:覆盖 batch_queue 深度 + 引擎滞后,
-        防止下步 host 覆写时上步拷贝尚未执行。
-        对当关系:LwdPinnedStaging.stage_to_device ≍ 原手写 pinned+device 4 槽对
-        轮换(容量下限 1024 同旧值)。"""
+        """Async H2D staging for int64 host index arrays (pinned 4-slot
+        rotation + non_blocking): replaces torch.tensor(arr, device=...)
+        pageable synchronous copies — those stall the main stream waiting
+        for the device to drain (under MTP, the draft-propose tail).
+        Ring depth rationale mirrors the meta ring: cover batch_queue
+        depth + engine lag so a later host overwrite cannot land while
+        the previous copy is still queued.
+        Correspondence: LwdPinnedStaging.stage_to_device ≍ the original
+        hand-rolled pinned+device 4-slot pair rotation (capacity floor
+        1024 unchanged)."""
         return self._lwd_staging(
             "down_index", dtype=torch.int64, min_capacity=1024,
         ).stage_to_device(arr, arr.size)

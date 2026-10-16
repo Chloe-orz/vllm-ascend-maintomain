@@ -177,16 +177,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return getattr(config, "image_token_index", None)
 
 def _backup_token_id(req_state, idx: int) -> int:
-    """get_token_id 的占位 embeds 容错。
+    """Placeholder-embeds tolerance for get_token_id.
 
-    LWD(prefill_only)云侧请求的 prompt 以 embeds 注入,
-    prompt_token_ids 为 None,对 prompt 位置取 id 会 raise
-    (gpu_input_batch.py:get_token_id)。backup 值只在该请求本步
-    无有效采样 token 时才被 torch.where 选中:对 prefill 半途
-    (chunk)请求,该位置的 draft 输入由 provider embeds 覆写
-    (_lwd_build_first_pass_embeds 的 prompt 段覆写),id 不会真实
-    落进 draft 前向,回填 0 占位即可;decode/完结请求恒有有效
-    采样 token,backup 不被消费。
+    LWD (prefill_only) cloud requests have their prompt injected as
+    embeds; prompt_token_ids is None and reading an id at a prompt
+    position would raise (gpu_input_batch.py:get_token_id). The backup
+    value is only selected by torch.where when the request has no valid
+    sampled token this step: for a mid-prefill (chunked) request, that
+    position's draft input is overwritten by provider embeds (the prompt
+    overwrite in _lwd_build_first_pass_embeds), the id never reaches the
+    draft forward, so a zero placeholder suffices; decode/finished
+    requests always carry a valid sampled token and never consume the
+    backup.
     """
     if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
         return 0
@@ -1800,14 +1802,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         position of each request holds the next token (already shifted
         into ``self.input_ids`` by the caller).
 
-        逐请求混合构造(mixed 组批后批内可同时存在 prefill/decode 请求):
-        先用 token-id 路径整批打底——右移后 decode 段是真实 token、采样
-        位置是 next token,只有 prompt 段是占位零值;再仅对段内含
-        prompt 行(base+1 < prompt_len)的请求用 provider embeds 覆写。
-        decode 请求(装配缓冲已随 prefill 完结释放)不查 provider,不再
-        像原实现那样因任一请求缺缓冲而整批回退——那会让同批 prefill
-        请求的 prompt 段退回占位零值,draft 状态从根上脏掉(MTP 混批
-        下的已知缺陷)。
+        Per-request hybrid construction (after mixed batching the batch
+        may hold prefill and decode requests simultaneously): seed the
+        whole batch via the token-id path first — after the one-position
+        right shift the decode segments are real tokens and the sampling
+        position holds the next token; only prompt segments carry
+        placeholder zeros. Then overwrite the prompt segments of the
+        requests that have any prompt rows in-segment (base+1 <
+        prompt_len) with provider embeds. Decode requests (whose
+        assembly buffer was already released when prefill completed)
+        never query the provider; unlike the original implementation,
+        one request missing its buffer no longer degrades the whole
+        batch — that regression returned same-batch prefill requests'
+        prompt segments to placeholder zeros, corrupting draft state at
+        the root (a known defect under MTP mixed batching).
 
         Returns None (caller falls back to the token-id path) when no
         provider is configured, a request that needs prompt embeds lacks
@@ -1855,8 +1863,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                if getattr(cad, "query_start_loc_cpu", None) is not None
                else cad.query_start_loc.tolist())
         out = self.inputs_embeds  # persistent buffer (graph-safe)
-        # 打底:右移后的 input_ids 在 decode 段/采样位置都是真实 token,
-        # 整批嵌入一次;prompt 段的占位零值嵌入在下方逐请求覆写
+        # Seed pass: after the right shift, input_ids are real tokens in
+        # the decode segments and at the sampling position — embed the
+        # whole batch once; the placeholder-zero prompt embeddings are
+        # overwritten per-request below
         out[:num_tokens] = self.model.embed_input_ids(
             self.input_ids[:num_tokens]
         )
@@ -1867,14 +1877,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             base = int(computed[i]) if i < len(computed) else 0
             prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
             if base + 1 >= prompt_len:
-                # 段内无 prompt 行(decode 请求):打底已正确,跳过
+                # No prompt rows in-segment (decode request): the seed pass is already correct; skip
                 continue
-            # 直读主模型 inputs_embeds.gpu(替代 CPU 装配缓冲):
-            # 注入期该窗口已写入权威 embeds,与装配缓冲逐位同源
-            # (缓冲本就从这张量 D2H 出去)。窗口映射:调度段 [s,e) 的
-            # 行 = prompt 位置 [base, base+seg_len),provider 需要
-            # [base+1, base+seg_len) ⇒ gpu[s+1:e]。消除每 chunk
-            # 84MB 的 D2H 同步长尾(实测占 inject 段大头)。
+            # Read the main model's inputs_embeds.gpu directly (replacing
+            # the CPU assembly buffer): injection already wrote the
+            # authoritative embeds into that window — bitwise-identical
+            # to the assembly buffer (the buffer was D2H'd from this very
+            # tensor). Window mapping: scheduling segment [s,e) rows =
+            # prompt positions [base, base+seg_len), the provider needs
+            # [base+1, base+seg_len) ⇒ gpu[s+1:e]. Eliminates the
+            # per-chunk 84MB synchronous D2H tail (measured as the bulk of
+            # the inject segment).
             out[s : e - 1] = runner.inputs_embeds.gpu[s + 1 : e]
             wrote_any = True
         if not wrote_any:
@@ -2315,8 +2328,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
-        # (_backup_token_id:LWD 占位 embeds 请求的 prompt 位 id 不可知,
-        # 回填 0 占位——该值真实被消费的位置必由 provider embeds 覆写)
+        # (_backup_token_id: prompt-position ids are unknowable for LWD
+        # placeholder-embeds requests; backfill zero — wherever the value
+        # would be truly consumed, provider embeds overwrite it)
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(

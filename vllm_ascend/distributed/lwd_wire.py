@@ -34,10 +34,12 @@ _INITIALIZED = False
 
 
 def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
-    """调试:打印数据面张量摘要,供边云两端成对对比数值。
+    """Debug: print a data-plane tensor digest for pairwise edge/cloud
+    value comparison.
 
-    tag 形如 "[Lwd][DUMP][req=...][seqno=...] SEND/RECV ...";
-    fp32 统一精度,输出 shape/dtype/首尾各 10 个数/sum/mean。
+    tag looks like "[Lwd][DUMP][req=...][seqno=...] SEND/RECV ...";
+    fp32 uniform precision, printing shape/dtype/first-last 10 values
+    each/sum/mean.
     """
     import numpy as np
 
@@ -76,7 +78,7 @@ def init_lwd_duplex_channels() -> None:
 
     lwd_cfg = get_current_vllm_config().parallel_config.lwd_config
     if lwd_cfg.enable_lwd and lwd_cfg.edge_npu_count > 0:
-        # 连续 edge-first 布局：edge [0, E), cloud [E, E+C)，端点取 (0, E)
+        # Contiguous edge-first layout: edge [0, E), cloud [E, E+C); the endpoint takes (0, E)
         edge_rank, cloud_rank = 0, lwd_cfg.edge_npu_count
     else:
         pp_group = get_pp_group()
@@ -109,10 +111,13 @@ def init_lwd_duplex_channels() -> None:
         _LWD_CHANNEL_GROUPS[channel] = (group, peer)
         _LWD_CHANNEL_STREAMS[channel] = torch.npu.Stream()
     _LWD_ENDPOINTS = (edge_rank, cloud_rank)
-    # embeds 组内广播不再自建通信域(自建 new_group 在 torch_npu 下实测
-    # 零交付,疑建组顺序错位),改用框架 TP device_group(demo 同款,
-    # 建组顺序由框架保证);广播在注入时刻于计算流上发起,与前向 TP
-    # 集合同流 FIFO,天然不串台。
+    # The in-group embeds broadcast no longer builds its own
+    # communication domain (a self-managed new_group measured zero
+    # delivery under torch_npu, suspected group-creation-order skew) and
+    # reuses the framework TP device_group instead (same as the demo;
+    # construction order guaranteed by the framework); the broadcast
+    # launches on the compute stream at inject time, sharing an in-stream
+    # FIFO with the forward's TP collectives — naturally crosstalk-free.
     _INITIALIZED = True
     logger.info(
         "[lwd-wire] duplex channels created over ranks=%s (my_rank=%d)",
@@ -202,8 +207,8 @@ def destroy_lwd_duplex_channels() -> None:
 
 
 def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
-    """调试:张量摘要打印(head10/tail10/sum/mean/shape/dtype),
-    供边云两端成对对比数值。"""
+    """Debug: tensor digest print (head10/tail10/sum/mean/shape/dtype) for
+    pairwise edge/cloud value comparison."""
     import numpy as np
 
     flat = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)

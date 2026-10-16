@@ -59,10 +59,12 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self.tid2eid_tables: list[torch.Tensor] = []
 
     def load_model(self) -> None:
-        """加载边侧模型,并为 DeepSeek V4 从权重文件读取 CPU Hash 路由表。"""
+        """Load the edge model and read the CPU Hash routing tables for
+        DeepSeek V4 from the weight files."""
         super().load_model()
-        # [layer-trace] 对拍插桩(env 门控,缺省零开销):边侧安装点,
-        # 与云侧/集中式共用同一份代码(见 lwd_debug.lwd_layer_trace)。
+        # [layer-trace] Parity instrumentation (env-gated, zero overhead
+        # when off): the edge install point; cloud and centralized share
+        # the same code (see lwd_debug.lwd_layer_trace).
         from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
             install_lwd_layer_trace,
         )
@@ -99,11 +101,14 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         return {}
 
     def _lwd_embed_ids_h2d(self, flat_token_ids: list[int]) -> torch.Tensor:
-        """token ids 异步上卡:pinned 环(4 槽,与派发队列深度同阶)+
-        non_blocking,替代 torch.tensor(list, device=...) 的 pageable
-        同步拷贝——后者在主流上等设备排空(含上一块 chunk 的 UP send
-        配对等待),把跨侧锁步传导进边 worker 主线程。同流序保证 embed
-        kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。"""
+        """Async H2D for token ids: a pinned ring (4 slots, same order as
+        the dispatch queue depth) + non_blocking, replacing the pageable
+        synchronous copy of torch.tensor(list, device=...) — the latter
+        stalls the main stream waiting for the device to drain (including
+        the pairing wait on the previous chunk's UP send), leaking
+        cross-side lockstep into the edge worker's main thread. Same-stream
+        ordering guarantees the embed kernel reads this chunk's values
+        (H2D enqueues ahead of the embed)."""
         return self._lwd_staging(
             "edge_ids", dtype=torch.int64, min_capacity=8192,
         ).stage_to_device(flat_token_ids, len(flat_token_ids))
@@ -119,10 +124,13 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if not batch_meta.token_ids:
             return
 
-        # 登记新到请求的 mm 特征(首 chunk 随 scheduled_new_reqs 携带
-        # data;后续 chunk 走缓存)。注意登记不过滤 data:None 的项留到
-        # encoder 执行点 fail-fast(见 LwdEdgeMmCache.encoder_outputs)
-        # ——静默跳过会让图像 embeds 缺失、占位 token 按文本嵌入,即错算。
+        # Register newly arrived requests' mm features (the first chunk
+        # carries data with scheduled_new_reqs; later chunks hit the
+        # cache). Registration deliberately does not filter data:None
+        # entries — the encoder execution point fails fast on them (see
+        # LwdEdgeMmCache.encoder_outputs); silently skipping would drop
+        # image embeds and embed placeholder tokens as text, i.e. compute
+        # garbage.
         for req_data in scheduler_output.scheduled_new_reqs:
             feats = [
                 f
@@ -139,9 +147,10 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         )
         token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
         _t0 = time.monotonic()
-        # 多模态 merge:批内任一请求带 mm 数据即按本 chunk 窗口收集
-        # 视觉塔 embeds + 构造 is_multimodal 掩码,走模型原生
-        # embed_input_ids 的 merge 分支;纯文本批走原直达路径。
+        # Multimodal merge: when any request in the batch carries mm data,
+        # collect vision-tower embeds for this chunk window + build the
+        # is_multimodal mask and take the model's native embed_input_ids
+        # merge branch; text-only batches take the original direct path.
         mm_embeds, is_mm = self.mm_cache.gather_chunk(
             batch_meta, model, self.device, self.pin_memory,
         )
@@ -165,9 +174,10 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 seqno, tuple(expert_ids.shape), payload.numel(),
             )
 
-        # mrope positions 已随 RangeNotify 走控制面(wire_version>=2),
-        # 数据面只发 embeds 主帧;aux 帧机制保留在通道层供 deepstack
-        # 等扩展,mrope 不再使用。
+        # mrope positions ride the control plane with the RangeNotify
+        # (wire_version>=2); the data plane sends only the main embeds
+        # frame. The aux frame mechanism stays in the channel layer for
+        # deepstack and other future payloads; mrope no longer uses it.
         request = LwdCommRequest(
             channel=LwdChannelType.UP,
             op="send",
@@ -176,9 +186,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             seqno=seqno,
         )
         self.worker.comm_service.submit_send(request)
-        # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
-        # 广播提交(含 bridge 的 handle.wait)——若 UP 世界广播在等云侧
-        # 入队,此段会显著变大(chunk 级锁步的直接证据)
+        # [Lwd][perf] TTFT probes: forward = the embed forward;
+        # submit_send = snapshot clone + broadcast submit (including the
+        # bridge's handle.wait) — if the UP world broadcast is waiting on
+        # the cloud's enqueue, this segment grows visibly (direct evidence
+        # of chunk-level lockstep)
         logger.info(
             "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f "
             "total=%.2fms tokens=%d",
@@ -206,15 +218,18 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             )
         )
         _t_post = time.monotonic()
-        # wait_for_comm:device 序等待,主机不阻塞
+        # wait_for_comm: device-ordered wait; the host never blocks
         recv_future.wait_for_comm()
         result = recv_future.result()
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
-        # 诊断旁路(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):DOWN 张量照收
-        # (传输成本保留在测量内),但跳过 lm_head + rank-replay,直接交付
-        # 云侧 c2e 通告捎带的 token ids——性能恢复即瓶颈在边侧 unembed。
+        # Diagnostic bypass (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1): the DOWN
+        # tensor is still received (transport cost stays in the
+        # measurement), but lm_head + rank-replay are skipped and the
+        # cloud's c2e notify piggybacked token ids are delivered directly —
+        # if performance recovers, the bottleneck is the edge-side
+        # unembed.
         if envs.VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE and batch_meta.token_ids:
             assert len(batch_meta.token_ids) == len(batch_meta.req_ids)
             sampled_token_ids: list[list[int]] = [
@@ -222,12 +237,14 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             ]
             _t_lm = time.monotonic()
         else:
-            # lm_head 不允许直接调用(ParallelLMHead.forward 强制经 sampler);
-            # compute_logits 是标准接口,包装层/单体模型都有。
+            # lm_head must not be called directly (ParallelLMHead.forward
+            # forces the sampler path); compute_logits is the standard
+            # interface present on both wrapper and monolithic models.
             logits = model.compute_logits(hidden_states)   # (rows_total, V)
             _t_lm = time.monotonic()
-            # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
-            # top20 逐位对照——排名换位即重放漂移的直接视图。
+            # L5 parity check: the first row's top-20 compared entrywise
+            # against the cloud sampler's [layer-trace] top-20 — any rank
+            # swap is a direct view of replay drift.
             try:
                 from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
                     lwd_layer_trace_enabled,
@@ -256,9 +273,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 sampled_token_ids.append(flat_ids[off : off + accept])
                 off += len(ths)
         _t_sel = time.monotonic()
-        # [Lwd][perf] 临时探针:单请求慢的归因分段——
-        # post_recv=挂 irecv;wait_tensor=等张量落卡(网络);lm_head=词表
-        # 前向(权重带宽);select=argsort 取名(.item 同步);total=边尾段全长
+        # [Lwd][perf] Temporary probes attributing single-request latency:
+        # post_recv = posting the irecv; wait_tensor = waiting for the
+        # tensor to land (network); lm_head = the vocabulary forward
+        # (weight bandwidth); select = argsort name lookup (.item sync);
+        # total = the whole edge tail
         logger.info(
             "[Lwd][perf] unembed seqno=%s post_recv=%.2f wait_tensor=%.2f "
             "lm_head=%.2f select=%.2f total=%.2fms reqs=%d",

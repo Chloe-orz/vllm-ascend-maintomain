@@ -49,7 +49,7 @@ def test_zero_weave_overrides_present() -> None:
 
 
 def test_zero_weave_overrides_delegate_to_super() -> None:
-    """三个 wrap 必须以 super() 收尾/分流,不复刻基类实现。"""
+    """All three wraps must end/delegate via super(), never replicating base implementations."""
     src = CLOUD.read_text(encoding="utf-8")
     assert "return super()._update_states(scheduler_output)" in src
     assert "return super()._update_streaming_request(req_id, new_req_data)" in src
@@ -91,6 +91,6 @@ def test_runtime_supports_mm_inputs_property() -> None:
     runner = cls.__new__(cls)
     runner._model_supports_mm_inputs = True
     runner.input_batch = NS(req_prompt_embeds={0: object()})
-    assert runner.supports_mm_inputs is False  # 注入批:门关
+    assert runner.supports_mm_inputs is False  # injected batch: gate closed
     runner.input_batch = NS(req_prompt_embeds={})
-    assert runner.supports_mm_inputs is True   # 空批:模型真值
+    assert runner.supports_mm_inputs is True   # empty batch: model true value

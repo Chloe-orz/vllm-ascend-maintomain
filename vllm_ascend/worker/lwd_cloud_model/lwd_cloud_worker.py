@@ -25,8 +25,8 @@ from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
-# ops 须先于 model_runner 链初始化，否则 device_op 与 ops 包循环导入
-#（对齐 worker.py 的导入顺序）
+# ops must initialize before the model_runner chain, otherwise device_op
+# and the ops package circularly import (mirrors worker.py's import order)
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
@@ -64,9 +64,11 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_up_recv_futures: dict[
             int, tuple["LwdCommFuture | None", "LwdEmbedBatch"]
         ] = {}
-        # [Lwd][pre-recv] 提前收:端点 rank(= 唯一持跨机 P2P 通道的云 rank,
-        # 与 lwd_wire 同款约定)才提前挂真实 irecv 并上报收完水位;其余 rank
-        # 的数据在注入时刻由 TP 组内广播取到,既不挂 recv 也不上报。
+        # [Lwd][pre-recv] Early receive: only the endpoint rank (= the only
+        # cloud rank holding a cross-node P2P channel, same convention as
+        # lwd_wire) pre-posts the real irecv and reports completion
+        # watermarks; every other rank gets its data via the in-group TP
+        # broadcast at inject time — no recv posted, nothing reported.
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
             # The LWD hooks live on the V1 model runner; the V2 runner
@@ -85,14 +87,16 @@ class LwdCloudWorker(LwdWorkerBase):
             self.vllm_config, self.device, worker=self
         )
         self._init_lwd_duplex_channels()
-        # 端点 rank 才有跨机通道:把它的提前收通信线程起起来(hint MQ 已由
-        # 执行器在建 worker 之前建好并写进环境变量;done MQ 由本处建 writer,
-        # handle 随 READY 握手回传引擎)。其余 rank 只登记"非端点"。
+        # Only the endpoint rank has a cross-node channel: start its
+        # early-recv comm thread (the hint MQ was created by the executor
+        # before worker construction and exported via env; this side
+        # creates the done MQ writer, its handle rides the READY handshake
+        # back to the engine). Other ranks just register as non-endpoint.
         self._lwd_early_recv_endpoint = (
             self.rank == self.parallel_config.lwd_config.edge_npu_count
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
-        # 每个云 rank 都打一行:谁该起通信线程一目了然
+        # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         logger.info(
             "[Lwd][pre-recv] worker rank=%d endpoint=%s hidden=%d",
             self.rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
@@ -102,11 +106,14 @@ class LwdCloudWorker(LwdWorkerBase):
         self._register_lwd_prompt_embeds_provider()
 
     def load_model(self) -> None:
-        """加载后打实际切片:层数/首末层名/pp 切层参数,启动期即可裁决
-        半模型嫌疑(全量且从 layer 0 起 = 正常;减半/起始非 0 = pp 切错)。"""
+        """Log the real layer split after loading: layer count / first-last
+        layer names / pp slicing args, so a half-model suspicion is decided
+        at startup (full coverage from layer 0 = normal; halved or nonzero
+        start = wrong pp slicing)."""
         super().load_model()
-        # [layer-trace] 对拍插桩(env 门控,缺省零开销):云侧安装点,
-        # 与边侧/集中式共用同一份代码(见 lwd_debug.lwd_layer_trace)。
+        # [layer-trace] Parity instrumentation (env-gated, zero overhead
+        # when off): the cloud install point; edge and centralized share
+        # the same code (see lwd_debug.lwd_layer_trace).
         from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
             install_lwd_layer_trace,
         )
@@ -124,7 +131,7 @@ class LwdCloudWorker(LwdWorkerBase):
         ]
         logger.info(
             "[Lwd][cloud-model] loaded layers=%s first=%s last=%s "
-            "(config pp=%d tp=%d, my rank=%d) — 全量应覆盖 layer 0 起的全部层",
+            "(config pp=%d tp=%d, my rank=%d) — full load should cover every layer from 0",
             len(layers) if layers is not None else "?",
             layer_names[0] if layer_names else "?",
             layer_names[-1] if layer_names else "?",
@@ -138,8 +145,9 @@ class LwdCloudWorker(LwdWorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> "ModelRunnerOutput | AsyncModelRunnerOutput | None":
-        # [Lwd][perf] worker 开工时刻(与引擎 rpc-enqueue ts 对减 =
-        # 下达-开工延迟;各卡开工离散 = 集合对齐成本)
+        # [Lwd][perf] Worker start time (subtract the engine's rpc-enqueue
+        # ts = dispatch-to-start latency; spread across ranks = collective
+        # alignment cost)
         logger.info(
             "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
             self.rank, time.monotonic(),
@@ -157,8 +165,9 @@ class LwdCloudWorker(LwdWorkerBase):
         get_lwd_comm_service().poll_completions()  # lazy keepalive reap
         _t0 = time.monotonic()
         output = super().execute_model(scheduler_output)
-        # [Lwd][perf] 云侧每步 exec_model 计时:total=前向全程
-        # (forward 主段,sample/collect 在 sample_tokens 另有分项)
+        # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
+        # whole forward pass (sample/collect are itemized separately in
+        # sample_tokens)
         logger.info(
             "[Lwd][perf] cloud-exec total=%.2fms",
             (time.monotonic() - _t0) * 1000,
@@ -168,22 +177,29 @@ class LwdCloudWorker(LwdWorkerBase):
     def _lwd_up_post_recvs(self, scheduler_output: "SchedulerOutput") -> None:
         """Bind the UP recv for an incoming LWD_EMBED batch.
 
-        UP 两段通信按 prefill_only_demo_br 范式拆到两个时刻:
-          * post 时刻(本函数):仅端点 rank 经通道 P2P 挂 recv;非端点只登记
-            meta 占位;
-          * 消费时刻(runner 注入侧):各卡在*自己的计算流上*现场发起 TP 组内
-            broadcast 并紧随 work.wait()——torch_npu 下两个 HCCL op 之间的跨流
-            排序不可依赖(实测 post 时刻发起的广播抢跑 irecv、交付残缺),
-            launch+wait 同流上下文原子对才是 demo 验证过的可靠形态。
+        The UP two-phase communication splits into two instants per the
+        prefill_only_demo_br pattern:
+          * post time (this function): only the endpoint rank posts the
+            channel P2P recv; non-endpoints just register the meta;
+          * consume time (the runner's inject side): every rank launches
+            the in-group TP broadcast *on its own compute stream* followed
+            immediately by work.wait() — under torch_npu, cross-stream
+            ordering between two HCCL ops cannot be trusted (broadcasts
+            launched at post time were measured racing ahead of the irecv
+            and delivering truncated data); a launch+wait pair in the same
+            stream context is the demo-verified reliable shape.
 
-        提前收(early recv):端点那条 irecv **已由通信线程按引擎提示提前挂好**
-        (RangeNotify 到达即挂,不等本 SO),本处只是取用那条 future;闸门
-        (``_lwd_pre_recv_ready``)保证放行时它一定已挂出。提示万一没到,本处用
-        同一份信息现场补挂(见 ``get_or_post_early_recv``),不会漏挂。
+        Early recv: the endpoint's irecv has already been pre-posted by the
+        comm thread on the engine's hint (posted as soon as the RangeNotify
+        arrives, not waiting for this SO); this function only takes that
+        future. The gate (``_lwd_pre_recv_ready``) guarantees it is posted
+        before release. Should a hint never arrive, the same information
+        re-posts it here (see ``get_or_post_early_recv``) — no missed recv.
 
         All control info rides the SchedulerOutput (edge -> cloud
-        control plane fills it in):batch.seqno 为边侧派发号(跨机段
-        配对键),recv 尺寸包含 embedding 及可选的 Hash 专家 ID。"""
+        control plane fills it in): batch.seqno is the edge-side dispatch
+        number (the cross-node pairing key); the recv size covers the
+        embeddings plus optional Hash expert IDs."""
         from vllm.v1.core.sched.output import LwdBatchType
 
         batch = getattr(scheduler_output, "lwd_batch", None)
@@ -195,22 +211,27 @@ class LwdCloudWorker(LwdWorkerBase):
         num_tokens = sum(len(t) for t in meta.token_ids)
         if num_tokens <= 0:
             return
-        # mrope positions 已改走控制面(LwdRangeItem.mrope_positions 随
-        # meta 到达,wire_version>=2),UP recv 只挂 embeds 主帧,aux_rows
-        # 恒 0——若残留非零,预挂的 aux irecv 永远收不到数据,水位停摆。
-        # aux 帧机制保留在通道层供 deepstack 等扩展。
+        # mrope positions moved to the control plane
+        # (LwdRangeItem.mrope_positions arrives with the meta,
+        # wire_version>=2); the UP recv posts only the main embeds frame
+        # and aux_rows is always 0 — a stale nonzero would leave the
+        # pre-posted aux irecv forever unmatched and stall the watermark.
+        # The aux frame mechanism stays in the channel layer for deepstack
+        # and other future payloads.
         if self._lwd_early_recv_endpoint:
             future = self.get_or_post_early_recv(
                 batch.seqno, num_tokens, 0
             )
         else:
-            # 非端点:不碰跨机通道;广播接收推迟到注入时刻现场发起,
-            # None 即"消费时现场广播"标记。
+            # Non-endpoint: never touches the cross-node channel; the
+            # broadcast receive is deferred to inject time. None marks
+            # "broadcast on consumption".
             future = None
         self._lwd_up_recv_futures[batch.seqno] = (future, meta)
         if future is None:
-            # 每批 7 行 INFO 是纯噪音,降到 DEBUG(VLLM_LOGGING_LEVEL=DEBUG
-            # 时仍能看到各 rank 进前向的时刻/离散)
+            # Seven INFO lines per batch is pure noise; demoted to DEBUG
+            # (with VLLM_LOGGING_LEVEL=DEBUG the per-rank forward entry
+            # times/spread are still visible)
             logger.debug(
                 "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
                 "endpoint=False ts=%.3f",
@@ -218,8 +239,9 @@ class LwdCloudWorker(LwdWorkerBase):
                 time.monotonic(),
             )
             return
-        # 每批一条显存读数(仅端点 rank 有 recv buffer):峰值一路爬 = 有东西
-        # 没释放;mem_free 逼近 0 = OOM 前兆。
+        # One memory reading per batch (only the endpoint rank holds recv
+        # buffers): a climbing peak = something is leaking; mem_free
+        # approaching 0 = OOM precursor.
         free_bytes, _total = torch.npu.mem_get_info()
         logger.info(
             "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
@@ -233,55 +255,67 @@ class LwdCloudWorker(LwdWorkerBase):
         )
 
     # ------------------------------------------------------------------ #
-    # 提前收:通信线程(提示下发 -> 挂 recv -> 上报水位)                     #
+    # Early receive: comm thread (hint -> post recv -> report watermark) #
     # ------------------------------------------------------------------ #
 
     def _init_lwd_early_recv_state(self) -> None:
-        """提前收收单(与引擎下发的提示、上报的水位同一套键)。
+        """The early-recv ledger (same keys as the engine-issued hints and
+        the reported watermarks).
 
-        key = (channel, seqno)。条目生命周期:提示到达即 submit_recv 并登记;
-        消费点 ``get_or_post_early_recv`` 只是**取用并标记已消费**(不 pop:
-        上报线程还要继续轮询它推进水位);"既已上报又已消费"才移除。
+        Key = (channel, seqno). Entry lifecycle: a hint submits the recv
+        and registers the entry; the consume point
+        ``get_or_post_early_recv`` only *takes and marks consumed* (no
+        pop: the reporter thread keeps polling it to advance the
+        watermark); removal happens only once both reported and consumed.
 
-        **在飞上限 = 3**:一条已挂 recv 占一块整批大小的接收 buffer(含 aux 帧),
-        而这个 3 与边侧的 pending 闸门同源 —— ``LwdEdgeScheduler``
-        ``_LWD_MAX_PENDING_CHUNKS = 3`` 按"未消费 chunk(seqno)"限制边侧领先量,
-        所以云侧最多也就需要这 3 条;上限之外的提示先排队(``_early_recv_pending``,
-        按到达序,只存字段不占显存),前面的批随 SO 被消费腾出名额后立刻补挂。
-        归还点必须是"随 SO 被消费"(=已下发)而不是"收完":闸门放行第 N 批的
-        条件是水位 ≥ N,放行后 execute_model 立刻要取这条 future;名额若拖到
-        收完才还,N+1 的 recv 可能还没挂上,闸门就会跑到 recv 前面。
+        **In-flight cap = 3**: each posted recv holds a whole-batch-sized
+        receive buffer (aux frames included), and this 3 shares its source
+        with the edge-side pending gate — ``LwdEdgeScheduler`` caps edge
+        lead by unconsumed chunks at ``_LWD_MAX_PENDING_CHUNKS = 3``, so
+        the cloud never needs more than those 3. Hints beyond the cap
+        queue first (``_early_recv_pending``, arrival-ordered, fields only
+        — no device memory) and post as soon as a slot frees when an
+        earlier batch is consumed with its SO. The slot must be returned
+        on "consumed with the SO" (= dispatched), NOT on "received":
+        the gate releases batch N once the watermark >= N, and
+        execute_model immediately takes that future; if slots were
+        returned only on completion, batch N+1's recv might not be posted
+        yet and the gate would run ahead of the recv.
         """
         self._early_recv_max_inflight = 3
         self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdCommFuture] = {}
         self._early_recv_lock = threading.Lock()
-        # 已被消费点取走的 key:防止通信线程在提示迟到时再挂一条重复 recv
+        # Keys already taken by the consume point: prevents the comm thread from posting a duplicate recv on a late hint
         self._early_recv_consumed: set[tuple[LwdChannelType, int]] = set()
-        # 已上报完成的 key
+        # Keys whose completion has been reported
         self._early_recv_reported: set[tuple[LwdChannelType, int]] = set()
-        # 名额已满时排队的提示(key -> hint,插入序即到达序)
+        # Hints queued while the in-flight cap is full (key -> hint, insertion order = arrival order)
         self._early_recv_pending: dict[
             tuple[LwdChannelType, int], "dict[str, Any]"
         ] = {}
-        # 队列卡住诊断的限频时间戳
+        # Rate-limit timestamp for the stuck-queue diagnostic
         self._early_recv_stuck_log_at = 0.0
-        # 下行提示 MQ(reader)/ 上行完成上报 MQ(writer)
+        # Downstream hint MQ (reader) / upstream completion MQ (writer)
         self._irecv_hint_mq = None
         self._irecv_done_mq = None
-        # 公开别名:WorkerProc 在 worker 构造后取它,把 handle 随 READY 回传,
-        # 引擎据此挂 done reader(见 vllm/v1/executor/multiproc_executor.py)。
+        # Public alias: WorkerProc takes it after worker construction,
+        # returns the handle with READY, and the engine attaches its done
+        # reader (see vllm/v1/executor/multiproc_executor.py).
         self.irecv_done_mq = None
         self._lwd_early_recv_thread: threading.Thread | None = None
 
     def _lwd_build_up_recv_request(
         self, seqno: int, num_tokens: int, aux_rows: int
     ) -> LwdCommRequest:
-        """UP recv 请求的唯一构造点(提示路径与消费点补挂共用同一形状)。
+        """The single construction point for UP recv requests (the hint path
+        and the consume-point re-post share the same shape).
 
-        HCCL P2P 要求两端 numel 严格相等:主帧 = hash 载荷公式(embeds + 可选
-        专家 ID 字节)。aux 帧机制保留供 deepstack 等未来载荷(mrope
-        positions 自 wire_version 2 起改走控制面,调用方恒传 aux_rows=0)。
-        尺寸公式只在本处算一次,两侧路径不会各算一遍算歪。
+        HCCL P2P requires both ends to match numel exactly: the main frame
+        = the hash payload formula (embeds + optional expert-ID bytes).
+        The aux frame mechanism is kept for deepstack and other future
+        payloads (mrope positions moved to the control plane in
+        wire_version 2; callers always pass aux_rows=0). The size formula
+        is computed here exactly once so the two paths cannot drift.
         """
         return LwdCommRequest(
             channel=LwdChannelType.UP,
@@ -292,18 +326,22 @@ class LwdCloudWorker(LwdWorkerBase):
                 getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
             ),
             seqno=int(seqno),
-            # aux 第二载荷与主帧同 seqno;mrope 退役后恒 0(零 aux 流量),
-            # 未来载荷(如 deepstack)显式传行数即可
+            # The aux second payload shares the main frame's seqno; always
+            # 0 since mrope retired (zero aux traffic); future payloads
+            # (deepstack etc.) just pass their row count
             aux_num_elements=int(aux_rows) * 3,
         )
 
     def _start_lwd_early_recv_thread(self) -> None:
-        """重建 hint MQ reader、建 done MQ writer,起提前收通信线程。
+        """Rebuild the hint MQ reader, create the done MQ writer, and start
+        the early-recv comm thread.
 
-        起线程前后各打一行:"starting" 在起之前(证明这段代码走到了)、"up"
-        在线程体里设完设备之后(证明线程真的活起来了)。只有前一行 = 线程在
-        设置设备时挂了(异常栈在 stderr);两行都在但没 SUBMIT = 没收到提示
-        (hint MQ 没挂上,日志里会写 attached/none)。
+        One log line before and after the thread start: "starting" before
+        (proof this code ran) and "up" from inside the thread body after
+        setting the device (proof the thread is alive). Only the first
+        line = the thread died during device setup (traceback on stderr);
+        both lines but no SUBMIT = no hints arrived (hint MQ not attached;
+        the log will say attached/none).
         """
         from vllm_ascend.distributed.lwd_comm.pre_recv import (
             attach_hint_mq,
@@ -325,14 +363,17 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_early_recv_thread.start()
 
     def _lwd_early_recv_loop(self) -> None:
-        """通信线程主体:取提示 -> 提前挂 recv;轮询 future -> 上报收完。
+        """Comm thread body: take hints -> pre-post recvs; poll futures ->
+        report completions.
 
-        只做四件极轻的事:``dequeue`` / ``submit_recv`` / ``future.done()`` /
-        ``enqueue`` —— 从不 ``wait()`` 任何 future、也不碰模型,所以不与
-        busy_loop 的 HCCL 使用冲突(同通道上一端 irecv 一端跨线程 wait 是
-        HCCL 不允许的)。
+        It only does four featherweight things: ``dequeue`` /
+        ``submit_recv`` / ``future.done()`` / ``enqueue`` — it never
+        ``wait()``s any future and never touches the model, so it cannot
+        conflict with the busy loop's HCCL usage (an irecv on one side of
+        a channel plus a cross-thread wait on the other is disallowed by
+        HCCL).
         """
-        # 当前设备是线程级状态,通信线程要自己设一次(否则 irecv 落到 0 卡)
+        # The current device is thread-local state; the comm thread must set it once itself (or the irecv lands on card 0)
         torch.npu.set_device(self.device)
         logger.info(
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
@@ -347,27 +388,31 @@ class LwdCloudWorker(LwdWorkerBase):
                 except TimeoutError:
                     pass
                 except Exception:
-                    # 关停时 ring 被取消等:记一条、小睡,别热转(daemon 线程
-                    # 随进程退出)
+                    # Ring cancelled at shutdown etc.: log once and sleep a
+                    # little; never hot-spin (daemon threads exit with the
+                    # process)
                     logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
                     time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
                 else:
                     self.start_early_irecv(hint)
             self._report_irecv_completions()
             self._warn_if_early_recv_stuck()
-            # ring 读端在"刚读过"的时间窗内是 sched_yield 自旋(busy_loop_s=1s),
-            # 光给 0.5ms 超时并不封顶 CPU —— 这行 sleep 才是封顶,代价是
-            # 提示/水位各约 2ms 的可见延迟。
+            # The ring's read side sched_yield-spins within the
+            # just-read window (busy_loop_s=1s), so a 0.5ms timeout alone
+            # does not cap the CPU — this sleep does; the cost is ~2ms of
+            # added visibility latency on hints and watermarks each.
             time.sleep(_LWD_EARLY_RECV_LOOP_SLEEP_S)
 
     _LWD_EARLY_RECV_STUCK_LOG_INTERVAL_S = 5.0
 
     def _warn_if_early_recv_stuck(self) -> None:
-        """队列挂不上时每 5s 一条告警:排队有提示、名额却全被占住。
+        """Warn every 5s while the queue cannot drain: hints are queued but
+        every in-flight slot is held.
 
-        名额被占住 = 那几条已挂 recv 既没被消费也没释放(水位因此不前进、
-        闸门不再放行 prefill)。这条日志把"谁占着名额"直接写出来,避免出现
-        "prefill 不动了但不知道为什么"。
+        Held slots = posted recvs neither consumed nor released (so the
+        watermark stops advancing and the gate stops releasing prefills).
+        The log names exactly which seqnos hold the slots — no more
+        "prefill stalled and nobody knows why".
         """
         with self._early_recv_lock:
             if (
@@ -392,10 +437,12 @@ class LwdCloudWorker(LwdWorkerBase):
         )
 
     def start_early_irecv(self, hint: "dict[str, Any]") -> None:
-        """收下一条引擎提示;名额没满就立刻挂 recv,满了先排队。
+        """Take one engine hint; post the recv immediately while slots
+        remain, otherwise queue it.
 
-        幂等:同一 (channel, seqno) 的重复提示、或消费点已经处理过的,都不再
-        接受 —— 同一通道上两条 irecv 会抢发送端那一条 isend。
+        Idempotent: duplicate hints for the same (channel, seqno), or ones
+        the consume point already handled, are ignored — two irecvs on one
+        channel would race the sender's single isend.
         """
         from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
 
@@ -416,11 +463,13 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_pump()
 
     def _early_recv_pump(self) -> None:
-        """把排队的提示按到达序挂成 recv,直到用满在飞名额。
+        """Post queued hints as recvs in arrival order until the in-flight
+        cap is full.
 
-        名额 = "已挂 recv、还没随 SO 被消费"的条数(每条占一块整批接收 buffer),
-        所以这里的上限就是显存上限;``get_or_post_early_recv`` 消费一条后调用
-        本函数补挂下一条,提示队列因此不会因为上限而丢。
+        Slots = entries whose recv is posted but not yet consumed by an SO
+        (each holds a whole-batch receive buffer), so this cap is a memory
+        cap; ``get_or_post_early_recv`` calls this after consuming one to
+        post the next, so the hint queue never drops anything.
         """
         from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
 
@@ -449,11 +498,13 @@ class LwdCloudWorker(LwdWorkerBase):
             )
 
     def _report_irecv_completions(self) -> None:
-        """把已收完的 recv 以 (channel, seqno) 上报到 done MQ。
+        """Report completed recvs as (channel, seqno) tuples to the done MQ.
 
-        每通道完成序 = seqno 序,所以引擎侧只维护一个最大水位就能精确判就绪。
-        已被消费点取走的条目继续轮询:消费意味着前向正在用这份数据,``done()``
-        很快转真,水位照样前进;条目"既上报过又被消费过"才移除。
+        Per-channel completion order = seqno order, so one max watermark
+        per channel decides readiness exactly. Entries already taken by
+        the consume point keep being polled: consumption means the forward
+        is using the data, so ``done()`` flips soon and the watermark
+        still advances; removal only once both reported and consumed.
         """
         done_mq = self._irecv_done_mq
         if done_mq is None:
@@ -467,12 +518,12 @@ class LwdCloudWorker(LwdWorkerBase):
         for key, future in pending:
             if not future.done():
                 continue
-            # ① 收完:这条 recv 的数据(主帧 + aux 帧)已完整落地
+            # ① Completed: this recv's data (main frame + aux frame) has fully landed
             logger.info(
                 "[Lwd][pre-recv] DONE channel=%s seqno=%d ts=%.3f",
                 key[0].value, key[1], time.monotonic(),
             )
-            # ② 上报:把 (channel, seqno) 写进 done MQ,引擎每步排空它推进水位
+            # ② Report: write (channel, seqno) into the done MQ; the engine drains it each step to advance the watermark
             done_mq.enqueue(key)
             logger.info(
                 "[Lwd][pre-recv] REPORT channel=%s seqno=%d ts=%.3f",
@@ -493,15 +544,20 @@ class LwdCloudWorker(LwdWorkerBase):
     def get_or_post_early_recv(
         self, seqno: int, num_tokens: int, aux_rows: int
     ) -> LwdCommFuture | None:
-        """取通信线程提前挂好的 UP recv future;没有就现场补挂一条并登记。
+        """Take the comm thread's pre-posted UP recv future; if absent,
+        post one on the spot and register it.
 
-        非端点 rank 无跨机通道(数据在注入时刻由 TP 广播取到),返回 None。
-        条目不在本处移除:上报线程要继续轮询它推进水位,只有"既上报又消费"
-        才移除,所以水位不会因为被消费而断档。
+        Non-endpoint ranks hold no cross-node channel (their data arrives
+        via the TP broadcast at inject time) and get None. Entries are not
+        removed here: the reporter thread keeps polling them to advance
+        the watermark; removal only once both reported and consumed, so
+        the watermark never gaps on consumption.
 
-        本处是**名额归还点**(与旧版 `note_scheduled` 同款):SO 一到,这一条
-        的 buffer 马上要交给前向,名额立刻转给还在排队的提示(提示还排着队时
-        先就地挂上,闸门/前向不可能跑到 recv 前面)。
+        This is the **slot-return point** (same role as the old
+        `note_scheduled`): once the SO arrives, this entry's buffer goes
+        straight to the forward, and the slot passes to a queued hint
+        immediately (a still-queued hint is posted in place here — the
+        gate/forward can never overtake the recv).
         """
         if not self._lwd_early_recv_endpoint:
             return None
@@ -511,7 +567,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self._early_recv_consumed.add(key)
             future = self._early_recv_futures.get(key)
             if future is None:
-                # 名额满时该提示还在排队:本批已下发,现在必须挂上
+                # The hint was still queued while slots were full: this batch is dispatched, so post it now
                 hint = self._early_recv_pending.pop(key, None)
                 if hint is not None:
                     future = get_lwd_comm_service().submit_recv(
@@ -522,13 +578,14 @@ class LwdCloudWorker(LwdWorkerBase):
                     self._early_recv_futures[key] = future
             if future is not None:
                 if key in self._early_recv_reported:
-                    # 完成已上报:消费即条目终点(上报线程不会再碰它)
+                    # Completion already reported: consumption is the entry's end (the reporter will not touch it again)
                     self._early_recv_futures.pop(key, None)
                     self._early_recv_reported.discard(key)
                     self._early_recv_consumed.discard(key)
             else:
-                # 提示彻底没到(或到得比本 SO 还晚):用同一份信息现场补挂,
-                # 保证上报链不缺号,水位能继续前进
+                # The hint truly never arrived (or lands later than this
+                # SO): re-post from the same information so the report chain
+                # has no gaps and the watermark can keep advancing
                 logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
                 future = get_lwd_comm_service().submit_recv(
                     self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
@@ -536,7 +593,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 self._early_recv_futures[key] = future
             inflight = len(self._early_recv_futures)
             queued = len(self._early_recv_pending)
-        # 名额已归还:补挂排队中的提示
+        # Slot returned: post the next queued hint
         self._early_recv_pump()
         logger.info(
             "[Lwd][pre-recv] stats seqno=%d inflight=%d queued=%d",
@@ -544,18 +601,21 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         return future
 
-    # 注:take_lwd_up_embeds(host 阻塞收割)不随移植恢复——本线上 UP
-    # 消费已收进 runner(_lwd_inject_remote_embeds:端点过门 + TP 组内
-    # 现场广播),worker 层只保留 post 侧;aux(mrope)帧同路径消费。
+    # Note: take_lwd_up_embeds (host-blocking harvest) is not revived with
+    # the port — UP consumption lives in the runner on this line
+    # (_lwd_inject_remote_embeds: endpoint gate + in-place TP broadcast);
+    # the worker layer keeps only the post side. aux (mrope) frames are
+    # consumed on the same path.
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
         _t0 = time.monotonic()
         output = self.model_runner.sample_tokens(grammar_output)
         _t_sample = time.monotonic()
-        # rank-replay DOWN:发送 hidden 包(通道异步、流内有序);pinned 视图
-        # 挂输出内层(就绪由 get_output 的 wait_stream(主流) 保证),
-        # 引擎侧解码发布 meta。
+        # rank-replay DOWN: send the hidden packet (channel-async,
+        # in-stream ordered); the pinned view rides the output's inner
+        # layer (readiness guaranteed by get_output's wait_stream on the
+        # main stream), and the engine side decodes/publishes the meta.
         payload = self.model_runner.take_lwd_pending_down_payload()
         if payload is not None and output is not None:
             hidden, pinned, _event, req_ids, _accepted = payload
@@ -573,13 +633,15 @@ class LwdCloudWorker(LwdWorkerBase):
                     seqno=seqno,
                 )
             )
-            # async 包装器下挂到内层,否则 get_output() 解包丢失
+            # Under the async wrapper it must ride the inner layer, or get_output() unwraps it away
             target = getattr(output, "_model_runner_output", output)
             target.lwd_down_carrier = (
                 pinned, req_ids, hidden.numel(), seqno
             )
-            # [Lwd][perf] 云侧每步计时:sample=采样+采集(含秩计算);
-            # send=DOWN 提交(快照clone+isend+bridge wait);total=全步
+            # [Lwd][perf] Per-step cloud timing: sample = sampling +
+            # collection (rank computation included); send = the DOWN
+            # submit (snapshot clone + isend + bridge wait); total = the
+            # whole step
             logger.info(
                 "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f "
                 "total=%.2fms rows=%d",

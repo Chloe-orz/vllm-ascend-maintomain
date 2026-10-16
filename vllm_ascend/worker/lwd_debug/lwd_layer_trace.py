@@ -1,20 +1,25 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
-"""Lwd 边云 vs 集中式的逐层对拍插桩(调试设施,双模式共用)。
+"""LWD edge-cloud vs centralized per-layer parity instrumentation (debug
+facility, shared by both modes).
 
-设计约束:
-  * 集中式与边云必须走同一份插桩代码,插桩本身不得引入差异——
-    安装点在边/云各自的 load_model(边云臂自动;见 LwdEdgeWorker /
-    LwdCloudWorker),环境变量 VLLM_ASCEND_LWD_LAYER_TRACE=1 门控,
-    缺省零开销;
-  * 集中式对照臂为手动 opt-in:设同一环境变量后由驱动方调用
-    install_lwd_layer_trace(model)——基类 NPUModelRunner 保持零
-    LWD 符号,weave guard 白名单维持为空;
-  * 只打校验和(numel/sum/abs_sum/max_abs/l2/head4),不打全量张量;
-  * 只追踪前 _MAX_STEPS 个 model forward(prefill + 若干 decode),
-    防止 decode 循环刷屏。
-日志前缀统一 [layer-trace],与 [Lwd][DUMP] 并存便于 grep。
+Design constraints:
+  * Centralized and edge-cloud MUST run the identical instrumentation —
+    the instrumentation itself may not introduce divergence — so the
+    install points live in the per-side load_model (edge/cloud arms are
+    automatic; see LwdEdgeWorker / LwdCloudWorker), gated by the
+    VLLM_ASCEND_LWD_LAYER_TRACE=1 env var, zero overhead when off;
+  * The centralized comparison arm is manual opt-in: set the same env
+    var and call install_lwd_layer_trace(model) from the driver — the
+    NPUModelRunner base stays free of LWD symbols and the weave-guard
+    allowlist stays empty;
+  * Log checksums only (numel/sum/abs_sum/max_abs/l2/head4), never full
+    tensors;
+  * Trace only the first _MAX_STEPS model forwards (prefill plus a few
+    decode steps) so the decode loop cannot flood the log.
+Log prefix is uniformly [layer-trace], coexisting with [Lwd][DUMP] for
+easy grep.
 """
 
 import os
@@ -33,7 +38,7 @@ def lwd_layer_trace_enabled() -> bool:
 
 
 def lwd_tensor_checksum(tag: str, tensor: Any) -> str:
-    """张量校验和单行描述;非张量/空张量返回占位。"""
+    """One-line tensor checksum description; non-tensors and empty tensors return a placeholder."""
     if tensor is None:
         return f"{tag}=None"
     if not isinstance(tensor, torch.Tensor):
@@ -51,7 +56,7 @@ def lwd_tensor_checksum(tag: str, tensor: Any) -> str:
 
 
 def _hidden_from(x: Any) -> Any:
-    """从模块入参/出参里取 hidden 张量(容 tuple/None 包裹)。"""
+    """Extract the hidden tensor from module inputs/outputs (tolerates tuple/None wrapping)."""
     if isinstance(x, torch.Tensor):
         return x
     if isinstance(x, (tuple, list)) and len(x) > 0:
@@ -99,9 +104,9 @@ def _make_step_hook() -> Callable[..., None]:
 def _find_text_backbone(
     model: "torch.nn.Module",
 ) -> "tuple[torch.nn.Module | None, torch.nn.ModuleList | None]":
-    """定位文本 backbone:兼容普通结构(model.model.layers)与 VL 包装
-    结构(model.language_model[.model].layers,顶层是 visual+language_model)。
-    返回 (backbone, layers);找不到返回 (None, None)。"""
+    """Locate the text backbone: handles plain structures (model.model.layers)
+    and VL wrappers (model.language_model[.model].layers, top level being
+    visual+language_model). Returns (backbone, layers) or (None, None)."""
     candidates = (
         getattr(model, "model", None),
         getattr(getattr(model, "language_model", None), "model", None),
@@ -120,10 +125,13 @@ def _find_text_backbone(
 
 
 def install_lwd_layer_trace(model: "torch.nn.Module") -> None:
-    """L0+L2:层数/结构日志 + 逐层 forward hook(幂等,env 门控)。
+    """L0+L2: layer-count/structure log + per-layer forward hooks (idempotent,
+    env-gated).
 
-    覆盖 embed_tokens / decoder layers / final norm / lm_head;对拍时
-    集中式与边云同用本安装器,层列表本身即半模型嫌疑的裁决证据。"""
+    Covers embed_tokens / decoder layers / final norm / lm_head; both
+    centralized and edge-cloud use this installer during parity runs, and
+    the layer list itself is the adjudicating evidence for half-model
+    suspicions."""
     if not lwd_layer_trace_enabled():
         return
     if getattr(model, "_lwd_layer_traced", False):

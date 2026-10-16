@@ -1,23 +1,34 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""S1/S2 重构守卫(纯源码断言,无 torch,任何环境必跑)。
+"""S1/S2 refactor guards (pure source assertions; no torch, must pass in
+any environment).
 
-锚定 docs/refactor/lwd_worker_packages_refactor_plan.md S1/S2 的关键
-等价与结构承诺,防止回归:
-- R1: 死代码 compute_top_id_th 已删;
-- R2: 三处手写 pinned 环收敛到 LwdPinnedStaging(槽序变量清零);
-- R3: 端点判定单源(runner 不再重算 edge_npu_count);
-- F6a/R4: 收割逐 seqno 交错拆分(_lwd_stage_up_batch → _lwd_harvest
-  __tensors_one → _lwd_check_up_windows),事件序与拆分前单循环逐点
-  一致,整体位于 super()._prepare_inputs 之前(暂缓项 D1 的边界);
-- R4: 注入段复用收割携带的批位,不再重查 req_id_to_index;
-- 三类 fail-fast 消息(静默乱码防线)原文保留;
-- F6b: DOWN 采集拆分后 runner 经 worker.note_lwd_meta_ready 记事件,
-  不再直写 worker 私有属性;
-- R9: 完结清理单主(runner.lwd_release_finished 唯一落点,worker 只
-  转发)。
+Anchors the key equivalence and structural commitments of
+S1/S2 in docs/refactor/lwd_worker_packages_refactor_plan.md against
+regressions:
+- R1: the dead compute_top_id_th stays deleted;
+- R2: the three hand-rolled pinned rings stay consolidated into
+  LwdPinnedStaging (slot-index variables stay zeroed);
+- R3: the endpoint predicate stays single-sourced (the runner never
+  recomputes edge_npu_count);
+- F6a/R4: the harvest stays split per-seqno (_lwd_stage_up_batch ->
+  _lwd_harvest_tensors_one -> _lwd_check_up_windows) with an event order
+  matching the pre-split single loop point for point, wholly before
+  super()._prepare_inputs (the boundary of deferred item D1);
+- R4: the inject reuses the batch positions carried by the harvest
+  instead of re-querying req_id_to_index;
+- the three fail-fast messages (the silent-corruption defense) stay
+  verbatim;
+- F6b: after the DOWN-collect split, the runner records the event via
+  worker.note_lwd_meta_ready instead of writing the worker's private
+  attribute;
+- R9: finished-request cleanup stays single-owner
+  (runner.lwd_release_finished is the only sink; the worker only
+  forwards).
 
-时序拆分的已知良性差异(对当关系):meta 段核验先于张量段 host 门,
-失败路径下异常消息逐字一致、仅在等待前后区别;成功路径设备序不变。
+Known benign delta of the timing split (correspondence): the meta-stage
+check precedes the tensor-stage host gate, so on failure paths the
+exception message is verbatim-identical and only its position relative
+to the wait differs; on success paths the device order is unchanged.
 """
 
 from __future__ import annotations
@@ -74,12 +85,13 @@ def test_dead_code_removed() -> None:
 
 
 def test_no_is_lwd_gates_inside_lwd_runner() -> None:
-    """团队规范:lwd 类/函数内部不再判断"是否 lwd"。
+    """Team norm: LWD classes/functions never re-check "is this LWD".
 
-    入口不变量:platform.py 仅在 lwd_config.enabled 时选择
-    LwdCloudWorker,而 LwdCloudModelRunner 全仓唯一构造点在其
-    init_device——类内任何 enabled / is-not-None 门都是恒真死判断
-    (mode 维度的分支不属于"是否 lwd",允许保留)。
+    Entry invariant: platform.py selects LwdCloudWorker only when
+    lwd_config.enabled, and LwdCloudModelRunner's sole construction site
+    is its init_device — any enabled / is-not-None gate inside the class
+    is an invariantly-true dead check (mode-dimension branches are not
+    "is this LWD" and are allowed).
     """
     src = _RUNNER.read_text(encoding="utf-8")
     assert "_lwd_enabled" not in src
@@ -88,21 +100,27 @@ def test_no_is_lwd_gates_inside_lwd_runner() -> None:
 
 
 def test_draft_cache_weave_removed() -> None:
-    """LwdDraftCache 删除守卫(与基类 spec recovery chain 删除同款论证)。
+    """Guard for the LwdDraftCache removal (same argument as the base
+    spec-recovery-chain removal).
 
-    pdmix 现行线上恢复路径零消费:decode 不被驱逐(prefill notify 整批
-    defer)、原生 max_tokens 守卫是 depart-and-finish(请求必然完结,
-    不产生回归步)、V2 节拍守卫在云侧(V1 强制)是死路。删除后云
-    runner 的投机路径全原生(_update_states/_prepare_input_ids 不再
-    覆写)。若相位臂(phase_scheduler)重新接线,须连同"离批草稿
-    保管"机制一并恢复。
+    The restore path has zero consumers on the current pdmix line:
+    decode requests are never evicted (whole prefill notifies defer),
+    the native max_tokens guard is depart-and-finish (the request
+    necessarily finishes; no returning step), and the V2 cadence guard
+    is dead on the cloud (V1 enforced). With the removal, the cloud
+    runner's speculative path is fully native (_update_states /
+    _prepare_input_ids stay unoverridden). If the phase arm
+    (phase_scheduler) is ever rewired, a departure-safe draft keeper
+    must return with it.
     """
     runner_src = _RUNNER.read_text(encoding="utf-8")
     for symbol in ("LwdDraftCache", "_lwd_draft_cache", "_lwd_restore_drafts"):
         assert symbol not in runner_src, f"draft-cache weave leaked back: {symbol}"
-    # _prepare_input_ids 必须保持不覆写(草稿回填链已整体删除);
-    # _update_states 现承载零侵入占位重建 wrap(prompt_embeds seam),
-    # 属合法覆写,由 test_lwd_prompt_embeds_seam 锁定其形态。
+    # _prepare_input_ids must stay unoverridden (the draft-refill chain
+    # was removed wholesale); _update_states now carries the
+    # zero-weave placeholder rebuild wrap (prompt_embeds seam), a
+    # legitimate override whose shape is locked by
+    # test_lwd_prompt_embeds_seam.
     assert "def _prepare_input_ids(" not in runner_src
     assert not (
         _REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py"
@@ -113,12 +131,12 @@ def test_pinned_staging_single_implementation() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     edge = _EDGE.read_text(encoding="utf-8")
     base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
-    assert base.count("LwdPinnedStaging(") == 1  # 具名惰性工厂是唯一构造点
-    assert runner.count("LwdPinnedStaging(") == 0  # 云侧经 _lwd_staging 委托
+    assert base.count("LwdPinnedStaging(") == 1  # the named lazy factory is the sole constructor
+    assert runner.count("LwdPinnedStaging(") == 0  # the cloud delegates via _lwd_staging
     assert runner.count("self._lwd_staging(") == 2  # down_meta + down_index
-    assert edge.count("LwdPinnedStaging(") == 0  # 边 worker 已纯分派
+    assert edge.count("LwdPinnedStaging(") == 0  # the edge worker is pure dispatch
     edge_runner = (_REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py").read_text(encoding="utf-8")
-    assert edge_runner.count("self._lwd_staging(") == 1  # ids staging 经工厂
+    assert edge_runner.count("self._lwd_staging(") == 1  # ids staging goes through the factory
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):
         assert stale not in runner, f"hand-rolled rotation leaked: {stale}"
     assert "_lwd_ids_ring_idx" not in edge
@@ -214,12 +232,13 @@ def test_finished_release_single_owner() -> None:
     )
 
 def test_layer_trace_rehomed_and_installed() -> None:
-    """layer-trace 对拍插桩归位 lwd_debug 并恢复安装点。
+    """The layer-trace parity instrumentation is homed in lwd_debug with its
+    install points restored.
 
-    c22c04b53 清基座探针时摘除了 NPUModelRunner.load_model 的安装调用
-    且无人接手,约 120 行 hook/校验和机制成为孤儿。现归位:边/云各自
-    load_model 安装(env 门控,缺省零开销);集中式对照臂为手动
-    opt-in(基类保持零 LWD 符号,weave guard 白名单为空)。
+    c22c04b53 removed the install call from NPUModelRunner.load_model
+    while clearing probes from base classes and nobody rehomed it,
+    orphaning ~120 lines of hook/checksum machinery. Now rehomed: edge/cloud
+    install from their own load_model (env-gated); centralized is manual opt-in.
     """
     edge = _EDGE.read_text(encoding="utf-8")
     worker = _WORKER.read_text(encoding="utf-8")
@@ -231,17 +250,17 @@ def test_layer_trace_rehomed_and_installed() -> None:
     assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_layer_trace.py").exists()
 
 def test_v4_hash_wiring_on_main() -> None:
-    """V4 Hash 专家路由在 main 新结构上的接线守卫(B↔A 对当关系)。
+    """Guards for the V4 Hash expert-routing wiring on main new structure (B<->A).
 
-    B 侧(ww 分支)= deepseek_v4.py:460 构造期挂 runner 对象 + experts_selector
-    select_experts 合并块 + fused_moe 前向注入层号。main 对象图已变(runner
-    经多模块间接持有,.runner 属性不存在),对应移植为:
-      ① 模型层 forward 入口单点注入 context 层号(哈希层=层号,普通层=None
-         清空)——多层转发路径(fused_moe / routed_experts)一律不再各自注入,
-         防止内层把外层注入的正确层号覆盖成 None;
-      ② router/fused_topk_router sqrtsoftplus 分支的合并块(合并表 + 行号
-         充当 token id,复用原生 TP/EP 与门控内核,逐行为对当);
-      ③ B 侧的 TP/EP 后行数 fail-fast 同步保留。
+    B side (ww branch) = the deepseek_v4.py:460 construction-time runner wiring +
+    the experts_selector merge block + the fused_moe forward injection.
+    main object graph changed (the runner is held indirectly; no .runner attr),
+      ported as: (1) single-point context injection at the model forward entry
+         (hash layer = index, ordinary layer = None); the forwarding layers
+         never inject separately, so an inner layer cannot clobber the outer;
+      (2) the merge block in router/fused_topk_router sqrtsoftplus branch
+         (merged table + row indices as token ids; reuses native TP/EP kernels);
+      (3) the B-side post-TP/EP row-count fail-fast is kept.
     """
     model_src = (_REPO_ROOT / "vllm_ascend/models/deepseek_v4/model.py").read_text(encoding="utf-8")
     assert "get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None" in model_src

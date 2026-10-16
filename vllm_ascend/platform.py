@@ -1318,10 +1318,12 @@ def _setup_worker_and_scheduler(
     # Select worker class and refresh block size
     parallel_config = vllm_config.parallel_config
     if parallel_config and parallel_config.worker_cls == "auto":
-        # LWD prefill_only 边云 worker 选择(优先于硬件默认)。enabled/
-        # is_edge 经 getattr 防御读取:main 的 config/lwd 新代(path/
-        # role/instance)与 v0.23.0 血统字典代并存,激活桥落定前两代
-        # 均安全落到硬件默认路径。
+        # LWD prefill_only edge/cloud worker selection (takes priority
+        # over hardware defaults). enabled/is_edge are read defensively
+        # via getattr: main's new config/lwd generation (path/role/
+        # instance) and the v0.23.0-lineage dict generation coexist;
+        # until the activation bridge lands, both safely fall through to
+        # the hardware-default path.
         lwd_config = getattr(vllm_config, "lwd_config", None)
         if lwd_config is not None and getattr(lwd_config, "enabled", False):
             is_edge = getattr(lwd_config, "is_edge", None)

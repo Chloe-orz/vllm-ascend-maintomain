@@ -4,12 +4,15 @@
 Run this file directly with a Python environment containing torch and numpy.
 These checks do not validate HCCL streams or NPU graph execution.
 
-对当关系(S1/S2 拆分与 mrope 控制面迁移后的刷新):meta 段核验 +
-张量段广播 = 原 _lwd_harvest_up_batches 单循环;fake worker 直接携带
-``_lwd_early_recv_endpoint``(端点判定单源契约,rank 重算已删);mrope
-positions 以控制面字节随 meta 到达(原数据面 aux 帧路径已退役,非端点
-rank 只有一次主帧广播)。方法注解里的协议名经 globals_ 注入占位,故
-runner 侧注解保持无引号。
+Correspondence (refreshed after the S1/S2 split and the mrope
+control-plane migration): meta-stage check + tensor-stage broadcast =
+the original _lwd_harvest_up_batches single loop; the fake worker
+carries ``_lwd_early_recv_endpoint`` directly (single-source endpoint
+contract; the rank recomputation is gone); mrope positions arrive as
+control-plane bytes with the meta (the data-plane aux-frame path is
+retired; non-endpoint ranks get exactly one main-frame broadcast).
+Protocol names in method annotations are injected as placeholders via
+globals_, so the runner-side annotations stay unquoted.
 """
 
 import ast
@@ -166,7 +169,8 @@ class TestMixedInjection(unittest.TestCase):
             hash_layer_count=routing.hash_layer_count,
             hash_payload_numel=routing.hash_payload_numel,
             unpack_hash_payload=routing.unpack_hash_payload,
-            # 方法注解里的协议名:裁剪命名空间无模块级导入,占位即可。
+            # Protocol names in method annotations: the trimmed namespace has no
+            # module-level imports; placeholders suffice.
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
             LwdEmbedBatch=object,
@@ -243,8 +247,8 @@ class TestMixedInjection(unittest.TestCase):
             self.inject()
 
     def test_control_plane_mrope_visible_before_base_preparation(self):
-        # b 的 mrope positions 以控制面字节随 meta 到达([3, n] int64);
-        # a 纯文本空字节,零路径变化。
+        # b's mrope positions arrive as control-plane bytes with the meta ([3, n]
+        # int64); a is text-only with empty bytes and zero path change.
         positions = torch.tensor([[3, 6], [4, 7], [5, 8]], dtype=torch.int64)
         self.meta.mrope_positions = [positions.numpy().tobytes(), b""]
         self.meta.has_mrope = [True, False]
@@ -290,8 +294,8 @@ class TestMixedInjection(unittest.TestCase):
         self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.ids[2:]))
 
     def test_tp_receiver_consumes_control_plane_mrope_only(self):
-        # 非端点 rank:广播只发生一次(主帧);mrope 走控制面字节,不再有
-        # 数据面 aux 帧(原 aux 帧路径已退役)。
+        # Non-endpoint rank: exactly one broadcast (main frame); mrope rides
+        # control-plane bytes — no data-plane aux frame (that path is retired).
         self.runner.worker._lwd_early_recv_endpoint = False
         self.runner.worker._lwd_up_recv_futures[7] = (None, self.meta)
         self.runner.model_config.hf_config = NS(model_type="qwen2_5_vl")

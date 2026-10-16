@@ -37,13 +37,16 @@ class LwdWorkerBase(NPUWorker):
         self.comm_service = get_lwd_comm_service()
 
     def _init_worker_distributed_environment(self) -> None:
-        """覆写原生入口(worker.py):ascend 侧并行组按 Lwd 布局构建。
+        """Override of the native entry (worker.py): ascend-side parallel
+        groups are built per the LWD layout.
 
-        vllm 侧分组由 parallel_state.initialize_model_parallel 的 Lwd
-        分支完成;ascend 侧原生 init_ascend_model_parallel 按 (dp, pp,
-        pcp, tp) 均匀网格切分,表达不了非对称边云拓扑,故以
-        init_lwd_ascend_model_parallel 替代(构建 MC2 等组后注入)。
-        其余步骤与原生 worker.py 保持一致。"""
+        The vllm-side grouping is done by the LWD branch of
+        parallel_state.initialize_model_parallel; the ascend-side native
+        init_ascend_model_parallel splits ranks on a uniform (dp, pp,
+        pcp, tp) grid, which cannot express the asymmetric edge-cloud
+        topology — hence init_lwd_ascend_model_parallel replaces it
+        (building the MC2 etc. groups and injecting them). Every other
+        step matches the native worker.py verbatim."""
         init_batch_invariance()
         init_distributed_environment(
             self.parallel_config.world_size,

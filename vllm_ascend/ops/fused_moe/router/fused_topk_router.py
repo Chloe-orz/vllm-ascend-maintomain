@@ -162,10 +162,13 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
                 input_ids = input_ids.to(torch.int64)
-                # LWD prefill_only: prompt 行的专家 ID 由边侧查表随 UP
-                # 通道到达(云侧无 prompt token ids)。合并出逐步专家表
-                # (prompt 行=远端 ID,decode 行=本地查表行),以行号充
-                # 当 token id,后续完全复用原生 TP/EP 准备与门控内核。
+                # LWD prefill_only: prompt rows' expert IDs arrive from the
+                # edge's table lookup over the UP channel (the cloud has no
+                # prompt token ids). Build the per-step merged table
+                # (prompt rows = remote IDs, decode rows = local lookup
+                # rows) and let row indices play the role of token ids —
+                # everything downstream reuses the native TP/EP prep and
+                # gating kernel verbatim.
                 remote_ids = getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)
                 if remote_ids is not None:
                     tid2eid_ones = merge_hash_expert_ids(

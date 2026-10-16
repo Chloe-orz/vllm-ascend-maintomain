@@ -1,18 +1,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LwdPinnedStaging 表驱动等价测试(S1 R2 收敛的等价锚)。
+"""Table-driven equivalence tests for LwdPinnedStaging (the equivalence
 
-对当关系(不写进注释的等价性不可信):
-- ``stage_to_device`` ≍ 旧 ``LwdEdgeWorker._lwd_embed_ids_h2d`` / 旧
-  ``LwdCloudModelRunner._lwd_h2d_stage_i64`` 的"pinned 写入 +
-  non_blocking H2D + 返回 dev[:n]":4 槽轮换、容量 max(n, floor)
-  增长、增长重建后槽序归零,三语义逐条对应;
-- ``next_pinned`` ≍ 旧 ``_lwd_meta_pinned`` 的纯 pinned 4 槽轮换
-  (容量下限 4096)。
+anchor of the S1 R2 consolidation).
+Correspondence (equivalence not written down cannot be trusted):
+  - ``stage_to_device`` ~= the old ``LwdEdgeWorker._lwd_embed_ids_h2d`` /
+  ``LwdCloudModelRunner._lwd_h2d_stage_i64`` "pinned write + non_blocking
+  H2D + return dev[:n]": 4-slot rotation, capacity growth to max(n, floor),
+rotation restart after a growth rebuild — semantics correspond term by term;
+  - ``next_pinned`` ~= the old ``_lwd_meta_pinned`` pure pinned 4-slot
 
-真实环境补跑条件:训练栈主机(torch + NPU/CUDA;pinned 内存需要
-加速器宿主分配器,无 torch 或仅 CPU torch 的环境整体 skip)。
-结构层面的守卫(源码扫描)在 test_lwd_s1s2_refactor_guard.py,任何
-环境必跑。
+rotation (capacity floor 4096).
+Real-environment rerun condition: a training-stack host (torch + NPU/CUDA;
+pinned memory needs an accelerator host allocator — environments without
+torch or with CPU-only torch skip wholesale). Structural guards (source
 """
 
 from __future__ import annotations
@@ -43,16 +43,16 @@ _DEVICE = "npu" if getattr(torch, "npu", None) else "cuda"
 @pytest.mark.parametrize(
     "min_capacity,sizes",
     [
-        (8, [3, 5, 7]),  # 常规轮换,无增长
-        (8, [3, 5, 7, 9, 4]),  # 第 5 次上传回到槽 0(4 槽环)
-        (8, [64]),  # 超容量 → 增长重建
-        (8, [64, 3]),  # 增长后小载荷仍正确(槽序归零后继续轮换)
-        (1024, [1]),  # min_capacity 下限生效
-        (4, [4, 4, 4, 4, 4]),  # 定长重复上传(最常见稳态)
+        (8, [3, 5, 7]),  # plain rotation, no growth
+        (8, [3, 5, 7, 9, 4]),  # 5th upload returns to slot 0 (4-slot ring)
+        (8, [64]),  # over capacity -> growth rebuild
+        (8, [64, 3]),  # small payload still correct after growth rebuild
+        (1024, [1]),  # min_capacity floor in effect
+        (4, [4, 4, 4, 4, 4]),  # fixed-size repeated uploads (common steady state)
     ],
 )
 def test_upload_roundtrip_per_step(min_capacity: int, sizes: list[int]) -> None:
-    """每次上传后立即读回:视图值即本次暂存(同流序,legacy 同款保证)。"""
+    """Read back right after each upload: the view equals this staging."""
     ring = LwdPinnedStaging(
         dtype=torch.int64, min_capacity=min_capacity, device=_DEVICE,
     )
@@ -64,7 +64,7 @@ def test_upload_roundtrip_per_step(min_capacity: int, sizes: list[int]) -> None:
 
 
 def test_upload_rotation_depth_window() -> None:
-    """4 槽窗口内互不重叠(在飞传输不被下一步覆写),第 5 次回到槽 0。"""
+    """No overlap within the 4-slot window; the 5th returns to slot 0."""
     ring = LwdPinnedStaging(dtype=torch.int64, min_capacity=8, device=_DEVICE)
     ptrs = [ring.stage_to_device([i], 1).data_ptr() for i in range(4)]
     assert len(set(ptrs)) == 4
@@ -72,7 +72,7 @@ def test_upload_rotation_depth_window() -> None:
 
 
 def test_upload_growth_rebuild_restarts_rotation() -> None:
-    """超容量触发整环重建(max(n, floor)),重建后功能不变。"""
+    """Over-capacity triggers a whole-ring rebuild (max(n, floor)); behavior unchanged."""
     ring = LwdPinnedStaging(dtype=torch.int64, min_capacity=8, device=_DEVICE)
     ring.stage_to_device([1], 1)
     big = list(range(100))
@@ -81,7 +81,7 @@ def test_upload_growth_rebuild_restarts_rotation() -> None:
 
 
 def test_take_pinned_rotation_and_growth() -> None:
-    """纯 pinned 模式(meta 轮换同款):4 槽轮换、回到槽 0、超容量重建。"""
+    """Pinned-only mode (same rotation as meta): 4-slot rotation, slot-0 return, rebuild."""
     ring = LwdPinnedStaging(dtype=torch.int32, min_capacity=4096)
     slots = [ring.next_pinned(n) for n in (10, 20, 30, 40)]
     assert len({t.data_ptr() for t in slots}) == 4

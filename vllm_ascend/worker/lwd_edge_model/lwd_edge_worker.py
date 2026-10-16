@@ -30,10 +30,10 @@ class LwdEdgeWorker(LwdWorkerBase):
     """LWD edge worker: batch dispatch only (embed/unembed on the runner)."""
 
     def init_device(self) -> None:
-        # comm_service 与组网由基类 init_device 负责;双工通道时序注释见
+        # comm_service and group setup belong to the base init_device; see
         # LwdWorkerBase._init_lwd_duplex_channels。
         super().init_device()
-        # 换装边侧 runner(与云侧同款模式):embed/unembed 计算住 runner。
+        # Swap in the edge runner (same pattern as the cloud side): embed/unembed compute lives in the runner.
         self.model_runner = LwdEdgeModelRunner(
             self.vllm_config, self.device, worker=self,
         )
@@ -45,10 +45,11 @@ class LwdEdgeWorker(LwdWorkerBase):
         )
 
     def compile_or_warm_up_model(self) -> "CompilationTimes":
-        # LWD 边侧运行期 forward 被 LWD 流程劫持(execute_model 只分派给
-        # runner 的 embed/unembed 直调),模型级 warmup 与 cudagraph 捕获
-        # 均用不到;且 0 层拓扑下 full-forward 会在 final norm 解包失败。
-        # 整体跳过。
+        # The LWD edge's runtime forward is hijacked by the LWD flow
+        # (execute_model only dispatches to the runner's embed/unembed
+        # direct calls), so model-level warmup and cudagraph capture are
+        # never used; and under the 0-layer topology a full forward would
+        # fail unpacking at the final norm. Skip entirely.
         from vllm.v1.worker.worker_base import CompilationTimes
 
         logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")
@@ -58,9 +59,10 @@ class LwdEdgeWorker(LwdWorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> "ModelRunnerOutput | None":
         lwd_batch = scheduler_output.lwd_batch
-        # 多模态缓存生命周期:请求完结(含 abort)即摘除其 mm 特征/
-        # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部 mm
-        # 窗口后已提前摘除,此为兜底)。
+        # Multimodal cache lifecycle: when a request finishes (abort
+        # included) drop its mm feature/encoder-output caches to prevent
+        # cross-request leaks (the healthy path already removed them once
+        # the chunk window passed all mm segments; this is the backstop).
         if scheduler_output.finished_req_ids:
             self.model_runner.mm_cache.release_finished(
                 scheduler_output.finished_req_ids
@@ -94,9 +96,10 @@ class LwdEdgeWorker(LwdWorkerBase):
             result = self.model_runner.execute_lwd_unembed(
                 lwd_batch.seqno, batch_meta
             )
-            # [Lwd][eos-trace] C 点:声明 accepted>0 却无 token 回填的行
-            # 留痕(与边侧 B 点按 down_seqno 配对;accepted=0 的行不产
-            # token 属合法,不计缺)
+            # [Lwd][eos-trace] Point C: log rows that declared accepted>0
+            # yet received no token backfill (paired with edge-side point B
+            # by down_seqno; accepted=0 rows legitimately produce no token
+            # and are not counted as missing)
             LwdControlDiag.trace_worker_missing_rows(
                 lwd_batch.seqno,
                 list(batch_meta.req_ids),

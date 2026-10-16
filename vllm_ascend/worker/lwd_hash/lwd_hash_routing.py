@@ -5,18 +5,18 @@ import torch
 
 
 def hash_layer_count(config: "PretrainedConfig") -> int:
-    """返回 DeepSeek V4 的 Hash MoE 层数，其他模型返回零。"""
+    """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
     return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
 
 
 def hash_payload_numel(num_tokens: int, hidden_size: int, num_layers: int, top_k: int) -> int:
-    """计算传输载荷的元素数，包含 embedding 和按四字节编码的专家 ID。"""
+    """Compute the transport payload element count: embeddings plus expert IDs encoded as four bytes each."""
     # Each int32 expert ID is encoded as four exactly representable BF16 bytes.
     return num_tokens * (hidden_size + 4 * num_layers * top_k)
 
 
 def pack_hash_payload(embeds: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
-    """将 embedding 与 [tokens, hash_layers, top_k] 专家 ID 打包为一维 BF16 载荷。"""
+    """Pack embeddings and [tokens, hash_layers, top_k] expert IDs into a 1-D BF16 payload."""
     if embeds.dtype != torch.bfloat16:
         raise ValueError("LWD V4 expert transport requires bfloat16 embeddings")
     if expert_ids.ndim != 3 or expert_ids.shape[0] != embeds.shape[0]:
@@ -34,7 +34,7 @@ def unpack_hash_payload(
     num_layers: int,
     top_k: int,
 ) -> "tuple[torch.Tensor, torch.Tensor]":
-    """校验并拆解载荷，返回原设备上的 embedding 和 CPU 上的 int32 专家 ID。"""
+    """Validate and unpack the payload; returns on-device embeddings and CPU int32 expert IDs."""
     expected = hash_payload_numel(num_tokens, hidden_size, num_layers, top_k)
     if payload.numel() != expected:
         raise ValueError(f"LWD V4 payload size mismatch: got {payload.numel()}, expected {expected}")
@@ -64,20 +64,20 @@ class LwdHashRoutingState:
     """CPU prompt tables keyed by request ID, with explicit received-row masks."""
 
     def __init__(self, num_layers: int, top_k: int, num_experts: int) -> None:
-        """保存 Hash 路由维度，并初始化按请求管理的 prompt 专家 ID 缓存。"""
+        """Store the Hash routing dimensions and initialize the per-request prompt expert-ID cache."""
         self.num_layers = num_layers
         self.top_k = top_k
         self.num_experts = num_experts
         self.requests: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def discard(self, req_id: str) -> None:
-        """释放指定请求的专家 ID 和有效位置标记；请求不存在时无需处理。"""
+        """Release a request's expert IDs and validity mask; a missing request is a no-op."""
         self.requests.pop(req_id, None)
 
     def add_chunk(
         self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor
     ) -> None:
-        """校验远端专家 ID 分块，将其写入请求的绝对 prompt 位置并标记为有效。"""
+        """Validate a remote expert-ID chunk, write it into the request's absolute prompt position and mark it valid."""
         ids = expert_ids.to(device="cpu", dtype=torch.int32)
         if ids.ndim != 3 or tuple(ids.shape[1:]) != (self.num_layers, self.top_k):
             raise ValueError(f"Invalid LWD expert shape for {req_id}: {tuple(ids.shape)}")
@@ -103,7 +103,7 @@ class LwdHashRoutingState:
         computed: "Sequence[int]",
         prompt_lengths: "Sequence[int]",
     ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """按请求顺序和已计算位置组装 CPU 专家 ID 及 prompt 掩码，缺失 prompt 数据时报错。"""
+        """Assemble CPU expert IDs and the prompt mask by request order and computed positions; raise when prompt data is missing."""
         if not len(req_ids) == len(counts) == len(computed) == len(prompt_lengths):
             raise ValueError("LWD Hash routing batch metadata lengths do not match")
         total = sum(int(n) for n in counts)

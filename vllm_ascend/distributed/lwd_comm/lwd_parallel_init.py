@@ -1,14 +1,16 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
-"""Lwd 边云模式的 ascend 侧并行组初始化。
+"""Ascend-side parallel group initialization for LWD edge-cloud mode.
 
-原生 ``init_ascend_model_parallel`` 按 (dp, pp, pcp, tp) 均匀网格切分
-全局 rank,表达不了"边 edge_npu_count + 云 cloud_npu_count"的非对称
-拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
-``vllm_ascend.distributed.parallel_state``,由 LwdCloudWorker /
-LwdEdgeWorker 覆写的 ``_init_worker_distributed_environment`` 调用,
-替代原生入口。
+The native ``init_ascend_model_parallel`` splits global ranks on a
+uniform (dp, pp, pcp, tp) grid, which cannot express the asymmetric
+"edge edge_npu_count + cloud cloud_npu_count" topology. This module
+builds the ascend-side communication groups (MC2 etc.) per the LWD
+layout and injects them into
+``vllm_ascend.distributed.parallel_state``; it is invoked by the
+``_init_worker_distributed_environment`` override in LwdCloudWorker /
+LwdEdgeWorker, replacing the native entry point.
 """
 
 import torch
@@ -26,10 +28,11 @@ logger = init_logger(__name__)
 
 
 def init_lwd_ascend_model_parallel(parallel_config) -> None:
-    """按 Lwd 布局构建 ascend 侧通信组。
+    """Build the ascend-side communication groups per the LWD layout.
 
-    对齐原生 ``init_ascend_model_parallel`` 的无特性开启路径:仅 MC2,
-    及与其同分组的 dynamic_eplb / multistream_overlap_gate 变体。
+    Mirrors the feature-free path of native
+    ``init_ascend_model_parallel``: MC2 only, plus the dynamic_eplb /
+    multistream_overlap_gate variants that share its grouping.
     """
     if ascend_parallel_state.model_parallel_initialized():
         return
@@ -45,8 +48,10 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
         f"{data_parallel_size} * ({edge_count} + {cloud_count})")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 组:按 pp 段划分——段 0 为边 rank,段 1 为该实例的云 rank,
-    # 与 vllm 侧 PP 分组([边0, 云0] 两段链 + 其余单例)的链路语义对齐。
+    # MC2 groups: split by pp segment — segment 0 holds the edge ranks,
+    # segment 1 this instance's cloud ranks, aligned with the vllm-side
+    # PP grouping ([edge0, cloud0] two-stage chain + singletons) link
+    # semantics.
     mc2_groups: list[list[int]] = []
     for dp_idx in range(data_parallel_size):
         base = dp_idx * world_per_dp
@@ -75,8 +80,10 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
             group_name="fc3_quant_x",
         )
 
-    # 以下特性依赖均匀网格推导的通信组,尚未适配 Lwd 非对称布局;
-    # 开启时显式失败,避免缺组问题拖到运行期才暴露。
+    # The features below depend on uniformly-gridded communication groups
+    # and are not yet adapted to the asymmetric LWD layout; fail
+    # explicitly when enabled so a missing group never surfaces at
+    # runtime.
     finegrained = ascend_config.finegrained_tp_config
     enabled_finegrained = [
         name

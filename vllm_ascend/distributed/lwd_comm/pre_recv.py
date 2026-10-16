@@ -1,43 +1,52 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LWD 提前收(early recv):引擎⇄worker 旁路链路 + 提示/水位协议。
+"""LWD early receive: engine⇄worker bypass link + hint/watermark protocol.
 
-数据路径只有一条(与既有提前收同款,不新增旁路)::
+There is exactly one data path (same as the existing early receive; no new bypass)::
 
-    云引擎 IO 线程                        云端点 worker 通信线程
+    cloud engine IO thread                cloud endpoint comm thread
     ───────────────                       ──────────────────────
-    RangeNotify 到达(边侧预告)
-      └─ post_irecv_hint ──hint MQ(下行)──►  start_early_irecv
+    RangeNotify arrives (edge announcement)
+      └─ post_irecv_hint ──hint MQ (downstream)──►  start_early_irecv
                                               └─ submit_recv(UP, seqno, numel, aux)
-                                                    │  irecv 已提前挂出
-                                              future.done() 轮询
+                                                    │  irecv already pre-posted
+                                              future.done() polling
                                                     │
-    record_irecv_completions ◄──done MQ(上行)── _report_irecv_completions
-      └─ 水位 → is_irecv_complete(UP, seqno)
-           └─ PD_mix 调度闸门:收完才下发这个 prefill 批
+    record_irecv_completions ◄──done MQ (upstream)── _report_irecv_completions
+      └─ watermark → is_irecv_complete(UP, seqno)
+           └─ PD_mix scheduler gate: release the prefill batch only once received
 
-两条 MQ 都是旁路,都不能借 ``rpc_broadcast_mq``:那条队列由
-``worker_busy_loop`` 单线程消费,它在 ``execute_model`` 里为一个 prefill 批
-阻塞几百毫秒 —— 提示排在那条队列上,就等不到"提前"挂 recv 的机会。
+Both MQs are bypasses; neither may borrow ``rpc_broadcast_mq``: that queue
+is consumed single-threaded by ``worker_busy_loop``, which blocks for
+hundreds of milliseconds inside ``execute_model`` for a prefill batch — a
+hint queued there would never get its recv posted "early".
 
-* hint MQ:引擎建 writer(worker 创建之前把 handle 写进环境变量),云端点
-  rank 按 handle 挂 reader;
-* done MQ:云端点 rank 建 writer,handle 随 READY 握手回传,引擎挂 reader。
+* hint MQ: the engine creates the writer (handle exported to env before
+  worker creation); the cloud endpoint rank attaches the reader by handle;
+* done MQ: the cloud endpoint rank creates the writer, the handle rides
+  the READY handshake back, and the engine attaches the reader.
 
-水位语义:``is_irecv_complete(channel, seqno)`` == ``seqno <= watermark``。
-每通道完成序 = seqno 序(``channel.py`` 的 FIFO:队首没完成,后面不可能完成),
-"已完成集合"恒为前缀,故一个最大水位即可精确表示。水位只是**就绪判据**,
-不参与任务优先级。
+Watermark semantics: ``is_irecv_complete(channel, seqno)`` ==
+``seqno <= watermark``. Per-channel completion order = seqno order
+(``channel.py`` FIFO: if the head has not completed, nothing behind it
+has), so the "completed set" is always a prefix and one max watermark
+represents it exactly. The watermark is only a **readiness predicate**;
+it plays no role in task priority.
 
-本分支(chunked prefill + mm/hash)的提示字段:``num_tokens`` = 该批(本 chunk
-批)flat token 数,``aux_rows`` = 批内**带 mrope 的请求**的 token 行数之和 ——
-UP 主帧 numel 由 hash 载荷公式在 **worker 侧**按本机配置算(见
-``lwd_cloud_worker._lwd_build_up_recv_request``),提示只带"事实"(token 数、
-mrope 行数),不带尺寸公式,避免两侧各算一遍算歪;aux 帧 numel = aux_rows*3
-(int64,[n,3],与主帧同 seqno)。
+Hint fields on this branch (chunked prefill + mm/hash): ``num_tokens`` =
+the batch's (this chunk batch's) flat token count, ``aux_rows`` = the sum
+of token rows of **mrope-carrying** requests in the batch — the UP main
+frame numel is computed **worker-side** from the hash payload formula
+using local config (see
+``lwd_cloud_worker._lwd_build_up_recv_request``); the hint carries only
+"facts" (token count, mrope row count), never the size formula, so the
+two sides cannot compute it differently; aux frame numel = aux_rows*3
+(int64, [n,3], same seqno as the main frame).
 
-非端点 rank(云端其余 TP rank)没有跨机通道:它们的数据在注入时刻由 TP 组内
-广播取到(见 ``lwd_cloud_model_runner._lwd_inject_remote_embeds``),既不挂
-recv 也不上报 —— 本模块的提示/上报只走端点 rank 这一条线。
+Non-endpoint ranks (the cloud's remaining TP ranks) hold no cross-node
+channel: their data arrives via the in-group TP broadcast at inject time
+(see ``lwd_cloud_model_runner._lwd_inject_remote_embeds``) — they post no
+recv and report nothing; this module's hint/report line runs on the
+endpoint rank only.
 """
 
 from __future__ import annotations
@@ -56,33 +65,41 @@ from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-# 日志名必须落在 **vllm.** 命名空间内:vLLM 只给名为 "vllm" 的 logger 挂
-# handler(DEFAULT_LOGGING_CONFIG,propagate=False),子 logger 靠向上传播拿到
-# 那个 handler。vllm_ascend.* 的 logger 传不到 "vllm"(根 logger 无 handler)。
-# 本模块自身的日志只留异常诊断(正常路径的 HINT/水位/闸门/worker 四段都在
-# lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py / lwd_cloud_worker.py 里打)。
+# The logger name must sit inside the **vllm.** namespace: vLLM attaches
+# handlers only to loggers named "vllm" (DEFAULT_LOGGING_CONFIG,
+# propagate=False); child loggers reach that handler by propagation.
+# vllm_ascend.* loggers cannot reach "vllm" (the root logger has no
+# handler). This module's own logging keeps only exception diagnostics
+# (the healthy-path HINT/watermark/gate/worker segments are all logged in
+# lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py /
+# lwd_cloud_worker.py).
 logger = init_logger("vllm.lwd.pre_recv")
 
-#: 下行提示 MQ 的 handle 环境变量。执行器在创建 worker 之前导出,worker 在
-#: ``init_device`` 里重建 reader —— 两侧只认这一处常量名。
+#: Env var carrying the downstream hint MQ handle. The executor exports it
+#: before creating the worker; the worker rebuilds the reader in
+#: ``init_device`` — both sides honor this single constant name.
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
-# 旁路 MQ 规格:每槽 1KB、共 64 槽。一批一条提示/上报,边侧 pending 闸门
-# (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)把未消费 chunk 数压在
-# 个位数,而提示是正确性依赖(丢一条 = 该 recv 不提前挂、水位不前进、闸门后的
-# 批永不下发),所以留足余量、不做流控。
+# Bypass MQ spec: 1KB per slot, 64 slots. One hint/report per batch; the
+# edge pending gate (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)
+# keeps unconsumed chunks in the single digits, and hints are a
+# correctness dependency (losing one = that recv is never pre-posted, the
+# watermark stalls, and the gated batch is never dispatched) — so plenty
+# of headroom, no flow control.
 _SIDEBAND_MAX_CHUNK_BYTES = 1024
 _SIDEBAND_MAX_CHUNKS = 64
 
 
 # ---------------------------------------------------------------------- #
-# 提示(hint):调度侧生产,worker 通信线程消费                              #
+# Hints: produced by the scheduler, consumed by the worker comm thread   #
 # ---------------------------------------------------------------------- #
 def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
-    """构造一条 UP 提前收提示。
+    """Build one UP early-recv hint.
 
-    * ``num_tokens``:本批 flat token 数(主帧尺寸由 worker 按 hash 载荷公式推)
-    * ``aux_rows``:本批带 mrope 的 token 行数(0 = 纯文本批,零 aux 流量)
+    * ``num_tokens``: the batch's flat token count (the main-frame size
+      is derived worker-side from the hash payload formula)
+    * ``aux_rows``: the batch's mrope-carrying token rows (0 = text-only
+      batch, zero aux traffic)
     """
     return {
         "channel": LwdChannelType.UP,
@@ -93,7 +110,7 @@ def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
 
 
 def hint_fields(hint: dict) -> tuple[int, int, int] | None:
-    """提示自检:返回 (seqno, num_tokens, aux_rows);坏提示返回 None。"""
+    """Hint self-check: returns (seqno, num_tokens, aux_rows); None for a malformed hint."""
     try:
         seqno = int(hint["seqno"])
         num_tokens = int(hint["num_tokens"])
@@ -106,10 +123,10 @@ def hint_fields(hint: dict) -> tuple[int, int, int] | None:
 
 
 # ---------------------------------------------------------------------- #
-# 旁路 MQ 生命周期                                                        #
+# Bypass MQ lifecycle                                                    #
 # ---------------------------------------------------------------------- #
 def _new_sideband_mq() -> "MessageQueue":
-    """1 读 1 写的旁路 MQ(提示/上报同一规格,且都只有端点 rank 参与)。"""
+    """A 1-reader 1-writer bypass MQ (hint and report share the spec; only the endpoint rank participates)."""
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
     return MessageQueue(
@@ -120,10 +137,11 @@ def _new_sideband_mq() -> "MessageQueue":
 
 
 def create_hint_mq() -> "MessageQueue":
-    """引擎侧:建 hint MQ(writer),并把 handle 导出到环境变量。
+    """Engine side: create the hint MQ (writer) and export the handle to
+    the environment.
 
-    必须在 worker 被创建之前调用(worker 启动时按环境变量重建 reader);
-    fork/spawn 两种启动方式都靠环境变量继承。
+    Must be called before workers are created (they rebuild the reader
+    from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
     os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(
@@ -133,10 +151,12 @@ def create_hint_mq() -> "MessageQueue":
 
 
 def attach_hint_mq() -> "MessageQueue | None":
-    """worker 侧:按环境变量里的 handle 重建 hint MQ reader。
+    """Worker side: rebuild the hint MQ reader from the handle in the
+    environment.
 
-    没有 handle(该角色不接提示)返回 None:通信线程照旧跑上报,于是"提示
-    没来"只影响提前挂 recv 的时机,不影响水位前进。
+    Returns None when no handle exists (this role takes no hints): the
+    comm thread still runs reporting, so a missing hint only delays the
+    early recv, never stalls the watermark.
     """
     raw = os.environ.get(LWD_RECV_HINT_MQ_ENV)
     if raw is None:
@@ -147,12 +167,12 @@ def attach_hint_mq() -> "MessageQueue | None":
 
 
 def create_report_mq() -> "MessageQueue":
-    """worker 侧:建 done MQ(writer),handle 随后随 READY 握手回传引擎。"""
+    """Worker side: create the done MQ (writer); the handle returns to the engine with the READY handshake."""
     return _new_sideband_mq()
 
 
 # ---------------------------------------------------------------------- #
-# 调度进程侧:提示下发 + 完成水位                                          #
+# Scheduler process side: hint dispatch + completion watermark           #
 # ---------------------------------------------------------------------- #
 _hint_sender: Callable[[dict], None] | None = None
 _watermarks: dict[LwdChannelType, int] = {}
@@ -160,25 +180,30 @@ _lock = threading.Lock()
 
 
 def register_hint_sender(sender: Callable[[dict], None]) -> None:
-    """装上下发提示用的传输(每个引擎进程装一次)。
+    """Install the transport used to dispatch hints (once per engine
+    process).
 
-    传进来的闭包必须**可靠投递**(把提示 enqueue 进 hint MQ):闸门开启时提示
-    是正确性依赖 —— 丢一条,那条 recv 就不提前挂,水位不前进,被闸门拦下的批
-    永不下发。
+    The closure passed in must **deliver reliably** (enqueue the hint
+    into the hint MQ): with the gate on, hints are a correctness
+    dependency — lose one and that recv is never pre-posted, the
+    watermark stalls, and the gated batch is never dispatched.
     """
     global _hint_sender
     _hint_sender = sender
 
 
 def post_irecv_hint(hint: dict) -> None:
-    """把一条 recv 提示发给本地 worker 的通信线程。
+    """Send one recv hint to the local worker's comm thread.
 
-    成功路径不打日志(由调用方 ``lwd_cloud_engine`` 打 ``HINT ...``):本模块只留
-    "本该不发生"的诊断,而且它必须能从日志里看到。
+    The healthy path logs nothing (the caller ``lwd_cloud_engine`` logs
+    ``HINT ...``): this module keeps only should-never-happen diagnostics,
+    and they must be visible in the logs.
     """
     if _hint_sender is None:
-        # 没有传输 = 本进程不参与提前收(如相位调度逃生通道):丢一条提示不影响
-        # 正确性 —— 该分支没有闸门在等它,recv 由消费点自己挂。
+        # No transport = this process does not participate in early recv
+        # (e.g. the phase-scheduler escape hatch): losing a hint costs no
+        # correctness — that branch has no gate waiting on it, and the
+        # consume point posts the recv itself.
         logger.warning(
             "[Lwd][pre-recv] HINT DROPPED: no sender registered seqno=%s",
             hint.get("seqno"),
@@ -190,11 +215,13 @@ def post_irecv_hint(hint: dict) -> None:
 def record_irecv_completions(
     items: Iterable[tuple[LwdChannelType, int]],
 ) -> list[tuple[LwdChannelType, int]]:
-    """把 worker 上报的完成项并进每通道水位(引擎每步排空 done MQ 后调用)。
+    """Merge worker-reported completions into the per-channel watermark
+    (called after the engine drains the done MQ each step).
 
-    返回**本次真正推进水位**的项,由调用方(``lwd_cloud_engine``)打日志:
-    水位是否在动是定位"卡在哪一段"的第一手证据,日志放在已证明能打出来的
-    模块里。
+    Returns the entries that **actually advanced** the watermark this
+    call, for the caller (``lwd_cloud_engine``) to log: whether the
+    watermark is moving is the first-hand evidence for locating which
+    segment is stuck, so the log lives in a module proven to emit.
     """
     advanced: list[tuple[LwdChannelType, int]] = []
     with _lock:
@@ -206,15 +233,17 @@ def record_irecv_completions(
 
 
 def watermark(channel: LwdChannelType) -> int:
-    """当前水位:该通道上"已确认收完"的最大 seqno(-1 = 一条都没有)。"""
+    """Current watermark: the max confirmed-complete seqno on the channel (-1 = none yet)."""
     with _lock:
         return _watermarks.get(channel, -1)
 
 
 def is_irecv_complete(channel: LwdChannelType, seqno: int) -> bool:
-    """该通道 seqno 这条 recv 收完了没 —— 只作就绪判据,不打日志。
+    """Whether the seqno recv has completed on the channel — a pure
+    readiness predicate, no logging.
 
-    "在等谁"由闸门那一行给出(``lwd_cloud_mixed_scheduler`` 每步都打
-    ``gate seqno=.. watermark=.. ready=..``),所以这里保持纯判据。
+    "Who is being waited on" comes from the gate's own log line
+    (``lwd_cloud_mixed_scheduler`` logs ``gate seqno=.. watermark=..
+    ready=..`` every step), so this stays a pure predicate.
     """
     return seqno <= watermark(channel)

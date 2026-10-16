@@ -62,16 +62,19 @@ class LwdCommRequest:
     # skip/drain semantics are unchanged.  send: tensor; recv: None and
     # ``aux_num_elements`` sizes the exact buffer.
     #
-    # 扩展预留:再增加一种载荷时,把本组字段(aux_tensor/
-    # aux_num_elements/aux_dtype)扩成 list[TensorSpec] 即可——快照、
-    # keepalive、handles 桥接、recv 缓冲分配在 channel/future 里已是
-    # 按"主+aux 两条 op"写成的机械扩展;seqno 纪律与 sizing 预告
-    # (notify 携带逐帧 numel/dtype)同步扩展。
+    # Extension reserve: adding another payload tier only means widening
+    # this field group (aux_tensor/aux_num_elements/aux_dtype) into a
+    # list[TensorSpec] — snapshot, keepalive, handles bridging and recv
+    # buffer allocation in channel/future are already written as a
+    # mechanical "main + aux ops" extension; the seqno discipline and
+    # sizing pre-announcement
+    # (the notify carries per-frame numel/dtype) extends in lockstep.
     aux_tensor: Any | None = None
     aux_num_elements: int = 0
-    # aux 帧的元素 dtype(torch.dtype;None = int64,mrope positions)。
-    # 收端据此分配精确缓冲;后续其他载荷(如 bf16 的 deepstack 帧)
-    # 显式指定即可,无需改通道结构。
+    # Element dtype of the aux frame (torch.dtype; None = int64, mrope
+    # positions). The receiver allocates an exact buffer accordingly;
+    # future payloads (e.g. a bf16 deepstack frame) just specify it
+    # explicitly — no channel-structure change needed.
     aux_dtype: Any | None = None
 
 

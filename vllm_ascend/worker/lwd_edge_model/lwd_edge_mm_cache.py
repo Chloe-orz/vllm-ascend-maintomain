@@ -21,7 +21,7 @@ from vllm.logger import logger
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import LwdEmbedBatch
 
-# mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
+# mm_hash encode cache capacity (entries; one 1080p item is about 26MB HBM)
 _LWD_MM_HASH_CACHE_MAX_ITEMS = 32
 
 
@@ -37,8 +37,9 @@ class LwdEdgeMmCache:
         self._features[req_id] = feats
 
     def release_finished(self, finished_req_ids: "list[str]") -> None:
-        """完结兜底:请求完结(含 abort)即摘除其 mm 特征/位置登记
-        (正常路径在 chunk 越过全部 mm 窗口后已提前摘除)。"""
+        """Completion backstop: when a request finishes (abort included),
+        drop its mm feature/position registration (the healthy path already
+        removed it early once the chunk window passed all mm segments)."""
         for req_id in finished_req_ids:
             self.release_request(req_id)
 
@@ -49,24 +50,30 @@ class LwdEdgeMmCache:
         device: "torch.device",
         pin_memory: bool,
     ) -> None:
-        """批级编码:聚合本批全部请求的缓存未命中特征,按 modality 一次
-        组批过视觉塔,结果回填 mm_hash 缓存。
+        """Batch-level encoding: aggregate every request's cache-missed
+        features in this batch, run the vision tower once per modality, and
+        backfill the mm_hash cache.
 
-        跨请求组批与集中式 _execute_mm_encoder 同构(整批一次前向而
-        非逐请求 N 次):ViT eager 下单次调用的固定开销(逐算子
-        dispatch/H2D/同步)占比高,逐请求串行会把它支付 N 倍,且这些
-        串行调用压在 worker 的 embed 执行里、堵住后续 unembed 交付。
-        缓存键(identifier)与容量淘汰语义不变;回填顺序 = 收集顺序
-        (req_ids 序 × 请求内特征序),组批输出按同序消费——错序即
-        张冠李戴错算,总数断言兜底。"""
+        Cross-request batching mirrors the centralized _execute_mm_encoder
+        (one forward for the whole batch instead of N per-request calls):
+        under eager ViT the fixed per-call overhead (per-op dispatch, H2D,
+        syncs) dominates, and serializing per request would pay it N times
+        — those serial calls also sit inside the worker's embed execution
+        and block later unembed deliveries. Cache key (identifier) and
+        capacity-eviction semantics are unchanged; backfill order =
+        collection order (req_ids order × per-request feature order), and
+        the batched outputs are consumed in the same order — any
+        misordering misattributes embeddings, with a total-count assert as
+        the backstop."""
         missing_features = []
         missing_data = []
         for req_id in req_ids:
             for f in self._features.get(req_id) or []:
                 if f.identifier not in self._hash_embeds:
                     if f.data is None:
-                        # data 缺失即无法计算图像 embeds——静默跳过 =
-                        # 图像 token 按文本嵌入错算,fail-fast。
+                        # Without data the image embeds cannot be computed —
+                        # silently skipping would embed image tokens as text;
+                        # fail fast.
                         missing_data.append((req_id, f.identifier))
                     else:
                         missing_features.append(f)
@@ -104,10 +111,10 @@ class LwdEdgeMmCache:
             self._hash_embeds[feature.identifier] = (
                 outputs_by_modality[feature.modality].pop(0)
             )
-        # 容量淘汰(FIFO):超容量摘最旧条目,被淘汰顶多重编一次
+        # Capacity eviction (FIFO): drop the oldest entry past capacity; an evicted item is at most re-encoded once
         while len(self._hash_embeds) > _LWD_MM_HASH_CACHE_MAX_ITEMS:
             self._hash_embeds.pop(next(iter(self._hash_embeds)))
-        # [Lwd][perf] 视觉塔耗时(批级,仅缓存未命中计次;同图复用不重编)
+        # [Lwd][perf] Vision tower duration (batch level, cache misses only; same-image reuse never re-encodes)
         logger.info(
             "[Lwd][perf] mm-encoder reqs=%d items=%d dur=%.2fms",
             len(req_ids), len(missing_features),
@@ -117,15 +124,19 @@ class LwdEdgeMmCache:
     def encoder_outputs(
         self, req_id: str
     ) -> "list[tuple[PlaceholderRange, torch.Tensor]]":
-        """视觉塔输出的只读视图:[(mm_position, embeds)]。
+        """Read-only view of the vision tower outputs: [(mm_position, embeds)].
 
-        编码已前移到批级(encode_missing,整批一次组批);本处只读
-        缓存,未命中即批级编码漏编,fail-fast。编码结果按内容哈希
-        (mm_hash/identifier)跨请求共享——与集中式 encoder cache 同
-        粒度,同图复用不重编;位置信息(mm_position)仍按请求取,只有
-        编码结果共享;容量淘汰(FIFO),不随请求生命周期释放。
-        release_request 在 chunk 越过全部 mm 窗口或 finished_req_ids
-        兜底时摘除请求的位置特征(不动编码缓存)。"""
+        Encoding moved up to the batch level (encode_missing, one grouped
+        batch); this reads the cache only — a miss here means the batch
+        encode skipped it, so fail fast. Encoded outputs are shared across
+        requests by content hash (mm_hash/identifier) — the same
+        granularity as the centralized encoder cache, so same-image reuse
+        never re-encodes; position info (mm_position) stays per-request,
+        only the encoded outputs are shared; capacity eviction is FIFO and
+        does not follow request lifetime. release_request drops the
+        request's positional features when the chunk window passes all mm
+        segments or on the finished_req_ids backstop (the encode cache is
+        untouched)."""
         features = self._features.get(req_id)
         if not features:
             return []
@@ -144,8 +155,9 @@ class LwdEdgeMmCache:
         ]
 
     def release_request(self, req_id: str) -> None:
-        """按请求释放 mm 位置特征;hash 编码结果不随请求释放
-        (容量淘汰,见 encoder_outputs)。"""
+        """Release the request's mm positional features; hash-encoded outputs
+        are not released with the request (capacity eviction, see
+        encoder_outputs)."""
         self._features.pop(req_id, None)
 
     def gather_chunk(
@@ -155,14 +167,18 @@ class LwdEdgeMmCache:
         device: "torch.device",
         pin_memory: bool,
     ) -> "tuple[list[torch.Tensor], torch.Tensor]":
-        """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
+        """Collect mm embeds rows for this chunk window + build the
+        is_multimodal mask.
 
-        编码在切片之前批级完成(整批一次组批,见 encode_missing),
-        之后逐请求只读缓存切片。窗口语义逐字对齐原生
-        _gather_mm_embeddings:feature 的占位区间 [offset, offset+length)
-        与 chunk 窗口 [p_offset, p_offset+n) 求交,相交段切 embeds 行、
-        置掩码位;图像跨 chunk 时逐段收集。同时完成越过全部 mm 窗口
-        请求的特征摘除。"""
+        Encoding completes at the batch level before slicing (one grouped
+        batch, see encode_missing); afterwards each request only slices
+        the read-only cache. Window semantics match the native
+        _gather_mm_embeddings verbatim: intersect the feature's
+        placeholder span [offset, offset+length) with the chunk window
+        [p_offset, p_offset+n), slice embeds rows and set mask bits over
+        the intersection; images spanning chunks are collected segment by
+        segment. Requests whose window passed all mm segments have their
+        features removed along the way."""
         total = sum(len(t) for t in batch_meta.token_ids)
         is_mm = torch.zeros(total, dtype=torch.bool)
         mm_embeds: list[torch.Tensor] = []
