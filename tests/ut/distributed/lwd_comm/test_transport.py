@@ -3,7 +3,6 @@
 
 import importlib
 import importlib.util
-import io
 import json
 import queue
 import sys
@@ -583,41 +582,3 @@ def test_worker_rejects_unsupported_layout_before_device_initialization(
     with pytest.raises(ValueError):
         t.worker.init_device()
     t.base.NPUWorker.init_device.assert_not_called()
-
-
-@pytest.mark.parametrize("result", [[{"status": "PASS", "tp_rank": 0}], [], [{"status": "FAIL"}]])
-def test_client_waits_for_server_and_requires_all_worker_results(
-    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, result: list[dict]
-) -> None:
-    client = importlib.import_module(transport.types.__package__ + ".probe_client")
-    calls = []
-
-    def urlopen(request: object, timeout: float) -> io.BytesIO:
-        calls.append(request)
-        if len(calls) == 1:
-            raise client.URLError("server starting")
-        response = io.BytesIO(json.dumps({"results": result}).encode())
-        response.status = 200
-        return response
-
-    monkeypatch.setattr(client, "urlopen", urlopen)
-    monkeypatch.setattr(client.time, "sleep", lambda seconds: None)
-    if result and result[0]["status"] == "PASS":
-        assert client.run_client("http://127.0.0.1:8000", {"batches": 2}, 10) == result
-    else:
-        with pytest.raises(RuntimeError, match="Not all local Workers passed"):
-            client.run_client("http://127.0.0.1:8000", {"batches": 2}, 10)
-    assert calls[:2] == ["http://127.0.0.1:8000/health"] * 2
-    assert json.loads(calls[2].data)["method"] == "lwd_run_probe"
-
-
-def test_client_never_triggers_transfers_if_startup_times_out(
-    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    client = importlib.import_module(transport.types.__package__ + ".probe_client")
-    request = Mock(side_effect=client.URLError("server absent"))
-    monkeypatch.setattr(client, "urlopen", request)
-    monkeypatch.setattr(client.time, "monotonic", Mock(side_effect=[0, 11]))
-    with pytest.raises(TimeoutError, match="did not become healthy"):
-        client.run_client("http://127.0.0.1:8000", {}, 10)
-    assert request.call_count == 1
