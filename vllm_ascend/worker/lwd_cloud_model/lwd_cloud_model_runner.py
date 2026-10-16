@@ -830,9 +830,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         """LWD: token flow rides the lwd DOWN channel, skip the native PP broadcast."""
 
-    def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
-        """LWD: token flow rides the lwd UP channel, skip the native PP receive."""
-
     def _sample(
         self, logits: "torch.Tensor | None",
         spec_decode_metadata: "SpecDecodeMetadata | None",
