@@ -35,11 +35,6 @@ class LwdWireConnection:
             return self.edge_rank
         raise ValueError(f"[LWD] rank={rank} is not a P2P endpoint of {self.key}")
 
-    def domain_rank_for(self, rank: int) -> int:
-        """Return an endpoint's index in this two-member communication domain."""
-        self.peer_for(rank)
-        return self.endpoint_ranks.index(rank)
-
     def includes(self, rank: int) -> bool:
         return rank in self.edge_ranks or rank in self.cloud_ranks
 

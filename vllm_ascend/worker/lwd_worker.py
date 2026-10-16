@@ -1,9 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Own the no-PP data plane independently of the worker's native TP group.
-
-Transport ownership and TP receive distribution come from d430200/982f776.
-The centralized model runner and scheduler remain unchanged.
-"""
+"""PR #33/#63 bootstrap and Worker transport, with centralized model execution."""
 
 from __future__ import annotations
 
@@ -23,6 +19,26 @@ from vllm_ascend.worker.worker import NPUWorker
 
 
 class LwdWorker(LwdEarlyRecv, NPUWorker):
+    def _init_worker_distributed_environment(self) -> None:
+        from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
+        from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
+
+        from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import init_lwd_ascend_model_parallel
+        from vllm_ascend.worker.worker import init_batch_invariance
+
+        init_batch_invariance()
+        init_distributed_environment(
+            self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
+        )
+        ensure_model_parallel_initialized(
+            self.parallel_config.tensor_parallel_size,
+            self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.prefill_context_parallel_size,
+            self.parallel_config.decode_context_parallel_size,
+        )
+        init_lwd_ascend_model_parallel(self.vllm_config)
+        ensure_ec_transfer_initialized(self.vllm_config)
+
     def init_device(self) -> None:
         config, parallel = self.vllm_config.lwd_config, self.parallel_config
         if config is None or config.topology.deployment.scene != "single_instance" or len(config.connections) != 1:
@@ -47,7 +63,7 @@ class LwdWorker(LwdEarlyRecv, NPUWorker):
         self._lwd_probe_round = 0
         self._lwd_probe_next = {channel: 0 for channel in LwdChannelType}
         self._lwd_probe_error: str | None = None
-        self.lwd_wire.join_async()
+        self.lwd_wire.init_lwd_duplex_channels()
         logger.info(
             "[LWD][worker] role=%s tp_rank=%d connection=%s endpoint=%s; transport retained until shutdown",
             config.role,
@@ -152,5 +168,6 @@ class LwdWorker(LwdEarlyRecv, NPUWorker):
                 self.shutdown_early_recv()
             if hasattr(self, "comm_service"):
                 self.comm_service.shutdown(timeout=5.0)
+                self.lwd_wire.shutdown()
         finally:
             super().shutdown()

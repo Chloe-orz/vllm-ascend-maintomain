@@ -15,14 +15,14 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 
-def test_domain_ranks_do_not_replace_yaml_or_tp_ranks() -> None:
+def test_endpoint_peers_keep_global_yaml_ranks() -> None:
     link = module.LwdWireConnection((0, 0, 0), (5, 2), (4, 0, 3, 1))
     assert link.endpoint_ranks == (5, 4)
-    assert (link.domain_rank_for(5), link.domain_rank_for(4)) == (0, 1)
     assert link.peer_for(5) == 4
+    assert link.peer_for(4) == 5
     assert link.includes(2)
     with pytest.raises(ValueError, match="not a P2P endpoint"):
-        link.domain_rank_for(2)
+        link.peer_for(2)
 
 
 def test_shared_endpoint_requires_an_explicit_connection() -> None:

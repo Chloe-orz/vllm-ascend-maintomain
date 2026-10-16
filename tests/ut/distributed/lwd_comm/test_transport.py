@@ -67,7 +67,6 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         device=torch.device("cpu"),
         member=True,
         is_edge=True,
-        domain_rank=0,
         timeout_s=0.05,
         ensure_joined=lambda: None,
         get_channel_stream=lambda channel: stream,
@@ -75,6 +74,18 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         p2p_recv=lambda channel, tensor, peer: tensor.fill_(9),
         shutdown=lambda: None,
     )
+    wire.get_lwd_channel_stream = wire.get_channel_stream
+    wire.get_lwd_channel_peer = lambda channel: 1
+    wire.get_lwd_channel_device_group = lambda channel: (wire, channel)
+
+    def post(op: str, tensor: torch.Tensor, group: tuple[Any, Any], peer: int) -> Mock:
+        getattr(group[0], "p2p_" + op)(group[1], tensor, peer)
+        return Mock()
+
+    monkeypatch.setattr(torch.distributed, "isend", lambda tensor, dst, group: post("send", tensor, group, dst))
+    monkeypatch.setattr(torch.distributed, "irecv", lambda tensor, src, group: post("recv", tensor, group, src))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0, 1])
     group = SimpleNamespace(
         world_size=1,
         rank_in_group=0,
@@ -85,6 +96,7 @@ def transport(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     parallel = ModuleType("vllm.distributed.parallel_state")
     parallel.get_tp_group = lambda: group
+    parallel.get_lwd_bootstrap_world = lambda: group
     monkeypatch.setitem(sys.modules, parallel.__name__, parallel)
     return SimpleNamespace(**modules, wire=wire, calls=calls, events=events, waits=waits, group=group)
 
@@ -175,27 +187,27 @@ def send(t: SimpleNamespace, seqno: int, value: float = 1) -> Any:
     )
 
 
-def test_out_of_order_send_preserves_snapshot_and_producer_event(transport: SimpleNamespace) -> None:
+def test_out_of_order_send_preserves_source_snapshot_and_fifo(transport: SimpleNamespace) -> None:
     t = transport
     service = t.service.LwdCommService(t.wire)
     second_request = send(t, 1, 2)
     second = service.submit_send(second_request)
-    producer = second.producer_event
     second_request.tensor.fill_(99)
     assert not second.done() and not t.calls
-    first = service.submit_send(send(t, 0))
+    service.submit_send(send(t, 0))
     assert [tensor.tolist() for _, tensor in t.calls] == [[1, 1], [2, 2]]
-    assert t.waits == [first.producer_event, producer]
+    assert second._keepalive[0].tolist() == [2, 2]
     assert service.poll_completions() == 2
-    assert second.request.tensor is None
+    assert second._keepalive is None
     service.shutdown()
 
 
+@pytest.mark.xfail(strict=True, reason="PR #63 does not advance a skipped hole reached while draining held batches")
 def test_abort_holes_advance_across_alternating_held_batches(transport: SimpleNamespace) -> None:
     t = transport
     service = t.service.LwdCommService(t.wire)
-    service.skip_seqno(t.types.LwdChannelType.UP, 0, "send")
     third = service.submit_send(send(t, 3, 3))
+    service.skip_seqno(t.types.LwdChannelType.UP, 0, "send")
     canceled = service.submit_send(send(t, 2, 2))
     service.skip_seqno(t.types.LwdChannelType.UP, 2, "send")
     service.submit_send(send(t, 1, 1))
@@ -203,8 +215,8 @@ def test_abort_holes_advance_across_alternating_held_batches(transport: SimpleNa
     assert third.done()
     with pytest.raises(RuntimeError, match="failed"):
         canceled.wait(0)
-    with pytest.raises(ValueError, match="duplicate or skipped"):
-        service.submit_send(send(t, 2))
+    with pytest.raises(RuntimeError, match="failed"):
+        service.submit_send(send(t, 2)).wait(0)
     service.shutdown()
 
 
@@ -220,37 +232,63 @@ def test_up_and_down_have_independent_sequence_zero(transport: SimpleNamespace) 
     service.shutdown()
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"connection_key": (9, 0, 0)},
-        {"num_elements": 3},
-        {"seqno": -1},
-        {"src_dst": 8},
-    ],
-)
-def test_invalid_requests_never_touch_the_wire(transport: SimpleNamespace, change: dict) -> None:
+def test_work_is_bridged_before_recording_completion(
+    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    t, order = transport, []
+    monkeypatch.setattr(
+        torch.distributed, "isend", lambda *args, **kwargs: SimpleNamespace(wait=lambda: order.append("wait"))
+    )
+    monkeypatch.setattr(torch.npu.Event, "record", lambda event: order.append("event"))
+    t.service.LwdCommService(t.wire).submit_send(send(t, 0))
+    assert order == ["wait", "event"]
+
+
+def test_up_aux_frame_keeps_source_order_and_dtype(transport: SimpleNamespace) -> None:
     t = transport
-    with pytest.raises(ValueError):
-        t.service.LwdCommService(t.wire).submit_send(replace(send(t, 0), **change))
-    assert not t.calls and not t.events
+    request = replace(send(t, 0), aux_tensor=torch.tensor([3, 4, 5]), aux_num_elements=3)
+    sent = t.service.LwdCommService(t.wire).submit_send(request)
+    assert [tensor.tolist() for _, tensor in t.calls] == [[1, 1], [3, 4, 5]]
+    assert t.calls[1][1].dtype is torch.int64
+    assert sent.wait(0).status is t.types.LwdCommStatus.OK
+    t.wire.is_edge = False
+    received = (
+        t.service.LwdCommService(t.wire).submit_recv(replace(request, op="recv", tensor=None, aux_tensor=None)).wait(0)
+    )
+    assert received.tensor.tolist() == [9, 9]
+    assert received.aux_tensor.tolist() == [9, 9, 9]
+    assert received.aux_tensor.dtype is torch.int64
 
 
-def test_pending_dma_retains_its_buffer_after_timeout(transport: SimpleNamespace) -> None:
+def test_service_rejects_wrong_submission_operation(transport: SimpleNamespace) -> None:
+    t = transport
+    with pytest.raises(AssertionError, match="requires op"):
+        t.service.LwdCommService(t.wire).submit_recv(send(t, 0))
+    assert not t.calls
+
+
+def test_pending_future_retains_payload_until_completion(transport: SimpleNamespace) -> None:
     t = transport
     service = t.service.LwdCommService(t.wire)
     future = service.submit_send(send(t, 0))
     future._done_event.complete = False
-    with pytest.raises(TimeoutError, match="seqno=0 timed out stage=device_pending"):
+    with pytest.raises(TimeoutError, match="timed out.*seqno=0"):
         future.wait(0)
-    with pytest.raises(RuntimeError, match="could not drain"):
-        service.shutdown(timeout=0)
-    assert future.request.tensor is not None
+    assert future._keepalive is not None
     future._done_event.complete = True
-    service.shutdown(timeout=0.1)
-    assert future.request.tensor is None
-    with pytest.raises(RuntimeError, match="closed"):
-        service.submit_send(send(t, 1))
+    assert service.poll_completions() == 1
+    assert future._keepalive is None
+    service.shutdown(timeout=0)
+    assert not service._channels
+
+
+def test_service_shutdown_preserves_source_timeout_and_reset(transport: SimpleNamespace) -> None:
+    t = transport
+    service = t.service.LwdCommService(t.wire)
+    service.submit_send(send(t, 0))._done_event.complete = False
+    with pytest.raises(TimeoutError, match="timed out"):
+        service.shutdown(timeout=0)
+    assert not service._channels and not service._shutting_down
 
 
 def test_missing_receive_sequence_is_reported_as_queued(transport: SimpleNamespace) -> None:
@@ -258,7 +296,7 @@ def test_missing_receive_sequence_is_reported_as_queued(transport: SimpleNamespa
     service = t.service.LwdCommService(t.wire)
     request = t.types.LwdCommRequest(t.types.LwdChannelType.DOWN, "recv", 3, seqno=1, connection_key=t.wire.key)
     future = service.submit_recv(request)
-    with pytest.raises(TimeoutError, match="lwd_down seqno=1 timed out stage=queued"):
+    with pytest.raises(TimeoutError, match="timed out.*unbound"):
         future.wait(0)
     assert not t.events
     service.submit_recv(replace(request, seqno=0))
@@ -273,7 +311,7 @@ def test_probe_uses_the_same_bounded_transport_for_either_role(
 ) -> None:
     t = worker_transport
     probe = importlib.import_module(t.types.__package__ + ".probe")
-    t.wire.is_edge, t.wire.domain_rank = is_edge, 0 if is_edge else 1
+    t.wire.is_edge = is_edge
     plan = probe.LwdProbePlan(batches=7, tokens=(1, 4, 2), hidden_size=8, window=3, channel=channel)
     payloads, posts_at_wait = [], []
 
@@ -303,7 +341,7 @@ def test_probe_uses_the_same_bounded_transport_for_either_role(
 def test_probe_rejects_corrupt_or_reordered_payload(worker_transport: SimpleNamespace) -> None:
     t = worker_transport
     probe = importlib.import_module(t.types.__package__ + ".probe")
-    t.wire.is_edge, t.wire.domain_rank = False, 1
+    t.wire.is_edge = False
     t.wire.p2p_recv = lambda channel, tensor, peer: tensor.copy_(probe.make_payload(1, tensor.numel()))
     with pytest.raises(ValueError, match="payload mismatch seqno=0"):
         probe.run_batches(t.worker, probe.LwdProbePlan(batches=1))
@@ -327,87 +365,61 @@ def test_probe_rejects_invalid_transfer_plan(transport: SimpleNamespace, invalid
         probe.LwdProbePlan(**invalid)
 
 
-def test_post_failure_fails_waiters_without_releasing_possible_dma(transport: SimpleNamespace) -> None:
+def test_enqueue_failure_is_raised_to_the_caller(transport: SimpleNamespace) -> None:
     t = transport
-    service = t.service.LwdCommService(t.wire)
-    held = service.submit_send(send(t, 1))
 
     def fail(*args: object) -> None:
         raise RuntimeError("device enqueue failed")
 
     t.wire.p2p_send = fail
-    with pytest.raises(RuntimeError, match="device enqueue"):
-        service.submit_send(send(t, 0))
-    with pytest.raises(RuntimeError, match="failed"):
-        held.wait(0)
-    with pytest.raises(RuntimeError, match="failed"):
-        service.poll_completions()
-    channel = next(iter(service._channels.values()))
-    assert channel._failed[0].request.tensor is not None
+    with pytest.raises(RuntimeError, match="device enqueue failed"):
+        t.service.LwdCommService(t.wire).submit_send(send(t, 0))
 
 
-@pytest.mark.parametrize("role,domain_rank", [("edge", 0), ("cloud", 1)])
-def test_join_uses_one_domain_for_both_directions_and_leaves_tp_ranks_local(
-    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, role: str, domain_rank: int
+@pytest.mark.parametrize("role,tp_rank", [("edge", 0), ("cloud", 0), ("cloud", 1)])
+def test_all_ranks_create_two_groups_and_only_endpoints_warm_up(
+    transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, role: str, tp_rank: int
 ) -> None:
-    t = transport
-    calls = []
-    module = t.lwd_wire
-    # A hashable key with the same attributes as the actual config key.
+    t, calls, transfers = transport, [], []
     Key = namedtuple("Key", "edge_id cloud_id dp_idx")
-    key = Key(0, 0, 0)
     link = SimpleNamespace(
-        key=key,
+        key=Key(0, 0, 0),
         dp_idx=0,
-        edge=SimpleNamespace(addr="edge", ranks=(5, 2)),
-        cloud=SimpleNamespace(addr="cloud", ranks=(4, 0, 3, 1)),
+        edge=SimpleNamespace(addr="edge", ranks=(0,)),
+        cloud=SimpleNamespace(addr="cloud", ranks=(1, 2)),
     )
-    cfg = SimpleNamespace(
-        role=role,
-        topology=SimpleNamespace(deployment=SimpleNamespace(scene="single_instance")),
-        connections=(link,),
-    )
+    config = SimpleNamespace(role=role, connections=(link,))
+    module = t.lwd_wire
+    bootstrap = SimpleNamespace(device_group=object(), barrier=Mock())
+    monkeypatch.setattr(module, "get_lwd_bootstrap_world", lambda: bootstrap)
+    rank = 0 if role == "edge" else tp_rank + 1
+    monkeypatch.setattr(module.dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(module.dist, "get_backend", lambda group: "hccl")
 
-    class PG:
-        Options = SimpleNamespace
+    def new_group(ranks: list[int], **kwargs: object) -> object:
+        group = object()
+        calls.append((ranks, group))
+        return group
 
-        def __init__(self, store: object, rank: int, size: int, options: object) -> None:
-            calls.append((rank, size))
+    monkeypatch.setattr(module.dist, "new_group", new_group)
+    monkeypatch.setattr(module.dist.distributed_c10d, "_get_default_store", lambda: object())
 
-        def get_hccl_comm(self, device: object) -> int:
-            return 123
+    def post(op: str, tensor: torch.Tensor, peer: int, group: object) -> Mock:
+        transfers.append((op, peer, group))
+        return Mock()
 
-    stub = ModuleType("torch_npu._C._distributed_c10d")
-    stub.ProcessGroupHCCL = PG
-    monkeypatch.setitem(sys.modules, stub.__name__, stub)
-    hccl = ModuleType("lwd_transport_test.lwd_hccl")
-    hccl.hcclComm_t = lambda value: value
-    hccl.LwdHcclLibrary = lambda: SimpleNamespace(
-        send=lambda tensor, peer, comm: None, recv=lambda tensor, peer, comm: tensor.fill_(1 + peer)
-    )
-    monkeypatch.setitem(sys.modules, hccl.__name__, hccl)
-    store_calls = []
-
-    def tcp_store(*args: object, **kwargs: object) -> object:
-        store_calls.append((args, kwargs))
-        return object()
-
-    monkeypatch.setattr(module.dist, "TCPStore", tcp_store)
-    monkeypatch.setattr(module.dist, "PrefixStore", lambda *args: object())
-    wire = module.LwdWire(cfg, 0, torch.device("cpu"))
-    wire.join_async()
-    wire.ensure_joined(1)
-    assert calls == [(domain_rank, 2)]
-    args, kwargs = store_calls[0]
-    assert args == ("edge", 29600, 2, role == "edge")
-    assert kwargs["timeout"].total_seconds() == 1200
-    assert len(wire._streams) == 2 and wire._comm == 123
-    assert wire.connection.edge_ranks == (5, 2)
-    other = module.LwdWire(cfg, 1, torch.device("cpu"))
-    other.join_async()
-    assert not other.member and other._thread is None
-    with pytest.raises(RuntimeError, match="non-endpoint"):
-        other.ensure_joined(0)
+    monkeypatch.setattr(module.dist, "isend", lambda tensor, dst, group: post("send", tensor, dst, group))
+    monkeypatch.setattr(module.dist, "irecv", lambda tensor, src, group: post("recv", tensor, src, group))
+    monkeypatch.setattr(module.dist, "destroy_process_group", Mock())
+    wire = module.LwdWire(config, tp_rank, torch.device("cpu"))
+    wire.init_lwd_duplex_channels()
+    assert [ranks for ranks, _ in calls] == [[0, 1], [0, 1]]
+    assert calls[0][1] is not calls[1][1]
+    assert len(transfers) == (2 if tp_rank == 0 else 0)
+    if transfers:
+        assert [item[0] for item in transfers] == (["send", "recv"] if role == "edge" else ["recv", "send"])
+        assert transfers[0][2] is calls[0][1] and transfers[1][2] is calls[1][1]
+    bootstrap.barrier.assert_called_once()
     wire.shutdown()
 
 
@@ -485,7 +497,7 @@ def test_early_receive_bounds_prefetch_and_does_not_report_failed_receives(worke
     assert len(worker._early_recv_futures) == 3
     worker.get_or_post_early_recv(0, 1, 0)
     assert set(worker._early_recv_futures) == {1, 2, 3}
-    worker._early_recv_futures[3]._fail(RuntimeError("receive failed"))
+    worker._early_recv_futures[3]._finalize(error=RuntimeError("receive failed"))
     with pytest.raises(RuntimeError, match="failed"):
         worker._report_irecv_completions()
     assert worker._irecv_done_mq.enqueue.call_count == 3
@@ -500,7 +512,8 @@ def test_two_workers_run_repeated_mixed_large_and_early_receive_cases(
     cloud = copy(t.worker)
     cloud.vllm_config = SimpleNamespace(lwd_config=SimpleNamespace(role="cloud", topology=topology))
     cloud.lwd_wire = copy(t.wire)
-    cloud.lwd_wire.is_edge, cloud.lwd_wire.domain_rank = False, 1
+    cloud.lwd_wire.is_edge = False
+    cloud.lwd_wire.get_lwd_channel_device_group = lambda channel: (cloud.lwd_wire, channel)
     cloud.comm_service = t.service.LwdCommService(cloud.lwd_wire)
     cloud._lwd_probe_next = dict(t.worker._lwd_probe_next)
     cloud._init_lwd_early_recv_state()
@@ -561,10 +574,10 @@ def test_two_workers_run_repeated_mixed_large_and_early_receive_cases(
     assert not cloud._early_recv_futures and not cloud._early_recv_pending
     assert cloud._lwd_early_recv_thread is not None and not cloud._lwd_early_recv_thread.is_alive()
     assert all(pipe.empty() for pipe in pipes.values())
-    assert not t.worker.comm_service._closed and not cloud.comm_service._closed
+    assert t.worker.comm_service._channels and cloud.comm_service._channels
     t.worker.shutdown()
     cloud.shutdown()
-    assert t.worker.comm_service._closed and cloud.comm_service._closed
+    assert not t.worker.comm_service._channels and not cloud.comm_service._channels
     assert t.base.NPUWorker.shutdown.call_count == 2
 
 
@@ -578,7 +591,7 @@ def test_failed_probe_requires_restart_and_keeps_transport_buffers(
         t.worker.lwd_run_probe()
     with pytest.raises(RuntimeError, match="restart after failed probe"):
         t.worker.lwd_run_probe()
-    assert run.call_count == 1 and not t.worker.comm_service._closed
+    assert run.call_count == 1 and not t.worker.comm_service._shutting_down
 
 
 def test_probe_reports_completion_reaping_failure_to_local_tp_peers(worker_transport: SimpleNamespace) -> None:

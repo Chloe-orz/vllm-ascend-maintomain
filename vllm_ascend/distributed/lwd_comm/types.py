@@ -1,19 +1,27 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Requests and results for ordered UP/DOWN communication."""
+"""Type definitions for the prefill_only duplex comm package."""
+
+from __future__ import annotations
 
 import enum
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    import torch
     from vllm.config.lwd.topology import LwdConnectionKey
 
 
 class LwdChannelType(enum.Enum):
-    # Directions share one domain but keep separate streams and sequence numbers.
-    UP = "lwd_up"
-    DOWN = "lwd_down"
+    """The two physical data-plane channels, direction-only.
+
+    Each channel maps 1:1 to a dedicated HCCL communicator + NPU stream
+    (see ``vllm_ascend.distributed.lwd_wire``).  HCCL P2P matching order
+    per (communicator, peer) is exactly the per-channel ``seqno``
+    submission order — HCCL does not support tags.
+    """
+
+    UP = "lwd_up"  # edge -> cloud: embeddings + optional V4 expert-ID bytes
+    DOWN = "lwd_down"  # cloud -> edge: combined c2e packet
 
 
 class LwdCommStatus(enum.Enum):
@@ -24,17 +32,53 @@ class LwdCommStatus(enum.Enum):
 
 @dataclass
 class LwdCommRequest:
+    """One communication task submitted to the service.
+
+    Everything the comm layer needs travels with the request — it never
+    reaches back into scheduler/model state.
+    """
+
     channel: LwdChannelType
     op: Literal["send", "recv"]
+    # Number of bf16 elements of the payload (UP: N*H, or N*(H+4*L*K)
+    # for V4 with L Hash layers and K experts per token; DOWN:
+    # 32 + R*(H+3K)).  recv: used to allocate the exact-size buffer
+    # (HCCL P2P requires matching numel on both ends).
     num_elements: int
-    tensor: "torch.Tensor | None" = None
+    # send: payload tensor (snapshotted into a communication-owned buffer
+    # at submit time).  recv: None.
+    tensor: Any | None = None
+    # Per-channel request-level sequence number.  Contract: each
+    # channel's counter starts at 0 and increments by one per request on
+    # both peers; ops are posted to HCCL only once all lower seqnos have
+    # been submitted, so send order and the peer's recv-post order always
+    # agree.  Do not mix sequenced and unsequenced requests on one
+    # channel.
     seqno: int | None = None
+    # Explicit global peer rank; None -> the channel's configured peer.
     src_dst: int | None = None
-    connection_key: "LwdConnectionKey | None" = None
+    # Optional second payload of the SAME logical request (currently
+    # UP-only: mrope positions, int64 [n,3], accompanying an embeds chunk
+    # when the batch has mm data).  Physically a second P2P issued right
+    # after the main one on the same channel, but sequencing stays at
+    # logical-request granularity: one seqno covers both frames, so
+    # skip/drain semantics are unchanged.  send: tensor; recv: None and
+    # ``aux_num_elements`` sizes the exact buffer.
+    #
+    aux_tensor: Any | None = None
+    aux_num_elements: int = 0
+    # None selects int64 for mRoPE; another auxiliary payload can supply its dtype.
+    aux_dtype: Any | None = None
+    connection_key: LwdConnectionKey | None = None
 
 
 @dataclass
 class LwdCommResult:
+    """Outcome of a completed request (cross-node P2P finished on device)."""
+
     status: LwdCommStatus
-    tensor: "torch.Tensor | None" = None
+    tensor: Any | None = None
     error: BaseException | None = None
+    # Received aux payload (mrope positions int64), None when the
+    # request carried no aux frame.
+    aux_tensor: Any | None = None

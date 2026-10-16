@@ -1,5 +1,12 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Completion and buffer ownership for one held or submitted wire request."""
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+"""LwdCommFuture: completion handle for one duplex comm request.
+
+Ported (simplified) from the demo branch's ``lwd_comm/future.py``:
+pure-CPU ``done()`` via ``event.query()``, blocking ``wait()`` for the
+debug/timeout path, in-place ``_bind`` for deferred (out-of-order
+sequenced) futures, and exactly-once ``_finalize`` releasing the send
+keepalive.
+"""
 
 from __future__ import annotations
 
@@ -8,93 +15,182 @@ import time
 from typing import Any
 
 import torch
-from vllm.logger import logger
 
-from .types import LwdCommRequest, LwdCommResult, LwdCommStatus
+from .types import (
+    LwdCommRequest,
+    LwdCommResult,
+    LwdCommStatus,
+)
 
 
 class LwdCommFuture:
-    def __init__(self, request: LwdCommRequest, *, producer_event: Any = None) -> None:
-        self.request = request
-        self.producer_event = producer_event
-        self._done_event: Any = None
-        self._tensor: torch.Tensor | None = None
+    """Tracks one posted (or held) wire op.
+
+    Completion means the cross-node P2P op has finished on the device,
+    witnessed by ``done_event`` recorded on the channel stream right
+    behind the bridged HCCL op.
+    """
+
+    def __init__(
+        self,
+        request: LwdCommRequest,
+        handles: list[Any],
+        done_event: torch.npu.Event | None,
+        tensor: torch.Tensor | None = None,
+        keepalive: Any = None,
+        aux_tensor: torch.Tensor | None = None,
+    ) -> None:
+        self._request = request
+        self._handles = handles
+        self._done_event = done_event
+        self._tensor = tensor
+        self._aux_tensor = aux_tensor
+        self._keepalive = keepalive
         self._status = LwdCommStatus.PENDING
-        self._error: Exception | None = None
-        self._condition = threading.Condition()
+        self._error: BaseException | None = None
+        self._lock = threading.Lock()
+        self._done_cond = threading.Condition(self._lock)
+        self._finalized = False
 
-    def _trace(self, stage: str) -> None:
-        request = self.request
-        logger.debug(
-            "[LWD][comm] %s connection=%s channel=%s op=%s seqno=%s num_elements=%d",
-            stage,
-            request.connection_key,
-            request.channel.value,
-            request.op,
-            request.seqno,
-            request.num_elements,
-        )
+    # ------------------------------------------------------------------ #
+    # Deferred (out-of-order sequenced) support                           #
+    # ------------------------------------------------------------------ #
 
-    def _bind(self, done_event: Any, tensor: torch.Tensor | None = None) -> None:
-        with self._condition:
+    @classmethod
+    def deferred(cls, request: LwdCommRequest) -> LwdCommFuture:
+        """A future for a held request; bound in place when its seqno
+        turn arrives."""
+        return cls(request, [], None)
+
+    def _bind(
+        self,
+        *,
+        handles: list[Any],
+        done_event: torch.npu.Event | None,
+        tensor: torch.Tensor | None = None,
+        keepalive: Any = None,
+        aux_tensor: torch.Tensor | None = None,
+    ) -> None:
+        with self._done_cond:
+            self._handles = handles
             self._done_event = done_event
             self._tensor = tensor
-            self._condition.notify_all()
+            self._aux_tensor = aux_tensor
+            self._keepalive = keepalive
+            self._done_cond.notify_all()
 
-    def _fail(self, error: Exception) -> None:
-        with self._condition:
-            self._status = LwdCommStatus.ERROR
-            self._error = error
-            self._condition.notify_all()
+    # ------------------------------------------------------------------ #
+    # Status                                                              #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def request(self) -> LwdCommRequest:
+        return self._request
 
     def done(self) -> bool:
-        with self._condition:
+        """Pure CPU query; never blocks, never touches the device."""
+        with self._lock:
             if self._status is not LwdCommStatus.PENDING:
                 return True
-            try:
-                if self._done_event is not None and self._done_event.query():
-                    self._status = LwdCommStatus.OK
-                    self._trace("complete")
-                    self._condition.notify_all()
-            except Exception as exc:
-                self._fail(exc)
-            return self._status is not LwdCommStatus.PENDING
-
-    def result(self) -> LwdCommResult:
-        self.done()
-        with self._condition:
-            if self._error is not None:
-                raise RuntimeError(
-                    f"[LWD] {self.request.channel.value} seqno={self.request.seqno} failed"
-                ) from self._error
-            return LwdCommResult(status=self._status, tensor=self._tensor)
+            event = self._done_event
+        if event is None:
+            return False
+        try:
+            if event.query():
+                with self._lock:
+                    if self._status is LwdCommStatus.PENDING:
+                        self._status = LwdCommStatus.OK
+                        self._done_cond.notify_all()
+                return True
+        except Exception as exc:  # device error surfaces as ERROR
+            with self._lock:
+                if self._status is LwdCommStatus.PENDING:
+                    self._status = LwdCommStatus.ERROR
+                    self._error = exc
+                    self._done_cond.notify_all()
+            return True
+        return False
 
     def wait(self, timeout: float | None = None) -> LwdCommResult:
+        """Block until completion (readiness-gate path)."""
         deadline = None if timeout is None else time.monotonic() + timeout
-        with self._condition:
-            while not self.done():
+        with self._done_cond:
+            while self._status is LwdCommStatus.PENDING:
+                if self._done_event is None:
+                    # Deferred future not yet bound; wait for _bind.
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        raise TimeoutError(
+                            f"lwd-comm wait timed out (unbound) on "
+                            f"{self._request.channel.value} seqno="
+                            f"{self._request.seqno}"
+                        )
+                    self._done_cond.wait(timeout=remaining or 0.05)
+                    continue
+                if self._done_event.query():
+                    self._status = LwdCommStatus.OK
+                    break
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
-                    stage = "queued" if self._done_event is None else "device_pending"
                     raise TimeoutError(
-                        f"[LWD] {self.request.channel.value} seqno={self.request.seqno} timed out "
-                        f"stage={stage} op={self.request.op} connection={self.request.connection_key} "
-                        f"num_elements={self.request.num_elements}"
+                        f"lwd-comm wait timed out on {self._request.channel.value} seqno={self._request.seqno}"
                     )
-                self._condition.wait(min(0.01, remaining) if remaining is not None else 0.01)
-            return self.result()
+                self._done_cond.wait(timeout=min(0.05, remaining or 0.05))
+            if self._status is LwdCommStatus.ERROR:
+                raise RuntimeError(
+                    f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
+                ) from self._error
+        return LwdCommResult(
+            status=self._status,
+            tensor=self._tensor,
+            aux_tensor=self._aux_tensor,
+        )
+
+    def result(self) -> LwdCommResult:
+        with self._lock:
+            status, tensor, aux_tensor, error = (
+                self._status,
+                self._tensor,
+                self._aux_tensor,
+                self._error,
+            )
+        if status is LwdCommStatus.ERROR:
+            raise RuntimeError(
+                f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
+            ) from error
+        return LwdCommResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
+
+    # ------------------------------------------------------------------ #
+    # Device-side ordering for consumers                                  #
+    # ------------------------------------------------------------------ #
 
     def wait_for_comm(self) -> None:
-        with self._condition:
-            self.result()
-            if self._done_event is None:
-                raise RuntimeError("[LWD] cannot consume an unposted receive")
-            torch.npu.current_stream().wait_event(self._done_event)
+        """Order the *current* stream after the channel-stream completion
+        event (pure device-side; CPU returns immediately)."""
+        event = self._done_event
+        if event is not None:
+            torch.npu.current_stream().wait_event(event)
 
-    def _finalize(self) -> None:
-        with self._condition:
-            # An error is not proof that DMA stopped. Retain its buffers until
-            # process teardown; only successful completion permits reclamation.
-            if self.done() and self._status is LwdCommStatus.OK:
-                self.request.tensor = None
-                self.producer_event = None
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _finalize(self, error: BaseException | None = None) -> None:
+        """Exactly-once terminal bookkeeping: release the send keepalive.
+        With ``error`` the future completes in ERROR state immediately
+        (abort/skip path) so waiters fail promptly instead of timing out."""
+        with self._done_cond:
+            if self._finalized:
+                return
+            self._finalized = True
+            self._keepalive = None
+            self._handles = []
+            if error is not None:
+                self._status = LwdCommStatus.ERROR
+                self._error = error
+                self._done_cond.notify_all()
+                return
+            if self._status is LwdCommStatus.PENDING:
+                self._status = (
+                    LwdCommStatus.OK if (self._done_event is not None and self._done_event.query()) else self._status
+                )
