@@ -49,13 +49,6 @@ class LwdCloudWorker(LwdWorkerBase):
     Selected by ``platform.py`` only when LWD is enabled on a cloud
     process; the data-plane wiring below runs unconditionally."""
 
-    def _receive_pp_intermediate_tensors(
-        self, forward_pass: bool
-    ) -> "AsyncIntermediateTensors | None":
-        """LWD: the edge-cloud handoff rides the lwd UP/DOWN channels,
-        so the native PP p2p receive would block forever."""
-        return None
-
     def init_device(self) -> None:
         super().init_device()
         # channel-global DOWN seqno counter (worker layer, send-time alloc)

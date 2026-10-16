@@ -881,11 +881,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         return cpu_ms, delta_ms
 
-    def _pp_broadcast_prev_sampled_token_ids(
-        self, sampled_token_ids: "torch.Tensor"
-    ) -> None:
-        """LWD: token flow rides the lwd DOWN channel, skip the native PP broadcast."""
-
     def _sample(
         self, logits: "torch.Tensor | None",
         spec_decode_metadata: "SpecDecodeMetadata | None",
