@@ -492,13 +492,6 @@ class NPUWorker(WorkerBase):
         # in ray scenario. see https://github.com/vllm-project/vllm/pull/26845
         # for more details
         self.device = self._init_device()
-        if self.vllm_config.lwd_config is not None:
-            from vllm_ascend.distributed.lwd_comm.probe import run_startup_probe
-
-            # Retain the test communicator until worker exit, as its PG owns HCCL.
-            self._lwd_probe_wire = run_startup_probe(
-                self.vllm_config.lwd_config, self.parallel_config, self.device, get_tp_group()
-            )
         # Initialize workspace manager
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)

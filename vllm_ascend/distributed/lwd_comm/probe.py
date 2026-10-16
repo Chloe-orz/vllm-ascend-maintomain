@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Check the LWD transport during ordinary centralized worker startup."""
+"""Exercise the persistent Worker data plane after the API server is ready."""
 
 from __future__ import annotations
 
@@ -13,19 +13,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
+import vllm
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
 
-from .types import LwdChannelType, LwdCommRequest
+from .types import LwdChannelType
 
 if TYPE_CHECKING:
     from torch.distributed import Store
-    from vllm.config import ParallelConfig
-    from vllm.config.lwd import LwdConfig
-    from vllm.distributed.parallel_state import GroupCoordinator
+
+    from vllm_ascend.worker.lwd_worker import LwdWorker
 
     from .future import LwdCommFuture
-    from .lwd_wire import LwdWire
-    from .service import LwdCommService
+
 
 _SEQUENCE_BYTES = 8
 
@@ -79,112 +80,129 @@ def exchange_check(store: Store, role: str, phase: str, payload: str, timeout: f
         raise ValueError(f"[LWD][wire-test] peer {phase} mismatch: local={payload} peer={actual}")
 
 
-def run_batches(service: LwdCommService, wire: LwdWire, plan: LwdProbePlan) -> None:
+def check_local_result(error: str | None) -> None:
+    tp = get_tp_group()
+    errors = [error]
+    if tp.world_size > 1:
+        errors = [None] * tp.world_size
+        dist.all_gather_object(errors, error, group=tp.cpu_group)
+    if any(item is not None for item in errors):
+        raise ValueError(f"[LWD][wire-test] local TP verification failed: {errors}")
+
+
+def run_batches(worker: LwdWorker, plan: LwdProbePlan, start_seqno: int = 0) -> None:
+    wire = worker.lwd_wire
     channel = LwdChannelType.UP if plan.channel == "up" else LwdChannelType.DOWN
     sending = wire.is_edge == (channel is LwdChannelType.UP)
-    pending: deque[LwdCommFuture] = deque()
+    pending: deque[tuple[int, int, LwdCommFuture | None]] = deque()
 
-    def complete(future: LwdCommFuture) -> None:
-        result = future.wait(wire.timeout_s)
-        request = future.request
-        assert request.seqno is not None
-        if not sending:
-            expected = make_payload(request.seqno, request.num_elements)
-            if result.tensor is None or not torch.equal(result.tensor.cpu(), expected):
-                raise ValueError(f"[LWD][wire-test] payload mismatch seqno={request.seqno}")
-        logger.info(
-            "[LWD][wire-test] %s seqno=%d num_elements=%d %s",
-            request.op,
-            request.seqno,
-            request.num_elements,
-            "complete" if sending else "verified",
-        )
-        service.poll_completions()
+    def complete(item: tuple[int, int, LwdCommFuture | None]) -> None:
+        seqno, numel, future = item
+        if sending:
+            worker.wait_lwd_send(future)
+        else:
+            tensor = worker.receive_lwd_tensor(future, numel)
+            error = None
+            try:
+                expected = make_payload(seqno, numel).to(dtype=wire.dtype)
+                if not torch.equal(tensor.cpu(), expected):
+                    error = f"payload mismatch seqno={seqno}"
+            except Exception as exc:
+                error = str(exc)
+            check_local_result(error)
+        error = None
+        if wire.member:
+            logger.info(
+                "[LWD][wire-test] %s seqno=%d num_elements=%d %s",
+                "send" if sending else "recv",
+                seqno,
+                numel,
+                "complete" if sending else "verified",
+            )
+            try:
+                worker.comm_service.poll_completions()
+            except Exception as exc:
+                error = str(exc)
+        worker.lwd_sync_error(error)
 
-    for seqno in range(plan.batches):
-        num_elements = plan.num_elements(seqno)
-        tensor = make_payload(seqno, num_elements).to(wire.device) if sending else None
-        request = LwdCommRequest(
-            channel, "send" if sending else "recv", num_elements, tensor, seqno=seqno, connection_key=wire.key
-        )
-        future = service.submit_send(request) if sending else service.submit_recv(request)
-        pending.append(future)
+    for offset in range(plan.batches):
+        seqno, numel = start_seqno + offset, plan.num_elements(offset)
+        future, error = None, None
+        try:
+            if sending:
+                tensor = make_payload(seqno, numel).to(device=wire.device, dtype=wire.dtype) if wire.member else None
+                future = worker.send_lwd_tensor(tensor, channel, seqno)
+            else:
+                future = worker.submit_lwd_recv(numel, channel, seqno)
+        except Exception as exc:
+            error = str(exc)
+        worker.lwd_sync_error(error)
+        pending.append((seqno, numel, future))
         if len(pending) >= plan.window:
             complete(pending.popleft())
     while pending:
         complete(pending.popleft())
 
 
-def run_probe(config: LwdConfig, device: torch.device, plan: LwdProbePlan) -> LwdWire:
-    import vllm.config.lwd as lwd
-
-    from .lwd_wire import LwdWire
-    from .service import LwdCommService
-
-    wire = LwdWire(config, tp_rank=0, device=device)
-    service = LwdCommService(wire)
+def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
+    config, wire = worker.vllm_config.lwd_config, worker.lwd_wire
+    channel = LwdChannelType.UP if plan.channel == "up" else LwdChannelType.DOWN
+    round_id, start_seqno = worker._lwd_probe_round, worker._lwd_probe_next[channel]
+    if start_seqno + plan.batches > 256**_SEQUENCE_BYTES:
+        raise ValueError("[LWD][wire-test] sequence exceeds payload header capacity")
     topology = asdict(config.topology)
     topology.pop("digest")
+    vllm_root = Path(vllm.__file__).resolve().parents[1]
     agreement = {
         "ascend_commit": source_revision(Path(__file__).resolve().parents[3]),
-        "vllm_commit": source_revision(Path(lwd.__file__).resolve().parents[3]),
+        "vllm_commit": source_revision(vllm_root),
         "transport_sha256": source_digest(Path(__file__).parent),
-        "config_sha256": source_digest(Path(lwd.__file__).parent),
+        "worker_sha256": sha256(Path(__file__).parents[2].joinpath("worker/lwd_worker.py").read_bytes()).hexdigest(),
+        "config_sha256": source_digest(vllm_root / "vllm/config/lwd"),
         "topology": topology,
         "connection": asdict(wire.key),
+        "dtype": str(wire.dtype),
         "plan": asdict(plan),
+        "start_seqno": start_seqno,
     }
-    logger.info("[LWD][wire-test] config=%s device=%s", json.dumps(asdict(config)), device)
-    logger.info("[LWD][wire-test] agreement=%s", json.dumps(agreement, sort_keys=True))
-    wire.join_async()
-    wire.ensure_joined()
-    # Reuse the rendezvous store for test agreement and final verification;
-    # no inference control-plane sockets or per-packet notifications are used.
-    exchange_check(wire._store, config.role, "plan", json.dumps(agreement, sort_keys=True), wire.timeout_s)
-    logger.info("[LWD][wire-test] peer code/config/plan matched; starting transfers")
-    run_batches(service, wire, plan)
-    exchange_check(wire._store, config.role, "verified", str(plan.batches), wire.timeout_s)
-    # The cloud's last store operation acknowledges consuming the result.
-    # Only the store-owning edge waits, avoiding a shutdown/read race.
-    if wire.is_edge:
-        wire._store.wait(["lwd_probe/cloud_done"], timedelta(seconds=wire.timeout_s))
-    else:
-        wire._store.set("lwd_probe/cloud_done", "1")
-    service.shutdown(timeout=wire.timeout_s)
-    logger.info("[LWD][wire-test] PASS role=%s channel=%s batches=%d", config.role, plan.channel, plan.batches)
-    return wire
-
-
-def run_startup_probe(
-    config: LwdConfig, parallel: ParallelConfig, device: torch.device, tp_group: GroupCoordinator
-) -> LwdWire | None:
-    if config.topology.deployment.scene != "single_instance" or len(config.connections) != 1:
-        raise ValueError("[LWD][wire-test] startup test requires single_instance DP=1")
-    if any(
-        size != 1
-        for size in (
-            parallel.pipeline_parallel_size,
-            parallel.data_parallel_size,
-            parallel.prefill_context_parallel_size,
-        )
-    ):
-        raise ValueError("[LWD][wire-test] startup test requires PP=DP=PCP=1")
-    if len(config.instance.dp[0].ranks) != tp_group.world_size:
-        raise ValueError("[LWD][wire-test] YAML rank count must match the local tensor-parallel size")
-
-    wire = None
-    failure = None
-    if tp_group.rank_in_group == 0:
-        logger.info("[LWD][wire-test] starting before centralized model loading, role=%s", config.role)
+    store, error = None, None
+    if wire.member:
         try:
-            wire = run_probe(config, device, LwdProbePlan())
+            wire.ensure_joined()
+            # Per-round keys prevent an earlier PASS from satisfying a repeated test.
+            store = dist.PrefixStore(f"lwd_probe_round/{round_id}", wire._store)
+            exchange_check(store, config.role, "plan", json.dumps(agreement, sort_keys=True), wire.timeout_s)
+            logger.info(
+                "[LWD][wire-test] peer code/config/plan matched; starting round=%d channel=%s", round_id, plan.channel
+            )
         except Exception as exc:
-            failure = exc
-    # Other TP workers wait here, so none enter model collectives before the
-    # endpoint finishes; a failed endpoint stops every local worker.
-    error = tp_group.broadcast_object(str(failure) if failure is not None else None, src=0)
-    if error is not None:
-        raise RuntimeError(f"[LWD][wire-test] startup test failed: {error}") from failure
-    if tp_group.rank_in_group == 0:
-        logger.info("[LWD][wire-test] continuing centralized model loading")
-    return wire
+            error = str(exc)
+    worker.lwd_sync_error(error)
+    run_batches(worker, plan, start_seqno)
+    error = None
+    if wire.member:
+        try:
+            exchange_check(store, config.role, "verified", str(plan.batches), wire.timeout_s)
+        except Exception as exc:
+            error = str(exc)
+    worker.lwd_sync_error(error)
+    worker._lwd_probe_next[channel] += plan.batches
+    worker._lwd_probe_round += 1
+    result = {
+        "status": "PASS",
+        "role": config.role,
+        "channel": plan.channel,
+        "batches": plan.batches,
+        "round": round_id,
+        "start_seqno": start_seqno,
+        "tp_rank": get_tp_group().rank_in_group,
+    }
+    logger.info(
+        "[LWD][wire-test] PASS role=%s channel=%s batches=%d round=%d tp_rank=%d; transport remains open",
+        config.role,
+        plan.channel,
+        plan.batches,
+        round_id,
+        result["tp_rank"],
+    )
+    return result

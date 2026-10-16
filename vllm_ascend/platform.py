@@ -1327,6 +1327,11 @@ def _setup_worker_and_scheduler(
         else:
             parallel_config.worker_cls = hardware_profile.default_worker_cls
 
+        if vllm_config.lwd_config is not None:
+            if parallel_config.worker_cls != "vllm_ascend.worker.worker.NPUWorker":
+                raise ValueError("[LWD] data-plane worker requires the standard NPU worker")
+            parallel_config.worker_cls = "vllm_ascend.worker.lwd_worker.LwdWorker"
+
     refresh_block_size(vllm_config)
 
     # Automatically activate all custom ops on profiles using the standard path.
