@@ -266,31 +266,70 @@ class LwdCloudModelRunner(NPUModelRunner):
             self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
         return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
 
-    def _resolve_prompt_embeds(
-        self, new_req_data: "NewRequestData"
-    ) -> "torch.Tensor | None":
-        """LWD: the edge-cloud transport carries shape only for all-zero
-        embeds buffers, so rebuild the local placeholder here (same
-        semantics as the engine-side torch.zeros)."""
+    # ------------------------------------------------------------------ #
+    # Zero-base-weave seams: LWD 行为全部经子类覆写呈现,基类零接缝。       #
+    # ------------------------------------------------------------------ #
+
+    def _update_states(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "Callable[[], None] | None":
+        """LWD:shape-only 占位 embeds 在进基类前就地重建(零基座接缝)。
+
+        边云传输只携带形状(prompt_embeds=None + shape),基类的
+        CachedRequestState 构造按 new_req_data.prompt_embeds 直通——
+        此处先重建全零占位,原生路径行为不变。"""
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if (
+                new_req.prompt_embeds is None
+                and new_req.prompt_embeds_shape is not None
+            ):
+                new_req.prompt_embeds = torch.zeros(
+                    new_req.prompt_embeds_shape,
+                    dtype=new_req.prompt_embeds_dtype,
+                )
+        return super()._update_states(scheduler_output)
+
+    def _update_streaming_request(
+        self, req_id: str, new_req_data: "NewRequestData"
+    ) -> "CachedRequestState":
+        """LWD:流式更新的占位重建(同 _update_states,零基座接缝)。"""
         if (
             new_req_data.prompt_embeds is None
             and new_req_data.prompt_embeds_shape is not None
         ):
-            return torch.zeros(
+            new_req_data.prompt_embeds = torch.zeros(
                 new_req_data.prompt_embeds_shape,
                 dtype=new_req_data.prompt_embeds_dtype,
             )
-        return new_req_data.prompt_embeds
+        return super()._update_streaming_request(req_id, new_req_data)
 
-    def _should_run_mm_encoder(
-        self, is_first_rank: bool, is_encoder_decoder: bool
-    ) -> bool:
-        """LWD: batches carrying edge-provided embeds must not run the MM
-        encoder, or embeddings recomputed from input_ids would overwrite
-        the remote ones wholesale."""
-        if self.enable_prompt_embeds and bool(self.input_batch.req_prompt_embeds):
+    def _init_mrope_positions(self, req_state: "CachedRequestState") -> None:
+        """LWD prompt-embeds-only:纯文本 M-RoPE positions 与 ids 内容
+        无关(扫描仅认 vision 标记),直接按 prompt 长度构造;有 ids 则
+        走原生扫描(零基座接缝)。"""
+        if req_state.prompt_token_ids is None:
+            n = req_state.num_prompt_tokens
+            req_state.mrope_positions = (
+                torch.arange(n).unsqueeze(0).expand(3, n).clone()
+            )
+            req_state.mrope_position_delta = 0
+            return
+        super()._init_mrope_positions(req_state)
+
+    @property
+    def supports_mm_inputs(self) -> bool:
+        """LWD 注入批按"本步无 MM"呈现,原生 MM 门自然跳过 encoder
+        (重算的 embeddings 会整批覆写远端注入值);decode/纯文本步
+        返回模型真值。零基座接缝。"""
+        input_batch = getattr(self, "input_batch", None)
+        if input_batch is not None and input_batch.req_prompt_embeds:
             return False
-        return super()._should_run_mm_encoder(is_first_rank, is_encoder_decoder)
+        return getattr(self, "_model_supports_mm_inputs", False)
+
+    @supports_mm_inputs.setter
+    def supports_mm_inputs(self, value: bool) -> None:
+        # 基类 __init__ 直接赋值,存 backing 供 getter 动态呈现。
+        self._model_supports_mm_inputs = value
 
     def _lwd_preprocess_prompt_embeds(
         self, scheduler_output: "SchedulerOutput", num_input_tokens: int

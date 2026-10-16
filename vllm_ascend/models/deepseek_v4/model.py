@@ -376,8 +376,6 @@ class DeepseekV4MoE(nn.Module):
             n_shared_experts=config.n_shared_experts if self.is_fusion_moe_shared_experts_enabled else 0,
             hash_indices_table=self.gate.tid2eid,
         )
-        # 将哈希层号固定在本层运行器上，供编译后的算子在运行时读取。
-        self.experts.runner.lwd_hash_layer_idx = self.layer_idx if self.hash else None
 
     def forward(
         self,
@@ -385,6 +383,10 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # 哈希层号随每层前向注入 context(哈希层=层号,普通层=None 清空,
+        # 防沿用上一层),供路由的 LWD 专家合并读取——单点注入,避免
+        # 多层转发路径各自注入时相互覆盖。
+        get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 

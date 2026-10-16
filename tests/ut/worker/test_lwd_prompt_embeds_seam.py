@@ -1,128 +1,96 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Cloud-side seam tests for the prompt-embeds sinking batch.
+"""Zero-base-weave seam tests for the LWD cloud runner (ascend side).
 
-Companion to vllm ``tests/v1/lwd_control/test_prompt_embeds_seam.py``:
-the LWD halves of the two seams live ONLY here --
+The vllm base ``gpu_model_runner.py`` carries NO LWD seams anymore
+(locked by the vllm-side companion test): the shape-only placeholder
+rebuild, the MM-encoder gate and the mrope prompt-embeds-only branch are
+all presented by ``LwdCloudModelRunner`` overriding the native methods
+and wrapping ``super()``:
 
-- ``_resolve_prompt_embeds``: rebuild an all-zeros placeholder when the
-  edge-cloud transport carried shape only,
-- ``_should_run_mm_encoder``: skip the encoder when the batch carries
-  edge-provided embeds (recomputed embeddings would overwrite them),
+- ``_update_states`` / ``_update_streaming_request`` rebuild the
+  all-zeros placeholder in-place on the incoming request data before the
+  base builds/updates ``CachedRequestState`` (base passthrough of
+  ``new_req_data.prompt_embeds`` keeps native semantics);
+- ``_init_mrope_positions`` constructs arange positions directly for
+  prompt-embeds-only requests, otherwise defers to the base scan;
+- ``supports_mm_inputs`` is a dynamic property: inject batches (remote
+  embeds present) report False so the native MM gate skips the encoder,
+  everything else reports the model capability.
 
-while the shared bases (``model_runner_v1.py``) stay protocol-free.
 Source-level assertions run everywhere; the runtime half re-runs on the
-NPU env (needs torch + the vllm import chain).
+NPU env (python>=3.10 + torch + vllm import chain), mirroring the
+vllm-side companion.
 """
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
-
-import pytest
+from types import SimpleNamespace as NS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 CLOUD = (
     _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_cloud_model" / "lwd_cloud_model_runner.py"
 )
-BASE_MR = _REPO_ROOT / "vllm_ascend" / "worker" / "model_runner_v1.py"
 
 
-def _method(path: Path, name: str) -> ast.FunctionDef:
-    src = path.read_text(encoding="utf-8")
-    for node in ast.walk(ast.parse(src)):
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            return node
-    raise AssertionError(f"method {name} not found in {path}")
-
-
-def test_cloud_overrides_exist() -> None:
+def test_zero_weave_overrides_present() -> None:
     src = CLOUD.read_text(encoding="utf-8")
-    assert "def _resolve_prompt_embeds(" in src
-    assert "def _should_run_mm_encoder(" in src
+    for marker in (
+        "def _update_states(",
+        "def _update_streaming_request(",
+        "def _init_mrope_positions(",
+        "@property",
+        "def supports_mm_inputs(",
+        "@supports_mm_inputs.setter",
+    ):
+        assert marker in src, f"zero-weave override missing: {marker}"
+    for stale in ("_resolve_prompt_embeds", "_should_run_mm_encoder"):
+        assert stale not in src, f"stale base hook reference: {stale}"
 
 
-def test_cloud_placeholder_rebuild_uses_shape_protocol() -> None:
-    fn = _method(CLOUD, "_resolve_prompt_embeds")
-    seg = ast.get_source_segment(CLOUD.read_text(encoding="utf-8"), fn)
-    assert seg is not None
-    assert "prompt_embeds_shape" in seg
-    assert "torch.zeros" in seg
-
-
-def test_cloud_mm_gate_skips_embeds_then_delegates() -> None:
-    fn = _method(CLOUD, "_should_run_mm_encoder")
-    seg = ast.get_source_segment(CLOUD.read_text(encoding="utf-8"), fn)
-    assert seg is not None
-    assert "req_prompt_embeds" in seg
-    assert "super()._should_run_mm_encoder(" in seg
-
-
-def test_ascend_base_runner_stays_protocol_free() -> None:
-    src = BASE_MR.read_text(encoding="utf-8")
-    assert "prompt_embeds_shape" not in src
-    assert "has_prompt_embeds" not in src
+def test_zero_weave_overrides_delegate_to_super() -> None:
+    """三个 wrap 必须以 super() 收尾/分流,不复刻基类实现。"""
+    src = CLOUD.read_text(encoding="utf-8")
+    assert "return super()._update_states(scheduler_output)" in src
+    assert "return super()._update_streaming_request(req_id, new_req_data)" in src
+    assert "super()._init_mrope_positions(req_state)" in src
 
 
 def _cloud_cls():
-    pytest.importorskip(
+    pytest_import = __import__("pytest")
+    pytest_import.importorskip(
         "torch", reason="re-run on NPU env: python>=3.10 + torch + vllm"
     )
     from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
         LwdCloudModelRunner,
     )
-
     return LwdCloudModelRunner
 
 
-def test_runtime_placeholder_rebuild() -> None:
+def test_runtime_mrope_direct_construction() -> None:
     cls = _cloud_cls()
     import torch
 
     runner = cls.__new__(cls)
+    state = NS(
+        prompt_token_ids=None,
+        num_prompt_tokens=4,
+        mrope_positions=None,
+        mrope_position_delta=None,
+    )
+    runner._init_mrope_positions(state)
+    assert state.mrope_position_delta == 0
+    assert torch.equal(
+        state.mrope_positions,
+        torch.arange(4).unsqueeze(0).expand(3, 4),
+    )
 
-    class _ShapeOnly:
-        prompt_embeds = None
-        prompt_embeds_shape = (2, 3, 4)
-        prompt_embeds_dtype = torch.float16
 
-    out = runner._resolve_prompt_embeds(_ShapeOnly)
-    assert isinstance(out, torch.Tensor)
-    assert tuple(out.shape) == (2, 3, 4)
-    assert out.dtype == torch.float16
-    assert float(out.abs().sum()) == 0.0
-
-
-def test_runtime_passthrough_when_embeds_present() -> None:
+def test_runtime_supports_mm_inputs_property() -> None:
     cls = _cloud_cls()
     runner = cls.__new__(cls)
-
-    class _Carried:
-        prompt_embeds = "EMBEDS"
-        prompt_embeds_shape = None
-        prompt_embeds_dtype = None
-
-    assert runner._resolve_prompt_embeds(_Carried) == "EMBEDS"
-
-
-def _gate(runner, req_prompt_embeds, supports_mm=True):
-    runner.enable_prompt_embeds = True
-    runner.supports_mm_inputs = supports_mm
-
-    class _IB:
-        pass
-
-    runner.input_batch = _IB()
-    runner.input_batch.req_prompt_embeds = req_prompt_embeds
-    return runner._should_run_mm_encoder(is_first_rank=True, is_encoder_decoder=False)
-
-
-def test_runtime_mm_gate_skips_when_embeds_in_batch() -> None:
-    cls = _cloud_cls()
-    assert _gate(cls.__new__(cls), req_prompt_embeds=["e"]) is False
-
-
-def test_runtime_mm_gate_delegates_without_embeds() -> None:
-    cls = _cloud_cls()
-    assert _gate(cls.__new__(cls), req_prompt_embeds=[]) is True
-    assert _gate(cls.__new__(cls), req_prompt_embeds=[], supports_mm=False) is False
+    runner._model_supports_mm_inputs = True
+    runner.input_batch = NS(req_prompt_embeds={0: object()})
+    assert runner.supports_mm_inputs is False  # 注入批:门关
+    runner.input_batch = NS(req_prompt_embeds={})
+    assert runner.supports_mm_inputs is True   # 空批:模型真值

@@ -100,10 +100,10 @@ def test_draft_cache_weave_removed() -> None:
     runner_src = _RUNNER.read_text(encoding="utf-8")
     for symbol in ("LwdDraftCache", "_lwd_draft_cache", "_lwd_restore_drafts"):
         assert symbol not in runner_src, f"draft-cache weave leaked back: {symbol}"
-    for override in ("def _update_states(", "def _prepare_input_ids("):
-        assert override not in runner_src, (
-            f"native {override[4:-1]} must stay unoverridden on the cloud runner"
-        )
+    # _prepare_input_ids 必须保持不覆写(草稿回填链已整体删除);
+    # _update_states 现承载零侵入占位重建 wrap(prompt_embeds seam),
+    # 属合法覆写,由 test_lwd_prompt_embeds_seam 锁定其形态。
+    assert "def _prepare_input_ids(" not in runner_src
     assert not (
         _REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py"
     ).exists(), "deleted module must not come back"
@@ -223,3 +223,28 @@ def test_layer_trace_rehomed_and_installed() -> None:
     assert "vllm_ascend.worker.lwd_debug.lwd_layer_trace" in edge
     assert (_REPO_ROOT / "vllm_ascend/worker/lwd_debug/lwd_layer_trace.py").exists()
     assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_layer_trace.py").exists()
+
+def test_v4_hash_wiring_on_main() -> None:
+    """V4 Hash 专家路由在 main 新结构上的接线守卫(B↔A 对当关系)。
+
+    B 侧(ww 分支)= deepseek_v4.py:460 构造期挂 runner 对象 + experts_selector
+    select_experts 合并块 + fused_moe 前向注入层号。main 对象图已变(runner
+    经多模块间接持有,.runner 属性不存在),对应移植为:
+      ① 模型层 forward 入口单点注入 context 层号(哈希层=层号,普通层=None
+         清空)——多层转发路径(fused_moe / routed_experts)一律不再各自注入,
+         防止内层把外层注入的正确层号覆盖成 None;
+      ② router/fused_topk_router sqrtsoftplus 分支的合并块(合并表 + 行号
+         充当 token id,复用原生 TP/EP 与门控内核,逐行为对当);
+      ③ B 侧的 TP/EP 后行数 fail-fast 同步保留。
+    """
+    model_src = (_REPO_ROOT / "vllm_ascend/models/deepseek_v4/model.py").read_text(encoding="utf-8")
+    assert "get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None" in model_src
+    for path in ("vllm_ascend/ops/fused_moe/fused_moe.py",
+                 "vllm_ascend/ops/fused_moe/routed_experts.py"):
+        assert "lwd_hash_layer_idx" not in (_REPO_ROOT / path).read_text(encoding="utf-8"), path
+    router_src = (
+        _REPO_ROOT / "vllm_ascend/ops/fused_moe/router/fused_topk_router.py"
+    ).read_text(encoding="utf-8")
+    assert "merge_hash_expert_ids(" in router_src
+    assert 'getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)' in router_src
+    assert "routing rows do not match router logits" in router_src

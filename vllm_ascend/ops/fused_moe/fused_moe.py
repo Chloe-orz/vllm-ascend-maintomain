@@ -423,8 +423,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # 每次算子执行都从本层运行器取得哈希层号,普通层清空该值,防止沿用上一层。
-        get_forward_context().lwd_hash_layer_idx = getattr(self, "lwd_hash_layer_idx", None)
         with self._sequence_parallel_context():
             shared_hidden_states = shared_experts_input if shared_experts_input is not None else hidden_states
             if self.ascend_shared_experts is None:
