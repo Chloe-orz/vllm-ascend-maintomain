@@ -116,7 +116,9 @@ def test_pinned_staging_single_implementation() -> None:
     assert base.count("LwdPinnedStaging(") == 1  # 具名惰性工厂是唯一构造点
     assert runner.count("LwdPinnedStaging(") == 0  # 云侧经 _lwd_staging 委托
     assert runner.count("self._lwd_staging(") == 2  # down_meta + down_index
-    assert edge.count("LwdPinnedStaging(") == 1  # ids staging(Phase 2 迁移后归零)
+    assert edge.count("LwdPinnedStaging(") == 0  # 边 worker 已纯分派
+    edge_runner = (_REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py").read_text(encoding="utf-8")
+    assert edge_runner.count("self._lwd_staging(") == 1  # ids staging 经工厂
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):
         assert stale not in runner, f"hand-rolled rotation leaked: {stale}"
     assert "_lwd_ids_ring_idx" not in edge
@@ -221,9 +223,10 @@ def test_layer_trace_rehomed_and_installed() -> None:
     """
     edge = _EDGE.read_text(encoding="utf-8")
     worker = _WORKER.read_text(encoding="utf-8")
-    assert "install_lwd_layer_trace(self.model_runner.get_model())" in edge
+    edge_runner_src = (_REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py").read_text(encoding="utf-8")
+    assert "install_lwd_layer_trace(self.get_model())" in edge_runner_src
     assert "install_lwd_layer_trace(self.model_runner.get_model())" in worker
-    assert "vllm_ascend.worker.lwd_debug.lwd_layer_trace" in edge
+    assert "vllm_ascend.worker.lwd_debug.lwd_layer_trace" in edge_runner_src
     assert (_REPO_ROOT / "vllm_ascend/worker/lwd_debug/lwd_layer_trace.py").exists()
     assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_layer_trace.py").exists()
 

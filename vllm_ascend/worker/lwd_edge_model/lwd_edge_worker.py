@@ -1,107 +1,42 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
-"""LWD (layerwise disaggregated) prefill_only mode edge worker."""
+"""LWD (layerwise disaggregated) prefill_only mode edge worker.
+
+Dispatcher only: the edge data-plane compute (embed/unembed forward,
+MM cache, tid2eid tables) lives on LwdEdgeModelRunner — same
+worker↔runner division as native. The native per-step runner pipeline
+stays dormant on the edge (LWD hijacks execute_model at the worker).
+"""
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING
 
-import torch
 from vllm.logger import logger
-from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
-
-from vllm.v1.core.sched.output import (
-    LwdBatchType,
-    LwdEmbedBatch,
-    LwdUnembedBatch,
-)
+from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm_ascend import envs
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
-from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
+
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
-from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (
+    LwdEdgeModelRunner,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-# mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
-_LWD_MM_HASH_CACHE_MAX_ITEMS = 32
-
-# ---- token recovery / logit-rank lookup ----
-def select_token_batch(
-    logits: torch.Tensor, ranks: list[int]
-) -> list[int]:
-    """Batched rank→token lookup: one sort, one D2H sync for all rows.
-
-    logits [R,V] rows sorted together (NPU sorts rows in parallel);
-    sorted_idx[i, ranks[i]] is the token id at rank ranks[i] for row i.
-    """
-    _, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-    row = torch.arange(len(ranks), device=logits.device)
-    return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
-
-
-# ---- edge worker ----
 class LwdEdgeWorker(LwdWorkerBase):
-    """LWD edge worker: embed (prefill) + unembed (token recovery) only."""
-
-    def load_model(self) -> None:
-        """加载边侧模型，并为 DeepSeek V4 从权重文件读取 CPU Hash 路由表。"""
-        super().load_model()
-        # [layer-trace] 对拍插桩(env 门控,缺省零开销):边侧安装点,
-        # 与云侧/集中式共用同一份代码(见 lwd_debug.lwd_layer_trace)。
-        from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
-            install_lwd_layer_trace,
-        )
-
-        install_lwd_layer_trace(self.model_runner.get_model())
-        self.tid2eid_tables: list[torch.Tensor] = []
-        config = self.model_config.hf_config
-        if getattr(config, "model_type", None) != "deepseek_v4":
-            return
-        num_hash_layers = config.num_hash_layers
-        if not 0 <= num_hash_layers <= config.num_hidden_layers:
-            raise ValueError(f"Invalid DeepSeek V4 num_hash_layers: {num_hash_layers}")
-        if num_hash_layers == 0:
-            logger.info("[lwd-edge] tid2eid loading skipped: num_hash_layers=0")
-            return
-        logger.info("[lwd-edge] loading tid2eid tables for %d Hash MoE layers", num_hash_layers)
-        # Reuse vLLM's checkpoint resolution (revision, cache and shard filtering).
-        loader = DefaultModelLoader(self.vllm_config.load_config)
-        _, weight_files, use_safetensors = loader._prepare_weights(
-            self.model_config.model,
-            subfolder=None,
-            revision=self.model_config.revision,
-            fall_back_to_pt=False,
-            allow_patterns_overrides=None,
-        )
-        if not use_safetensors:
-            raise ValueError("LWD DeepSeek V4 tid2eid loading requires safetensors weights")
-        self.tid2eid_tables = load_tid2eid_tables(
-            weight_files, num_hash_layers, config.vocab_size,
-            config.num_experts_per_tok, config.n_routed_experts,
-        )
+    """LWD edge worker: batch dispatch only (embed/unembed on the runner)."""
 
     def init_device(self) -> None:
         # comm_service 与组网由基类 init_device 负责;双工通道时序注释见
         # LwdWorkerBase._init_lwd_duplex_channels。
         super().init_device()
-        # 多模态缓存:req_id -> mm_features(带 data,首 chunk 随
-        # scheduled_new_reqs 到达时登记,chunk 越过全部 mm 段或
-        # finished_req_ids 时摘除;位置信息按请求);
-        # 视觉塔输出按 mm_hash(内容哈希)键共享缓存,与集中式
-        # encoder cache 同粒度——同图复用不重编;容量淘汰(FIFO),
-        # 不随请求生命周期释放(首版引用计数方案在错峰首 chunk 下
-        # 会在后继请求到达前误删共享条目,实测同图 30 并发仍全价编码)。
-        self._lwd_mm_features_dict: dict[str, list["MultiModalFeatureSpec"]] = {}
-        self._lwd_mm_hash_embeds: dict[str, object] = {}
-
+        # 换装边侧 runner(与云侧同款模式):embed/unembed 计算住 runner。
+        self.model_runner = LwdEdgeModelRunner(
+            self.vllm_config, self.device, worker=self,
+        )
         self._init_lwd_duplex_channels()
         logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
@@ -110,28 +45,26 @@ class LwdEdgeWorker(LwdWorkerBase):
         )
 
     def compile_or_warm_up_model(self) -> "CompilationTimes":
-        # LWD 边侧运行期 forward 被 LWD 流程劫持(execute_model 只走
-        # embed/unembed 直调),模型级 warmup 与 cudagraph 捕获均用不到;
-        # 且 0 层拓扑下 full-forward 会在 final norm 解包失败。整体跳过。
+        # LWD 边侧运行期 forward 被 LWD 流程劫持(execute_model 只分派给
+        # runner 的 embed/unembed 直调),模型级 warmup 与 cudagraph 捕获
+        # 均用不到;且 0 层拓扑下 full-forward 会在 final norm 解包失败。
+        # 整体跳过。
         from vllm.v1.worker.worker_base import CompilationTimes
 
         logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")
         return CompilationTimes(language_model=0.0, encoder=0.0)
-
-    def get_kv_cache_spec(self) -> dict[str, "KVCacheSpec"]:
-        """The LWD edge runs no attention/transformer, so it needs no KV cache."""
-        return {}
 
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> "ModelRunnerOutput | None":
         lwd_batch = scheduler_output.lwd_batch
         # 多模态缓存生命周期:请求完结(含 abort)即摘除其 mm 特征/
-        # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部
-        # mm 窗口后已提前摘除,此为兜底)。
+        # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部 mm
+        # 窗口后已提前摘除,此为兜底)。
         if scheduler_output.finished_req_ids:
-            for req_id in scheduler_output.finished_req_ids:
-                self._lwd_mm_release_request(req_id)
+            self.model_runner.mm_cache.release_finished(
+                scheduler_output.finished_req_ids
+            )
         if lwd_batch is None:
             logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
@@ -146,7 +79,7 @@ class LwdEdgeWorker(LwdWorkerBase):
                 sum(len(token_ids) for token_ids in batch_meta.token_ids),
                 batch_meta.has_mrope,
             )
-            return self._execute_lwd_embed(
+            return self.model_runner.execute_lwd_embed(
                 lwd_batch.seqno, batch_meta, scheduler_output
             )
         if lwd_batch.batch_type == LwdBatchType.LWD_UNEMBED:
@@ -158,7 +91,9 @@ class LwdEdgeWorker(LwdWorkerBase):
                 sum(batch_meta.num_accept_tokens),
                 batch_meta.recv_num_elements,
             )
-            result = self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
+            result = self.model_runner.execute_lwd_unembed(
+                lwd_batch.seqno, batch_meta
+            )
             # [Lwd][eos-trace] C 点:声明 accepted>0 却无 token 回填的行
             # 留痕(与边侧 B 点按 down_seqno 配对;accepted=0 的行不产
             # token 属合法,不计缺)
@@ -176,350 +111,3 @@ class LwdEdgeWorker(LwdWorkerBase):
             lwd_batch.batch_type,
         )
         return None
-
-    def _lwd_embed_ids_h2d(self, flat_token_ids: list[int]) -> torch.Tensor:
-        """token ids 异步上卡:pinned 环(4 槽,与派发队列深度同阶)+
-        non_blocking,替代 torch.tensor(list, device=...) 的 pageable
-        同步拷贝——后者在主流上等设备排空(含上一块 chunk 的 UP send
-        配对等待),把跨侧锁步传导进边 worker 主线程。同流序保证 embed
-        kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。"""
-        # 对当关系:LwdPinnedStaging.stage_to_device ≍ 原手写 pinned+device 4 槽对
-        # 轮换(容量下限 8192 同旧值)。
-        ring = getattr(self, "_lwd_ids_ring", None)
-        if ring is None:
-            ring = LwdPinnedStaging(
-                dtype=torch.int64, min_capacity=8192,
-                device=self.model_runner.device,
-            )
-            self._lwd_ids_ring = ring
-        return ring.stage_to_device(flat_token_ids, len(flat_token_ids))
-
-    @torch.inference_mode()
-    def _execute_lwd_embed(
-        self,
-        seqno: int,
-        batch_meta: LwdEmbedBatch,
-        scheduler_output: "SchedulerOutput",
-    ) -> None:
-        model = self.model_runner.get_model()
-        if not batch_meta.token_ids:
-            return
-
-        # 登记新到请求的 mm 特征(首 chunk 随 scheduled_new_reqs 携带
-        # data;后续 chunk 走缓存)。注意登记不过滤 data:None 的项留到
-        # encoder 执行点 fail-fast(见 _lwd_mm_encoder_outputs)——静默
-        # 跳过会让图像 embeds 缺失、占位 token 按文本嵌入,即错算。
-        for req_data in scheduler_output.scheduled_new_reqs:
-            feats = [
-                f
-                for f in req_data.mm_features
-                if f.modality != "prompt_embeds"
-            ]
-            if feats:
-                self._lwd_mm_features_dict[req_data.req_id] = feats
-
-        # Flatten all requests' prompt tokens into one batch (order = req_ids).
-        flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
-        logger.debug(
-            "[Lwd][edge-worker] embed token_ids=%s", flat_token_ids
-        )
-        token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
-        _t0 = time.monotonic()
-        # 多模态 merge:批内任一请求带 mm 数据即按本 chunk 窗口收集
-        # 视觉塔 embeds + 构造 is_multimodal 掩码,走模型原生
-        # embed_input_ids 的 merge 分支;纯文本批走原直达路径。
-        mm_embeds, is_mm = self._lwd_gather_chunk_mm(batch_meta)
-        if mm_embeds:
-            embeds = model.embed_input_ids(
-                token_ids_tensor,
-                multimodal_embeddings=mm_embeds,
-                is_multimodal=is_mm,
-            )
-        else:
-            embeds = model.embed_input_ids(token_ids_tensor)  # (total_N, H)
-        _t_fwd = time.monotonic()
-        payload = embeds
-        if self.tid2eid_tables:
-            # The original prompt IDs stay on the edge; transmit only lookups.
-            cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
-            expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
-            payload = pack_hash_payload(embeds, expert_ids)
-            logger.info(
-                "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
-                seqno, tuple(expert_ids.shape), payload.numel(),
-            )
-
-        # mrope positions 已随 RangeNotify 走控制面(wire_version>=2),
-        # 数据面只发 embeds 主帧;aux 帧机制保留在通道层供 deepstack
-        # 等扩展,mrope 不再使用。
-        request = LwdCommRequest(
-            channel=LwdChannelType.UP,
-            op="send",
-            num_elements=payload.numel(),
-            tensor=payload,
-            seqno=seqno,
-        )
-        self.comm_service.submit_send(request)
-        # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
-        # 广播提交(含 bridge 的 handle.wait)——若 UP 世界广播在等云侧
-        # 入队,此段会显著变大(chunk 级锁步的直接证据)
-        logger.info(
-            "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f "
-            "total=%.2fms tokens=%d",
-            seqno, (_t_fwd - _t0) * 1000,
-            (time.monotonic() - _t_fwd) * 1000,
-            (time.monotonic() - _t0) * 1000,
-            len(flat_token_ids),
-        )
-
-    # ------------------------------------------------------------------ #
-    # Multimodal (image) merge helpers                                     #
-    # ------------------------------------------------------------------ #
-
-    def _lwd_mm_encode_missing(self, req_ids: "list[str]") -> None:
-        """批级编码:聚合本批全部请求的缓存未命中特征,按 modality 一次
-        组批过视觉塔,结果回填 mm_hash 缓存。
-
-        跨请求组批与集中式 _execute_mm_encoder 同构(整批一次前向而
-        非逐请求 N 次):ViT eager 下单次调用的固定开销(逐算子
-        dispatch/H2D/同步)占比高,逐请求串行会把它支付 N 倍,且这些
-        串行调用压在 worker 的 embed 执行里、堵住后续 unembed 交付。
-        缓存键(identifier)与容量淘汰语义不变;回填顺序 = 收集顺序
-        (req_ids 序 × 请求内特征序),组批输出按同序消费——错序即
-        张冠李戴错算,总数断言兜底。"""
-        missing_features = []
-        missing_data = []
-        for req_id in req_ids:
-            for f in self._lwd_mm_features_dict.get(req_id) or []:
-                if f.identifier not in self._lwd_mm_hash_embeds:
-                    if f.data is None:
-                        # data 缺失即无法计算图像 embeds——静默跳过 =
-                        # 图像 token 按文本嵌入错算,fail-fast。
-                        missing_data.append((req_id, f.identifier))
-                    else:
-                        missing_features.append(f)
-        if missing_data:
-            raise RuntimeError(
-                f"[Lwd] mm feature data missing: {missing_data}; "
-                "cannot compute image embeddings; "
-                "check mm processor/receiver cache chain"
-            )
-        if not missing_features:
-            return
-        _t_enc = time.monotonic()
-        model = self.model_runner.get_model()
-        from vllm.multimodal.utils import group_and_batch_mm_kwargs
-
-        mm_kwargs = [(f.modality, f.data) for f in missing_features]
-        outputs_by_modality: dict[str, list[torch.Tensor]] = {}
-        num_outputs = 0
-        for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.model_runner.device,
-            pin_memory=getattr(self.model_runner, "pin_memory", False),
-        ):
-            batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
-            assert len(batch_outputs) == num_items, (
-                f"encoder outputs {len(batch_outputs)} != items "
-                f"{num_items} (modality={modality})"
-            )
-            outputs_by_modality.setdefault(modality, []).extend(batch_outputs)
-            num_outputs += len(batch_outputs)
-        assert num_outputs == len(missing_features), (
-            f"encoder outputs {num_outputs} != missing features "
-            f"{len(missing_features)}"
-        )
-        for feature in missing_features:
-            self._lwd_mm_hash_embeds[feature.identifier] = (
-                outputs_by_modality[feature.modality].pop(0)
-            )
-        # 容量淘汰(FIFO):超容量摘最旧条目,被淘汰顶多重编一次
-        while len(self._lwd_mm_hash_embeds) > _LWD_MM_HASH_CACHE_MAX_ITEMS:
-            self._lwd_mm_hash_embeds.pop(
-                next(iter(self._lwd_mm_hash_embeds))
-            )
-        # [Lwd][perf] 视觉塔耗时(批级,仅缓存未命中计次;同图复用不重编)
-        logger.info(
-            "[Lwd][perf] mm-encoder reqs=%d items=%d dur=%.2fms",
-            len(req_ids), len(missing_features),
-            (time.monotonic() - _t_enc) * 1000,
-        )
-
-    def _lwd_mm_encoder_outputs(
-        self, req_id: str
-    ) -> "list[tuple[PlaceholderRange, torch.Tensor]]":
-        """视觉塔输出的只读视图:[(mm_position, embeds)]。
-
-        编码已前移到批级(_lwd_mm_encode_missing,整批一次组批);本处
-        只读缓存,未命中即批级编码漏编,fail-fast。编码结果按内容哈希
-        (mm_hash/identifier)跨请求共享——与集中式 encoder cache 同
-        粒度,同图复用不重编;位置信息(mm_position)仍按请求取,只有
-        编码结果共享;容量淘汰(FIFO),不随请求生命周期释放。
-        _lwd_mm_release_request 在 chunk 越过全部 mm 段或
-        finished_req_ids 兜底时摘除请求的位置特征(不动编码缓存)。"""
-        features = self._lwd_mm_features_dict.get(req_id)
-        if not features:
-            return []
-        missing = [
-            f.identifier for f in features
-            if f.identifier not in self._lwd_mm_hash_embeds
-        ]
-        if missing:
-            raise RuntimeError(
-                f"[Lwd] mm embeds missing from batch encode: req={req_id} "
-                f"(mm_hashes={missing})"
-            )
-        return [
-            (f.mm_position, self._lwd_mm_hash_embeds[f.identifier])
-            for f in features
-        ]
-
-    def _lwd_mm_release_request(self, req_id: str) -> None:
-        """按请求释放 mm 位置特征;hash 编码结果不随请求释放
-        (容量淘汰,见 _lwd_mm_encoder_outputs)。"""
-        self._lwd_mm_features_dict.pop(req_id, None)
-
-    def _lwd_gather_chunk_mm(
-        self, batch_meta: LwdEmbedBatch
-    ) -> "tuple[list[torch.Tensor], torch.Tensor]":
-        """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
-
-        编码在切片之前批级完成(整批一次组批,见 _lwd_mm_encode_missing),
-        之后逐请求只读缓存切片。窗口语义逐字对齐原生
-        _gather_mm_embeddings:feature 的占位区间 [offset, offset+length)
-        与 chunk 窗口 [p_offset, p_offset+n) 求交,相交段切 embeds 行、
-        置掩码位;图像跨 chunk 时逐段收集。同时完成越过全部 mm 窗口
-        请求的特征摘除。"""
-        total = sum(len(t) for t in batch_meta.token_ids)
-        is_mm = torch.zeros(total, dtype=torch.bool)
-        mm_embeds: list[torch.Tensor] = []
-        if len(batch_meta.prompt_offsets) != len(batch_meta.req_ids):
-            return mm_embeds, is_mm
-        self._lwd_mm_encode_missing(batch_meta.req_ids)
-        req_start = 0
-        for req_id, token_ids, p_offset in zip(
-            batch_meta.req_ids, batch_meta.token_ids, batch_meta.prompt_offsets
-        ):
-            n = len(token_ids)
-            cached = self._lwd_mm_encoder_outputs(req_id)
-            max_end = 0
-            for pos_info, item_embeds in cached:
-                start_pos = pos_info.offset
-                num_encoder_tokens = pos_info.length
-                max_end = max(max_end, start_pos + num_encoder_tokens)
-                start_idx = max(p_offset - start_pos, 0)
-                end_idx = min(
-                    p_offset - start_pos + n, num_encoder_tokens
-                )
-                if start_idx >= end_idx:
-                    continue
-                req_start_pos = req_start + start_pos - p_offset
-                if (is_embed := pos_info.is_embed) is not None:
-                    s, e = pos_info.get_embeds_indices_in_range(
-                        start_idx, end_idx
-                    )
-                    if s == e:
-                        continue
-                    rows = item_embeds[s:e]
-                    is_mm[req_start_pos + start_idx : req_start_pos + end_idx] |= (
-                        is_embed[start_idx:end_idx]
-                    )
-                else:
-                    rows = item_embeds[start_idx:end_idx]
-                    is_mm[req_start_pos + start_idx : req_start_pos + end_idx] = True
-                mm_embeds.append(rows)
-            if cached and p_offset + n >= max_end:
-                self._lwd_mm_release_request(req_id)
-            req_start += n
-        return mm_embeds, is_mm
-
-    @torch.inference_mode()
-    def _execute_lwd_unembed(
-        self, seqno: int, batch_meta: LwdUnembedBatch
-    ) -> ModelRunnerOutput:
-        model = self.model_runner.get_model()
-        if not batch_meta.req_ids:
-            return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
-
-        _t0 = time.monotonic()
-        recv_future = self.comm_service.submit_recv(
-            LwdCommRequest(
-                channel=LwdChannelType.DOWN,
-                op="recv",
-                num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
-                seqno=seqno,
-            )
-        )
-        _t_post = time.monotonic()
-        # wait_for_comm:device 序等待,主机不阻塞
-        recv_future.wait_for_comm()
-        result = recv_future.result()
-        _t_tensor = time.monotonic()
-        hidden_size = self.model_config.get_hidden_size()
-        hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
-        # 诊断旁路(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1):DOWN 张量照收
-        # (传输成本保留在测量内),但跳过 lm_head + rank-replay,直接交付
-        # 云侧 c2e 通告捎带的 token ids——性能恢复即瓶颈在边侧 unembed。
-        if envs.VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE and batch_meta.token_ids:
-            assert len(batch_meta.token_ids) == len(batch_meta.req_ids)
-            sampled_token_ids: list[list[int]] = [
-                list(t) for t in batch_meta.token_ids
-            ]
-            _t_lm = time.monotonic()
-        else:
-            # lm_head 不允许直接调用(ParallelLMHead.forward 强制经 sampler);
-            # compute_logits 是标准接口,包装层/单体模型都有。
-            logits = model.compute_logits(hidden_states)   # (rows_total, V)
-            _t_lm = time.monotonic()
-            # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
-            # top20 逐位对照——排名换位即重放漂移的直接视图。
-            try:
-                from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
-                    lwd_layer_trace_enabled,
-                )
-
-                if lwd_layer_trace_enabled() and logits.dim() == 2:
-                    row = logits[0].detach().float()
-                    vals, tids = torch.topk(row, min(20, row.numel()))
-                    logger.info(
-                        "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f "
-                        "top20=%s",
-                        tuple(logits.shape), row.norm().item(),
-                        list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-
-            flat_ids = select_token_batch(
-                logits, [r for ths in batch_meta.top_id_ths for r in ths]
-            )
-            sampled_token_ids = []
-            off = 0
-            for accept, ths in zip(
-                batch_meta.num_accept_tokens, batch_meta.top_id_ths
-            ):
-                sampled_token_ids.append(flat_ids[off : off + accept])
-                off += len(ths)
-        _t_sel = time.monotonic()
-        # [Lwd][perf] 临时探针:单请求慢的归因分段——
-        # post_recv=挂 irecv;wait_tensor=等张量落卡(网络);lm_head=词表
-        # 前向(权重带宽);select=argsort 取名(.item 同步);total=边尾段全长
-        logger.info(
-            "[Lwd][perf] unembed seqno=%s post_recv=%.2f wait_tensor=%.2f "
-            "lm_head=%.2f select=%.2f total=%.2fms reqs=%d",
-            seqno,
-            (_t_post - _t0) * 1000,
-            (_t_tensor - _t_post) * 1000,
-            (_t_lm - _t_tensor) * 1000,
-            (_t_sel - _t_lm) * 1000,
-            (_t_sel - _t0) * 1000,
-            len(batch_meta.req_ids),
-        )
-        req_id_to_index = {
-            req_id: index for index, req_id in enumerate(batch_meta.req_ids)
-        }
-        return ModelRunnerOutput(
-            req_ids=batch_meta.req_ids,
-            req_id_to_index=req_id_to_index,
-            sampled_token_ids=sampled_token_ids,
-        )

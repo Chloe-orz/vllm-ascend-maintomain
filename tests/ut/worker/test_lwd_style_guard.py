@@ -26,6 +26,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 LWD_WORKER_FILES = [
     "vllm_ascend/worker/lwd_edge_model/lwd_edge_worker.py",
+    "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py",
+    "vllm_ascend/worker/lwd_edge_model/lwd_edge_mm_cache.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_worker.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_mtp_proposer.py",
