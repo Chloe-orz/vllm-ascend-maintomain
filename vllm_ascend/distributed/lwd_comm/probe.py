@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from hashlib import sha256
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.lwd_worker import LwdWorker
 
     from .future import LwdCommFuture
+    from .probe_early_recv import LwdProbeEarlyRecv
 
 
 _SEQUENCE_BYTES = 8
@@ -38,14 +40,30 @@ class LwdProbePlan:
     hidden_size: int = 5120
     window: int = 4
     channel: str = "up"
+    label: str = ""
+    early_recv: bool = False
 
     def __post_init__(self) -> None:
         if not 0 < self.batches <= 256**_SEQUENCE_BYTES or self.window < 1:
             raise ValueError("batches must fit the sequence header; window must be positive")
         if not self.tokens or min(self.tokens) < 1 or self.hidden_size < _SEQUENCE_BYTES:
             raise ValueError("positive token counts and hidden_size >= 8 are required")
-        if self.channel not in ("up", "down"):
-            raise ValueError("channel must be up or down")
+        if self.channel not in ("up", "down", "mixed"):
+            raise ValueError("channel must be up, down or mixed")
+        if self.channel == "mixed" and self.window < 2:
+            raise ValueError("mixed traffic must post both directions before waiting")
+        if self.early_recv and self.channel != "up":
+            raise ValueError("early receive is an UP path")
+
+    @property
+    def channels(self) -> tuple[LwdChannelType, ...]:
+        if self.channel == "mixed":
+            return (LwdChannelType.UP, LwdChannelType.DOWN)
+        return (LwdChannelType.UP if self.channel == "up" else LwdChannelType.DOWN,)
+
+    @property
+    def name(self) -> str:
+        return self.label or self.channel
 
     def num_elements(self, seqno: int) -> int:
         return self.tokens[seqno % len(self.tokens)] * self.hidden_size
@@ -90,65 +108,123 @@ def check_local_result(error: str | None) -> None:
         raise ValueError(f"[LWD][wire-test] local TP verification failed: {errors}")
 
 
-def run_batches(worker: LwdWorker, plan: LwdProbePlan, start_seqno: int = 0) -> None:
-    wire = worker.lwd_wire
-    channel = LwdChannelType.UP if plan.channel == "up" else LwdChannelType.DOWN
-    sending = wire.is_edge == (channel is LwdChannelType.UP)
-    pending: deque[tuple[int, int, LwdCommFuture | None]] = deque()
+@dataclass
+class LwdProbeTransfer:
+    channel: LwdChannelType
+    seqno: int
+    numel: int
+    sending: bool
+    future: LwdCommFuture | None = None
 
-    def complete(item: tuple[int, int, LwdCommFuture | None]) -> None:
-        seqno, numel, future = item
-        if sending:
-            worker.wait_lwd_send(future)
-        else:
-            tensor = worker.receive_lwd_tensor(future, numel)
-            error = None
-            try:
-                expected = make_payload(seqno, numel).to(dtype=wire.dtype)
-                if not torch.equal(tensor.cpu(), expected):
-                    error = f"payload mismatch seqno={seqno}"
-            except Exception as exc:
-                error = str(exc)
-            check_local_result(error)
-        error = None
-        if wire.member:
-            logger.info(
-                "[LWD][wire-test] %s seqno=%d num_elements=%d %s",
-                "send" if sending else "recv",
-                seqno,
-                numel,
-                "complete" if sending else "verified",
+
+def post_transfer(worker: LwdWorker, item: LwdProbeTransfer, early: LwdProbeEarlyRecv | None) -> None:
+    wire, error = worker.lwd_wire, None
+    try:
+        if item.sending:
+            tensor = (
+                make_payload(item.seqno, item.numel).to(device=wire.device, dtype=wire.dtype) if wire.member else None
             )
-            try:
-                worker.comm_service.poll_completions()
-            except Exception as exc:
-                error = str(exc)
-        worker.lwd_sync_error(error)
+            item.future = worker.send_lwd_tensor(tensor, item.channel, item.seqno)
+        elif early is not None:
+            item.future = early.post(item.seqno, item.numel)
+        else:
+            item.future = worker.submit_lwd_recv(item.numel, item.channel, item.seqno)
+    except Exception as exc:
+        error = str(exc)
+    worker.lwd_sync_error(error)
 
-    for offset in range(plan.batches):
-        seqno, numel = start_seqno + offset, plan.num_elements(offset)
-        future, error = None, None
+
+def complete_transfer(worker: LwdWorker, item: LwdProbeTransfer, early: LwdProbeEarlyRecv | None) -> None:
+    wire = worker.lwd_wire
+    if item.sending:
+        worker.wait_lwd_send(item.future)
+    else:
+        tensor = worker.receive_lwd_tensor(item.future, item.numel)
+        error = None
         try:
-            if sending:
-                tensor = make_payload(seqno, numel).to(device=wire.device, dtype=wire.dtype) if wire.member else None
-                future = worker.send_lwd_tensor(tensor, channel, seqno)
-            else:
-                future = worker.submit_lwd_recv(numel, channel, seqno)
+            expected = make_payload(item.seqno, item.numel).to(dtype=wire.dtype)
+            if not torch.equal(tensor.cpu(), expected):
+                error = f"payload mismatch seqno={item.seqno}"
         except Exception as exc:
             error = str(exc)
-        worker.lwd_sync_error(error)
-        pending.append((seqno, numel, future))
-        if len(pending) >= plan.window:
-            complete(pending.popleft())
+        check_local_result(error)
+    error = None
+    if wire.member:
+        try:
+            if early is not None:
+                early.verify_report(item.seqno)
+            worker.comm_service.poll_completions()
+            logger.info(
+                "[LWD][wire-test] %s channel=%s seqno=%d num_elements=%d %s",
+                "send" if item.sending else "recv",
+                item.channel.value,
+                item.seqno,
+                item.numel,
+                "complete" if item.sending else "verified",
+            )
+        except Exception as exc:
+            error = str(exc)
+    worker.lwd_sync_error(error)
+
+
+def run_batches(
+    worker: LwdWorker,
+    plan: LwdProbePlan,
+    start_seqnos: dict[LwdChannelType, int] | None = None,
+    early: LwdProbeEarlyRecv | None = None,
+) -> None:
+    starts = start_seqnos or {channel: 0 for channel in plan.channels}
+    pending: deque[LwdProbeTransfer] = deque()
+    for offset in range(plan.batches):
+        # Post UP then DOWN without waiting for the preceding direction to finish.
+        for channel in plan.channels:
+            item = LwdProbeTransfer(
+                channel,
+                starts[channel] + offset,
+                plan.num_elements(offset),
+                worker.lwd_wire.is_edge == (channel is LwdChannelType.UP),
+            )
+            post_transfer(worker, item, early)
+            pending.append(item)
+            if len(pending) >= plan.window:
+                complete_transfer(worker, pending.popleft(), early)
     while pending:
-        complete(pending.popleft())
+        complete_transfer(worker, pending.popleft(), early)
+
+
+def run_probe_transfers(worker: LwdWorker, plan: LwdProbePlan, starts: dict[LwdChannelType, int]) -> None:
+    from .probe_early_recv import LwdProbeEarlyRecv
+
+    wire = worker.lwd_wire
+    error = None
+    try:
+        with ExitStack() as stack:
+            early, setup_error = None, None
+            if plan.early_recv and wire.member and not wire.is_edge:
+                try:
+                    early = stack.enter_context(LwdProbeEarlyRecv(worker))
+                except Exception as exc:
+                    setup_error = str(exc)
+            worker.lwd_sync_error(setup_error)
+            run_batches(worker, plan, starts, early)
+        if early is not None:
+            logger.info(
+                "[LWD][wire-test] early receive verified: hints=%d reports=%d retained=0",
+                early.preposted,
+                early.verified_reports,
+            )
+    except Exception as exc:
+        error = str(exc)
+    check_local_result(error)
 
 
 def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
     config, wire = worker.vllm_config.lwd_config, worker.lwd_wire
-    channel = LwdChannelType.UP if plan.channel == "up" else LwdChannelType.DOWN
-    round_id, start_seqno = worker._lwd_probe_round, worker._lwd_probe_next[channel]
-    if start_seqno + plan.batches > 256**_SEQUENCE_BYTES:
+    round_id = worker._lwd_probe_round
+    starts = {channel: worker._lwd_probe_next[channel] for channel in plan.channels}
+    if plan.early_recv and (not worker._early_recv_enabled or plan.hidden_size != worker._lwd_up_hidden_size):
+        raise ValueError("[LWD][wire-test] early receive requires enabled YAML flag and model hidden size")
+    if any(start + plan.batches > 256**_SEQUENCE_BYTES for start in starts.values()):
         raise ValueError("[LWD][wire-test] sequence exceeds payload header capacity")
     topology = asdict(config.topology)
     topology.pop("digest")
@@ -163,7 +239,7 @@ def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
         "connection": asdict(wire.key),
         "dtype": str(wire.dtype),
         "plan": asdict(plan),
-        "start_seqno": start_seqno,
+        "start_seqnos": {channel.value: start for channel, start in starts.items()},
     }
     store, error = None, None
     if wire.member:
@@ -173,12 +249,15 @@ def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
             store = dist.PrefixStore(f"lwd_probe_round/{round_id}", wire._store)
             exchange_check(store, config.role, "plan", json.dumps(agreement, sort_keys=True), wire.timeout_s)
             logger.info(
-                "[LWD][wire-test] peer code/config/plan matched; starting round=%d channel=%s", round_id, plan.channel
+                "[LWD][wire-test] peer code/config/plan matched; case=%s round=%d channel=%s",
+                plan.name,
+                round_id,
+                plan.channel,
             )
         except Exception as exc:
             error = str(exc)
     worker.lwd_sync_error(error)
-    run_batches(worker, plan, start_seqno)
+    run_probe_transfers(worker, plan, starts)
     error = None
     if wire.member:
         try:
@@ -186,7 +265,8 @@ def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
         except Exception as exc:
             error = str(exc)
     worker.lwd_sync_error(error)
-    worker._lwd_probe_next[channel] += plan.batches
+    for channel in plan.channels:
+        worker._lwd_probe_next[channel] += plan.batches
     worker._lwd_probe_round += 1
     result = {
         "status": "PASS",
@@ -194,15 +274,20 @@ def run_probe(worker: LwdWorker, plan: LwdProbePlan) -> dict[str, str | int]:
         "channel": plan.channel,
         "batches": plan.batches,
         "round": round_id,
-        "start_seqno": start_seqno,
+        "start_seqno": starts[plan.channels[0]],
+        "case": plan.name,
+        "transfers": plan.batches * len(plan.channels),
         "tp_rank": get_tp_group().rank_in_group,
     }
     logger.info(
-        "[LWD][wire-test] PASS role=%s channel=%s batches=%d round=%d tp_rank=%d; transport remains open",
+        "[LWD][wire-test] PASS role=%s channel=%s batches=%d round=%d tp_rank=%d "
+        "case=%s transfers=%d; transport remains open",
         config.role,
         plan.channel,
         plan.batches,
         round_id,
         result["tp_rank"],
+        plan.name,
+        result["transfers"],
     )
     return result

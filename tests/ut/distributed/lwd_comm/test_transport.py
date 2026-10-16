@@ -127,6 +127,43 @@ def worker_transport(transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
     return SimpleNamespace(**vars(t), worker=worker, module=module, probe=probe, early=early, base=base)
 
 
+@pytest.fixture
+def probe_queues(worker_transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    t = worker_transport
+    probe_early = importlib.import_module(t.types.__package__ + ".probe_early_recv")
+
+    class LocalQueue:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.items = queue.Queue(maxsize=64)
+
+        def export_handle(self) -> "LocalQueue":
+            return self
+
+        @staticmethod
+        def create_from_handle(handle: "LocalQueue", rank: int) -> "LocalQueue":
+            return handle
+
+        def wait_until_ready(self) -> None:
+            pass
+
+        def enqueue(self, item: object, timeout: float | None = None) -> None:
+            self.items.put(item, timeout=timeout)
+
+        def dequeue(self, timeout: float | None = None) -> object:
+            try:
+                return self.items.get(timeout=timeout)
+            except queue.Empty as exc:
+                raise TimeoutError from exc
+
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(sys.modules["vllm.distributed.device_communicators.shm_broadcast"], "MessageQueue", LocalQueue)
+    monkeypatch.setattr(t.early, "MessageQueue", LocalQueue)
+    monkeypatch.setattr(probe_early, "MessageQueue", LocalQueue)
+    return SimpleNamespace(**vars(t), probe_early=probe_early, queue_class=LocalQueue)
+
+
 def send(t: SimpleNamespace, seqno: int, value: float = 1) -> Any:
     return t.types.LwdCommRequest(
         t.types.LwdChannelType.UP,
@@ -454,10 +491,10 @@ def test_early_receive_bounds_prefetch_and_does_not_report_failed_receives(worke
     assert worker._irecv_done_mq.enqueue.call_count == 3
 
 
-def test_two_workers_reuse_transport_for_repeated_up_and_down_probes(
-    worker_transport: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+def test_two_workers_run_repeated_mixed_large_and_early_receive_cases(
+    probe_queues: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    t = worker_transport
+    t = probe_queues
     topology = SimpleNamespace(digest="x")
     t.worker.vllm_config = SimpleNamespace(lwd_config=SimpleNamespace(role="edge", topology=topology))
     cloud = copy(t.worker)
@@ -466,6 +503,7 @@ def test_two_workers_reuse_transport_for_repeated_up_and_down_probes(
     cloud.lwd_wire.is_edge, cloud.lwd_wire.domain_rank = False, 1
     cloud.comm_service = t.service.LwdCommService(cloud.lwd_wire)
     cloud._lwd_probe_next = dict(t.worker._lwd_probe_next)
+    cloud._init_lwd_early_recv_state()
     real_asdict = t.probe.asdict
     monkeypatch.setattr(
         t.probe,
@@ -500,15 +538,28 @@ def test_two_workers_reuse_transport_for_repeated_up_and_down_probes(
         wire.p2p_send = lambda channel, tensor, peer: pipes[channel].put(tensor.clone())
         wire.p2p_recv = lambda channel, tensor, peer: tensor.copy_(pipes[channel].get(timeout=2))
     monkeypatch.setattr(t.probe.dist, "PrefixStore", Store)
+    plans = [
+        {"channel": "up"},
+        {"channel": "up"},
+        {"channel": "down"},
+        {"channel": "mixed"},
+        {"channel": "up", "tokens": [128, 512]},
+        {"channel": "down", "tokens": [128, 512]},
+        {"channel": "up", "early_recv": True},
+    ]
+    starts = (0, 3, 0, 6, 9, 6, 12)
     with ThreadPoolExecutor(2) as executor:
-        for round_id, (channel, start) in enumerate((("up", 0), ("up", 3), ("down", 0))):
-            plan = json.dumps({"batches": 3, "hidden_size": 8, "channel": channel})
+        for round_id, extra in enumerate(plans):
+            start = starts[round_id]
+            plan = json.dumps({"batches": 3, "hidden_size": 8, "window": 3, **extra})
             calls = [executor.submit(worker.lwd_run_probe, plan) for worker in (t.worker, cloud)]
             results = [call.result(timeout=5) for call in calls]
             assert {result["role"] for result in results} == {"edge", "cloud"}
             assert all(result["round"] == round_id and result["start_seqno"] == start for result in results)
             assert all(result["status"] == "PASS" for result in results)
-    assert sorted(prefixes) == [f"lwd_probe_round/{i}" for i in (0, 0, 1, 1, 2, 2)]
+    assert sorted(prefixes) == [f"lwd_probe_round/{i}" for i in range(len(plans)) for _ in range(2)]
+    assert not cloud._early_recv_futures and not cloud._early_recv_pending
+    assert cloud._lwd_early_recv_thread is not None and not cloud._lwd_early_recv_thread.is_alive()
     assert all(pipe.empty() for pipe in pipes.values())
     assert not t.worker.comm_service._closed and not cloud.comm_service._closed
     t.worker.shutdown()
@@ -582,3 +633,58 @@ def test_worker_rejects_unsupported_layout_before_device_initialization(
     with pytest.raises(ValueError):
         t.worker.init_device()
     t.base.NPUWorker.init_device.assert_not_called()
+
+
+@pytest.mark.parametrize("report", [("wrong", 0), "failure", "missing"])
+def test_early_probe_rejects_invalid_failed_or_missing_completion(
+    probe_queues: SimpleNamespace, report: object
+) -> None:
+    t = probe_queues
+    probe = t.probe_early.LwdProbeEarlyRecv(t.worker)
+    probe.reports = t.queue_class()
+    if report == "failure":
+        report = t.probe_early.LwdRecvFailure("device failed")
+    if report != "missing":
+        probe.reports.enqueue(report)
+    with pytest.raises((ValueError, RuntimeError, TimeoutError)):
+        probe.verify_report(0)
+    assert probe.verified_reports == 0
+
+
+def test_early_probe_never_falls_back_when_hint_thread_did_not_post(probe_queues: SimpleNamespace) -> None:
+    t = probe_queues
+    probe = t.probe_early.LwdProbeEarlyRecv(t.worker)
+    probe.hints = t.queue_class()
+    t.worker.get_or_post_early_recv = Mock()
+    with pytest.raises(TimeoutError, match="hint not posted"):
+        probe.post(0, 8)
+    t.worker.get_or_post_early_recv.assert_not_called()
+
+
+def test_interleaved_probe_posts_both_directions_before_waiting(worker_transport: SimpleNamespace) -> None:
+    t = worker_transport
+    t.wire.p2p_recv = lambda channel, tensor, peer: tensor.copy_(t.probe.make_payload(0, tensor.numel()))
+    original_wait = t.worker.wait_lwd_send
+
+    def wait(future: object) -> None:
+        assert set(t.worker.comm_service._channels) == {
+            (t.types.LwdChannelType.UP, "send"),
+            (t.types.LwdChannelType.DOWN, "recv"),
+        }
+        original_wait(future)
+
+    t.worker.wait_lwd_send = wait
+    t.probe.run_batches(t.worker, t.probe.LwdProbePlan(channel="mixed", batches=1, hidden_size=8, window=2))
+    assert t.worker.comm_service.poll_completions() == 0
+
+
+@pytest.mark.parametrize("fault", ["missing_report", "retained_future"])
+def test_early_probe_requires_all_reports_and_released_state(probe_queues: SimpleNamespace, fault: str) -> None:
+    t = probe_queues
+    probe = t.probe_early.LwdProbeEarlyRecv(t.worker)
+    if fault == "missing_report":
+        probe.preposted = 1
+    else:
+        t.worker._early_recv_futures[0] = object()
+    with pytest.raises(RuntimeError):
+        probe.__exit__(None, None, None)
