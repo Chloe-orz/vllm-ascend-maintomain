@@ -376,6 +376,8 @@ class DeepseekV4MoE(nn.Module):
             n_shared_experts=config.n_shared_experts if self.is_fusion_moe_shared_experts_enabled else 0,
             hash_indices_table=self.gate.tid2eid,
         )
+        # 将哈希层号固定在本层运行器上，供编译后的算子在运行时读取。
+        self.experts.runner.lwd_hash_layer_idx = self.layer_idx if self.hash else None
 
     def forward(
         self,

@@ -1318,7 +1318,27 @@ def _setup_worker_and_scheduler(
     # Select worker class and refresh block size
     parallel_config = vllm_config.parallel_config
     if parallel_config and parallel_config.worker_cls == "auto":
-        hardware_profile = get_current_hardware_profile()
+        # LWD prefill_only 边云 worker 选择(优先于硬件默认)。enabled/
+        # is_edge 经 getattr 防御读取:main 的 config/lwd 新代(path/
+        # role/instance)与 v0.23.0 血统字典代并存,激活桥落定前两代
+        # 均安全落到硬件默认路径。
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None and getattr(lwd_config, "enabled", False):
+            is_edge = getattr(lwd_config, "is_edge", None)
+            if is_edge is None:
+                is_edge = getattr(lwd_config, "role", "") == "edge"
+            if is_edge:
+                parallel_config.worker_cls = (
+                    "vllm_ascend.worker.lwd_edge_model.lwd_edge_worker."
+                    "LwdEdgeWorker"
+                )
+            else:
+                parallel_config.worker_cls = (
+                    "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker."
+                    "LwdCloudWorker"
+                )
+        else:
+            hardware_profile = get_current_hardware_profile()
         if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
             HardwareCapability.STANDARD_WORKER_PATCHES
         ):

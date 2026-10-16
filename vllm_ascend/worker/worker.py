@@ -749,6 +749,32 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    def _receive_pp_intermediate_tensors(
+        self, forward_pass: bool
+    ) -> "AsyncIntermediateTensors | None":
+        """Receive the previous pipeline stage's intermediate tensors.
+
+        Only non-first PP ranks with a forward pass participate in the
+        native PP p2p handoff; everyone else has nothing to receive.
+        """
+        if not (forward_pass and not get_pp_group().is_first_rank):
+            return None
+        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
+        # it will conflict with the all-gather operation in flashcomm1.
+        if enable_sp():
+            all_gather_group = None
+        else:
+            all_gather_group = get_tp_group()
+        tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+            all_gather_group=all_gather_group
+        )
+        assert tensor_dict is not None
+        return AsyncIntermediateTensors(
+            tensor_dict,
+            comm_handles=comm_handles,
+            comm_postprocess=comm_postprocess,
+        )
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -763,22 +789,8 @@ class NPUWorker(WorkerBase):
                 handle.wait()
             self._pp_send_work = []
 
-        intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        if forward_pass and not get_pp_group().is_first_rank:
-            if enable_sp():
-                all_gather_group = None
-            else:
-                all_gather_group = get_tp_group()
-            tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
-                all_gather_group=all_gather_group
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+        intermediate_tensors = self._receive_pp_intermediate_tensors(forward_pass)
 
         if self.profiler is not None:
             self.profiler.step()
