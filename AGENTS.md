@@ -8,7 +8,7 @@
 
 ## 存量代码 (mm 分支)
 
-- **基线**: LWD 改动全部在远端分支 `prefill_only_chunked_prefill_mm`, main 尚未合入. 该分支基于上游 vllm-ascend v0.23.0 并持续 cherry-pick 上游修复.
+- **基线**: LWD 改动在远端分支 `prefill_only_chunked_prefill_mm`, main 目前只迁入了数据面 (见下). 该分支基于上游 vllm-ascend v0.23.0 并持续 cherry-pick 上游修复.
 - **LWD 新增模块**:
 
   | 位置 | 职责 |
@@ -17,6 +17,8 @@
   | `vllm_ascend/worker/lwd_hash/`、`lwd_token_rank.py`、`lwd_layer_trace.py` | 请求 hash 路由与 hash 表、token 排名、层 trace |
   | `vllm_ascend/distributed/lwd_comm/`、`lwd_wire.py` | 边云数据面通信 (channel / future / pre_recv / payload_scramble) 与线协议 |
   | `tests/ut/worker/test_lwd_*.py` | LWD 单元测试 (draft cache、hash decode、token rank、v4 mixed migration) |
+
+- **数据面已迁入 main**: 在 `vllm_ascend/distributed/lwd_data_plane/`, 由 mm 的 `lwd_comm/`、`lwd_wire.py` 迁移并改名 (`LwdCommService` -> `LwdDataPlane`, `LwdChannel` -> `LwdTransferQueue`, `LwdCommFuture` -> `LwdTransferFuture`, `lwd_wire` -> `lwd_channels`, `PayloadScrambler` -> `LwdPayloadScrambler` 等), 提前收 (`pre_recv`) 未迁; 建组从 LWD 拓扑推导, 设计见 vllm 仓 `docs/design/lwd_data_plane.md`. 从 mm 移植调用方时改用新名字. `LwdChannelType` 的值 (`lwd_up`/`lwd_down`) 参与加扰种子推导, 其 repr 与 `[Lwd][perf] bridge-wait` 日志行被 mm 的 `log_analyze_tools/lwd_backlog_probe.py` 解析, 改名或改日志时要保持不变.
 
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
