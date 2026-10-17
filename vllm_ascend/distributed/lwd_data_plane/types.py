@@ -17,7 +17,7 @@ class LwdChannelType(enum.Enum):
     submission order — HCCL does not support tags.
     """
 
-    UP = "lwd_up"      # edge -> cloud: embeddings + optional V4 expert-ID bytes
+    UP = "lwd_up"  # edge -> cloud: embeddings + optional V4 expert-ID bytes
     DOWN = "lwd_down"  # cloud -> edge: combined c2e packet
 
 

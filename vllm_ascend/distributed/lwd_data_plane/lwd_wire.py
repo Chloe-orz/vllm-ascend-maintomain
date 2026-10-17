@@ -26,7 +26,7 @@ from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType
 
 # channel -> (device_group, peer_global_rank)
 _LWD_CHANNEL_GROUPS: dict[LwdChannelType, tuple[dist.ProcessGroup, int]] = {}
-_LWD_CHANNEL_STREAMS: dict[LwdChannelType, "torch.npu.Stream"] = {}
+_LWD_CHANNEL_STREAMS: dict[LwdChannelType, torch.npu.Stream] = {}
 _LWD_ENDPOINTS: tuple[int, int] | None = None  # (edge_global_rank, cloud_global_rank)
 _INITIALIZED = False
 
@@ -82,7 +82,8 @@ def init_lwd_duplex_channels() -> None:
     _INITIALIZED = True
     logger.info(
         "[lwd-wire] duplex channels created over ranks=%s (my_rank=%d)",
-        ranks, my_rank,
+        ranks,
+        my_rank,
     )
     # Exactly two channels, always warmed up: the first-use HCCL
     # rendezvous is moved to init time, where both sides are guaranteed
@@ -102,13 +103,11 @@ def warmup_lwd_duplex_channels() -> None:
     edge_rank, cloud_rank = _LWD_ENDPOINTS
     for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
         group, peer = _LWD_CHANNEL_GROUPS[channel]
-        am_sender = (
-            (channel is LwdChannelType.UP and my_rank == edge_rank)
-            or (channel is LwdChannelType.DOWN and my_rank == cloud_rank)
+        am_sender = (channel is LwdChannelType.UP and my_rank == edge_rank) or (
+            channel is LwdChannelType.DOWN and my_rank == cloud_rank
         )
-        am_receiver = (
-            (channel is LwdChannelType.UP and my_rank == cloud_rank)
-            or (channel is LwdChannelType.DOWN and my_rank == edge_rank)
+        am_receiver = (channel is LwdChannelType.UP and my_rank == cloud_rank) or (
+            channel is LwdChannelType.DOWN and my_rank == edge_rank
         )
         # Non-endpoint ranks participate in new_group/barrier (world
         # collectives) but skip the P2P ops entirely.
@@ -117,15 +116,21 @@ def warmup_lwd_duplex_channels() -> None:
         payload = torch.zeros(8, dtype=torch.bfloat16, device="npu")
         if am_sender:
             logger.info(
-                "[lwd-warmup] SEND post channel=%s my_rank=%d peer=%d "
-                "group_ranks=%s", channel, my_rank, peer,
-                dist.get_process_group_ranks(group))
+                "[lwd-warmup] SEND post channel=%s my_rank=%d peer=%d group_ranks=%s",
+                channel,
+                my_rank,
+                peer,
+                dist.get_process_group_ranks(group),
+            )
             handle = dist.isend(payload, dst=peer, group=group)
         else:
             logger.info(
-                "[lwd-warmup] RECV post channel=%s my_rank=%d src=%d "
-                "group_ranks=%s", channel, my_rank, peer,
-                dist.get_process_group_ranks(group))
+                "[lwd-warmup] RECV post channel=%s my_rank=%d src=%d group_ranks=%s",
+                channel,
+                my_rank,
+                peer,
+                dist.get_process_group_ranks(group),
+            )
             handle = dist.irecv(payload, src=peer, group=group)
         handle.wait()
         logger.info("[lwd-warmup] DONE channel=%s my_rank=%d", channel, my_rank)
@@ -148,7 +153,7 @@ def get_lwd_channel_peer(channel: LwdChannelType) -> int:
     return peer
 
 
-def get_lwd_channel_stream(channel: LwdChannelType) -> "torch.npu.Stream":
+def get_lwd_channel_stream(channel: LwdChannelType) -> torch.npu.Stream:
     return _LWD_CHANNEL_STREAMS[channel]
 
 
@@ -158,9 +163,7 @@ def destroy_lwd_duplex_channels() -> None:
         try:
             dist.destroy_process_group(group)
         except Exception:
-            logger.warning(
-                "[lwd-wire] failed to destroy group for %s", channel.value
-            )
+            logger.warning("[lwd-wire] failed to destroy group for %s", channel.value)
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
     _LWD_ENDPOINTS = None

@@ -12,7 +12,6 @@ Ported (simplified) from the demo branch's ``lwd_comm/service.py``.
 from __future__ import annotations
 
 import threading
-import time
 
 from vllm.logger import logger
 
@@ -24,11 +23,11 @@ from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType, LwdComm
 class LwdCommService:
     """Process-wide singleton.  All public methods are thread-safe."""
 
-    _instance: "LwdCommService | None" = None
+    _instance: LwdCommService | None = None
     _instance_lock = threading.Lock()
 
     @classmethod
-    def instance(cls) -> "LwdCommService":
+    def instance(cls) -> LwdCommService:
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = cls()
@@ -73,9 +72,7 @@ class LwdCommService:
             completed += len(channel.reap())
         return completed
 
-    def skip_seqno(
-        self, channel_type: LwdChannelType, seqno: int, op: str = "recv"
-    ) -> None:
+    def skip_seqno(self, channel_type: LwdChannelType, seqno: int, op: str = "recv") -> None:
         """Mark a seqno as never-to-arrive (aborted request) on the given
         channel+direction FIFO.  Recv managers' drop path passes
         op="recv"; the sender-side abort glue passes op="send".  Both

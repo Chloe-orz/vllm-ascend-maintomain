@@ -57,7 +57,7 @@ class LwdCommFuture:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def deferred(cls, request: LwdCommRequest) -> "LwdCommFuture":
+    def deferred(cls, request: LwdCommRequest) -> LwdCommFuture:
         """A future for a held request; bound in place when its seqno
         turn arrives."""
         return cls(request, [], None)
@@ -66,7 +66,7 @@ class LwdCommFuture:
         self,
         *,
         handles: list[Any],
-        done_event: "torch.npu.Event | None",
+        done_event: torch.npu.Event | None,
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
@@ -118,9 +118,7 @@ class LwdCommFuture:
             while self._status is LwdCommStatus.PENDING:
                 if self._done_event is None:
                     # Deferred future not yet bound; wait for _bind.
-                    remaining = (
-                        None if deadline is None else deadline - time.monotonic()
-                    )
+                    remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         raise TimeoutError(
                             f"lwd-comm wait timed out (unbound) on "
@@ -132,35 +130,33 @@ class LwdCommFuture:
                 if self._done_event.query():
                     self._status = LwdCommStatus.OK
                     break
-                remaining = (
-                    None if deadline is None else deadline - time.monotonic()
-                )
+                remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(
-                        f"lwd-comm wait timed out on "
-                        f"{self._request.channel.value} seqno="
-                        f"{self._request.seqno}"
+                        f"lwd-comm wait timed out on {self._request.channel.value} seqno={self._request.seqno}"
                     )
                 self._done_cond.wait(timeout=min(0.001, remaining or 0.001))
             if self._status is LwdCommStatus.ERROR:
                 raise RuntimeError(
-                    f"lwd-comm op failed on {self._request.channel.value} "
-                    f"seqno={self._request.seqno}"
+                    f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
                 ) from self._error
         return LwdCommResult(
-            status=self._status, tensor=self._tensor,
+            status=self._status,
+            tensor=self._tensor,
             aux_tensor=self._aux_tensor,
         )
 
     def result(self) -> LwdCommResult:
         with self._lock:
             status, tensor, aux_tensor, error = (
-                self._status, self._tensor, self._aux_tensor, self._error,
+                self._status,
+                self._tensor,
+                self._aux_tensor,
+                self._error,
             )
         if status is LwdCommStatus.ERROR:
             raise RuntimeError(
-                f"lwd-comm op failed on {self._request.channel.value} "
-                f"seqno={self._request.seqno}"
+                f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
             ) from error
         return LwdCommResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
 
@@ -196,7 +192,5 @@ class LwdCommFuture:
                 return
             if self._status is LwdCommStatus.PENDING:
                 self._status = (
-                    LwdCommStatus.OK
-                    if (self._done_event is not None and self._done_event.query())
-                    else self._status
+                    LwdCommStatus.OK if (self._done_event is not None and self._done_event.query()) else self._status
                 )

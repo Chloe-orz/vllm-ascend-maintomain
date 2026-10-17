@@ -41,8 +41,8 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
     data_parallel_size = parallel_config.data_parallel_size
     world_size = torch.distributed.get_world_size()
     assert world_size == data_parallel_size * world_per_dp, (
-        f"Lwd world size mismatch: got {world_size}, expected "
-        f"{data_parallel_size} * ({edge_count} + {cloud_count})")
+        f"Lwd world size mismatch: got {world_size}, expected {data_parallel_size} * ({edge_count} + {cloud_count})"
+    )
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
     # MC2 groups mirror the vLLM-side TP groups: one group per side.
@@ -95,10 +95,7 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
     if ascend_config.layer_sharding is not None:
         unsupported.append("layer_sharding")
     if unsupported:
-        raise NotImplementedError(
-            "features not yet supported in Lwd edge-cloud mode: "
-            + ", ".join(unsupported)
-        )
+        raise NotImplementedError("features not yet supported in Lwd edge-cloud mode: " + ", ".join(unsupported))
 
     logger.info(
         "Lwd ascend model parallel initialized: world_size=%s, MC2 groups=%s",

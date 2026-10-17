@@ -31,8 +31,7 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane import lwd_wire
 from vllm_ascend.distributed.lwd_data_plane.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType
-from vllm_ascend.distributed.lwd_data_plane.types import LwdCommRequest, LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType, LwdCommRequest
 
 
 def _scramble_seed_for(request: LwdCommRequest) -> int | None:
@@ -94,12 +93,7 @@ class LwdChannel:
             # waiter fails promptly instead of waiting out the timeout.
             held = self._held.pop(seqno, None)
             if held is not None:
-                held[1]._finalize(
-                    error=RuntimeError(
-                        f"seqno {seqno} aborted on channel "
-                        f"{self.channel_type.value}"
-                    )
-                )
+                held[1]._finalize(error=RuntimeError(f"seqno {seqno} aborted on channel {self.channel_type.value}"))
             self._skipped.add(seqno)
             self._advance_past_skipped()
 
@@ -121,8 +115,7 @@ class LwdChannel:
         """Execute the wire op and enqueue the future."""
         if request.op != self.op:
             raise RuntimeError(
-                f"op mismatch on {self.channel_type.value} FIFO: "
-                f"channel carries {self.op!r}, got {request.op!r}"
+                f"op mismatch on {self.channel_type.value} FIFO: channel carries {self.op!r}, got {request.op!r}"
             )
         finalized = self._reap()
         self._finalize_many(finalized)
@@ -147,11 +140,7 @@ class LwdChannel:
             )
 
             get_payload_scrambler().scramble(owned, seed=seed)
-        aux_owned = (
-            request.aux_tensor.detach().clone()
-            if request.aux_tensor is not None
-            else None
-        )
+        aux_owned = request.aux_tensor.detach().clone() if request.aux_tensor is not None else None
         return replace(request, tensor=owned, aux_tensor=aux_owned)
 
     # ------------------------------------------------------------------ #
@@ -173,16 +162,15 @@ class LwdChannel:
             # the request with an error result so the caller's readiness
             # gate fails this request promptly.
             logger.warning(
-                "[lwd-comm] dropping submission of skipped/duplicate "
-                "seqno %d on channel %s %s (next expected %d)",
-                seqno, self.channel_type.value, self.op, self._next_seqno,
+                "[lwd-comm] dropping submission of skipped/duplicate seqno %d on channel %s %s (next expected %d)",
+                seqno,
+                self.channel_type.value,
+                self.op,
+                self._next_seqno,
             )
             future = LwdCommFuture(request, [], None)
             future._finalize(
-                error=RuntimeError(
-                    f"seqno {seqno} was skipped (aborted) on channel "
-                    f"{self.channel_type.value}"
-                )
+                error=RuntimeError(f"seqno {seqno} was skipped (aborted) on channel {self.channel_type.value}")
             )
             return future
         if seqno > self._next_seqno:
@@ -195,7 +183,10 @@ class LwdChannel:
             self._held[seqno] = (request, future)
             logger.debug(
                 "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
-                self.channel_type.value, request.op, seqno, self._next_seqno,
+                self.channel_type.value,
+                request.op,
+                seqno,
+                self._next_seqno,
             )
             return future
         future = self._execute_next(request)
@@ -240,28 +231,24 @@ class LwdChannel:
         with self._submission_lock:
             if self._held:
                 logger.warning(
-                    "[lwd-comm] shutdown on channel %s with %d held "
-                    "(never-posted) request(s); lowest missing seqno=%s",
-                    self.channel_type.value, len(self._held), self._next_seqno,
+                    "[lwd-comm] shutdown on channel %s with %d held (never-posted) request(s); lowest missing seqno=%s",
+                    self.channel_type.value,
+                    len(self._held),
+                    self._next_seqno,
                 )
                 # Fail the deferred futures before dropping them: their
                 # waiters must not hang until the readiness-gate timeout.
                 for _, held_future in self._held.values():
                     held_future._finalize(
                         error=RuntimeError(
-                            f"channel {self.channel_type.value} shut down "
-                            "with the request still held (never posted)"
+                            f"channel {self.channel_type.value} shut down with the request still held (never posted)"
                         )
                     )
                 self._held.clear()
             with self._lock:
                 pending = list(self._pending)
             for future in pending:
-                remaining = (
-                    None
-                    if deadline is None
-                    else max(0.0, deadline - time.monotonic())
-                )
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 future.wait(timeout=remaining)
             finalized = self._reap()
             self._finalize_many(finalized)
@@ -368,13 +355,14 @@ class LwdChannel:
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
-            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s "
-            "shape=%s dtype=%s op=%s",
-            self.channel_type, dist.get_rank(), peer,
+            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s shape=%s dtype=%s op=%s",
+            self.channel_type,
+            dist.get_rank(),
+            peer,
             dist.get_process_group_ranks(group),
-            list(tensor.shape), tensor.dtype,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
-            else "isend",
+            list(tensor.shape),
+            tensor.dtype,
+            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP else "isend",
         )
         # UP(边→云)两层通信:第一段边→云端点 P2P(只等端点 join,
         # 不再被 8 卡 join 拖住);第二段端点在云 TP 组内 broadcast
@@ -385,16 +373,10 @@ class LwdChannel:
         if self.channel_type == LwdChannelType.UP:
             handles = [dist.isend(tensor.contiguous(), dst=peer, group=group)]
             if req.aux_tensor is not None:
-                handles.append(
-                    dist.isend(
-                        req.aux_tensor.contiguous(), dst=peer, group=group
-                    )
-                )
+                handles.append(dist.isend(req.aux_tensor.contiguous(), dst=peer, group=group))
             return handles
         if req.aux_tensor is not None:
-            raise RuntimeError(
-                "aux payload is only supported on the UP channel"
-            )
+            raise RuntimeError("aux payload is only supported on the UP channel")
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _wire_recv(self, req: LwdCommRequest):
@@ -403,19 +385,18 @@ class LwdChannel:
         if peer is None:
             peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
         logger.debug(
-            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s "
-            "num_elements=%d aux_elements=%d op=%s",
-            self.channel_type, dist.get_rank(), peer,
-            dist.get_process_group_ranks(group), req.num_elements,
+            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=%s",
+            self.channel_type,
+            dist.get_rank(),
+            peer,
+            dist.get_process_group_ranks(group),
+            req.num_elements,
             req.aux_num_elements,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP
-            else "irecv",
+            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP else "irecv",
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
-        buffer = torch.empty(
-            req.num_elements, dtype=torch.bfloat16, device="npu"
-        )
+        buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
             # aux 帧尺寸 = num_tokens*3(mrope positions);dtype 取
@@ -425,14 +406,16 @@ class LwdChannel:
                 dtype=req.aux_dtype or torch.int64,
                 device="npu",
             )
-            return buffer, aux_buffer, [
-                dist.irecv(buffer, src=peer, group=group),
-                dist.irecv(aux_buffer, src=peer, group=group),
-            ]
-        if req.aux_num_elements > 0:
-            raise RuntimeError(
-                "aux payload is only supported on the UP channel"
+            return (
+                buffer,
+                aux_buffer,
+                [
+                    dist.irecv(buffer, src=peer, group=group),
+                    dist.irecv(aux_buffer, src=peer, group=group),
+                ],
             )
+        if req.aux_num_elements > 0:
+            raise RuntimeError("aux payload is only supported on the UP channel")
         return buffer, None, [dist.irecv(buffer, src=peer, group=group)]
 
     def _bridge_and_record(self, handles: list[Any]):
@@ -449,11 +432,15 @@ class LwdChannel:
         # 返回"——dur 大 = 发送/接收 posting 阻塞主机(锁定步判定依据)
         logger.info(
             "[Lwd][perf] bridge-wait op=%s ch=%s dur=%.2fms",
-            self.op, self.channel_type, (time.monotonic() - _t) * 1000,
+            self.op,
+            self.channel_type,
+            (time.monotonic() - _t) * 1000,
         )
         logger.debug(
             "[lwd-comm] DONE channel=%s my_rank=%d handles=%d",
-            self.channel_type, dist.get_rank(), len(handles),
+            self.channel_type,
+            dist.get_rank(),
+            len(handles),
         )
         event = torch.npu.Event()
         event.record()

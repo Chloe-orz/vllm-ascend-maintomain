@@ -55,7 +55,7 @@ __all__ = [
 
 # Domain separator: bump the version suffix on any factor-set / canonical-form
 # / order change.  A bump makes two peers running different versions derive
-# different seeds loudly instead of silently mis-deriving.
+# different seeds loudly instead of silently deriving the wrong one.
 _KDF_DOMAIN = b"vllm-ascend/payload-scramble/v3"
 _US = b"\x1f"  # unit separator between factor fields
 _SEED_PERSON = b"ec-scr01"
@@ -140,8 +140,7 @@ def _require_torch() -> Any:
         import torch
     except ImportError as exc:  # pragma: no cover - torch is a hard dep in prod
         raise RuntimeError(
-            "PayloadScrambler: the operators need torch; seed_for does not and "
-            "remains usable without it"
+            "PayloadScrambler: the operators need torch; seed_for does not and remains usable without it"
         ) from exc
     return torch
 
@@ -152,9 +151,7 @@ def _require_seed(seed: int) -> int:
     ``bool`` is rejected explicitly: ``True`` would silently mean ``k=1``.
     """
     if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError(
-            f"scramble/descramble: seed must be an int, got {type(seed).__name__}"
-        )
+        raise ValueError(f"scramble/descramble: seed must be an int, got {type(seed).__name__}")
     return seed & _MASK16
 
 
@@ -168,7 +165,7 @@ def _signed_k(k: int) -> int:
     return k if k <= 0x7FFF else k - 0x10000
 
 
-def _xor_in_place(t: "Tensor", k: int, torch: Any) -> None:
+def _xor_in_place(t: Tensor, k: int, torch: Any) -> None:
     """XOR ``k`` into every element of ``t``, in place.
 
     The transform XORs the raw 16-bit float bit patterns: per-bit independent,
@@ -185,21 +182,15 @@ def _xor_in_place(t: "Tensor", k: int, torch: Any) -> None:
     t.view(torch.int16).bitwise_xor_(_signed_k(k))
 
 
-def _require_scrambleable(t: "Tensor", torch: Any) -> None:
+def _require_scrambleable(t: Tensor, torch: Any) -> None:
     """Reject anything that cannot take a 16-bit bit view."""
     if not isinstance(t, torch.Tensor):
-        raise ValueError(
-            f"scramble/descramble: expected a torch.Tensor, got {type(t).__name__}"
-        )
+        raise ValueError(f"scramble/descramble: expected a torch.Tensor, got {type(t).__name__}")
     if t.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            "scramble/descramble: only 16-bit floats can be reinterpreted as "
-            f"int16, got dtype={t.dtype}"
-        )
+        raise ValueError(f"scramble/descramble: only 16-bit floats can be reinterpreted as int16, got dtype={t.dtype}")
     if not t.is_contiguous():
         raise ValueError(
-            "scramble/descramble: tensor must be contiguous to take a bit "
-            "view, call .contiguous() on it first"
+            "scramble/descramble: tensor must be contiguous to take a bit view, call .contiguous() on it first"
         )
 
 
@@ -234,9 +225,7 @@ class PayloadScrambler:
         # Canonicalise once, at construction, so a whitespace-only factor fails
         # here rather than silently producing a different seed than the peer.
         object.__setattr__(self, "device_id", _canonical_str(self.device_id))
-        object.__setattr__(
-            self, "custom_factor", _canonical_str(self.custom_factor)
-        )
+        object.__setattr__(self, "custom_factor", _canonical_str(self.custom_factor))
         if not self.device_id:
             raise ValueError("PayloadScrambler: device_id must not be empty")
         if not self.custom_factor:
@@ -267,7 +256,7 @@ class PayloadScrambler:
         )
 
     # ------------------------------------------------------------ 算子
-    def scramble(self, t: "Tensor", *, seed: int) -> "Tensor":
+    def scramble(self, t: Tensor, *, seed: int) -> Tensor:
         """Scramble one matrix in place; returns ``t``.
 
         Raises:
@@ -276,7 +265,7 @@ class PayloadScrambler:
         """
         return self._apply(t, seed=seed)
 
-    def descramble(self, t: "Tensor", *, seed: int) -> "Tensor":
+    def descramble(self, t: Tensor, *, seed: int) -> Tensor:
         """Exact inverse of :meth:`scramble`; ``seed`` must match.
 
         Same body on purpose: the transform is its own inverse, so a separate
@@ -284,7 +273,7 @@ class PayloadScrambler:
         """
         return self._apply(t, seed=seed)
 
-    def _apply(self, t: "Tensor", *, seed: int) -> "Tensor":
+    def _apply(self, t: Tensor, *, seed: int) -> Tensor:
         torch = _require_torch()
         k = _require_seed(seed)
         _require_scrambleable(t, torch)
@@ -303,9 +292,7 @@ class PayloadScrambler:
 _PROCESS_SCRAMBLER: PayloadScrambler | None = None
 
 
-def get_payload_scrambler(
-    *, device_id: str | None = None, custom_factor: str | None = None
-) -> PayloadScrambler:
+def get_payload_scrambler(*, device_id: str | None = None, custom_factor: str | None = None) -> PayloadScrambler:
     """Return the process-wide instance, mirroring ``get_comm_service()``.
 
     The worker builds it once at startup (place 1 in the design doc) with the
@@ -320,23 +307,12 @@ def get_payload_scrambler(
     global _PROCESS_SCRAMBLER
     if _PROCESS_SCRAMBLER is None:
         if device_id is None or custom_factor is None:
-            raise ValueError(
-                "get_payload_scrambler: the first call must pass both "
-                "device_id and custom_factor"
-            )
-        _PROCESS_SCRAMBLER = PayloadScrambler(
-            device_id=device_id, custom_factor=custom_factor
-        )
+            raise ValueError("get_payload_scrambler: the first call must pass both device_id and custom_factor")
+        _PROCESS_SCRAMBLER = PayloadScrambler(device_id=device_id, custom_factor=custom_factor)
     elif device_id is not None or custom_factor is not None:
         candidate = PayloadScrambler(
-            device_id=(
-                device_id if device_id is not None else _PROCESS_SCRAMBLER.device_id
-            ),
-            custom_factor=(
-                custom_factor
-                if custom_factor is not None
-                else _PROCESS_SCRAMBLER.custom_factor
-            ),
+            device_id=(device_id if device_id is not None else _PROCESS_SCRAMBLER.device_id),
+            custom_factor=(custom_factor if custom_factor is not None else _PROCESS_SCRAMBLER.custom_factor),
         )
         if candidate != _PROCESS_SCRAMBLER:
             raise ValueError(

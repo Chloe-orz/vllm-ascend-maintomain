@@ -25,6 +25,7 @@ Ascend kernel.
 """
 
 import ast
+import dataclasses
 import os
 import subprocess
 import sys
@@ -49,9 +50,7 @@ _MODULE_PATH = Path(ps.__file__)
 def _scrambler(device_id=None, custom_factor=None):
     return ps.PayloadScrambler(
         device_id=_FACTORS["device_id"] if device_id is None else device_id,
-        custom_factor=(
-            _FACTORS["custom_factor"] if custom_factor is None else custom_factor
-        ),
+        custom_factor=(_FACTORS["custom_factor"] if custom_factor is None else custom_factor),
     )
 
 
@@ -131,8 +130,7 @@ def test_each_factor_contributes(overrides):
 def test_whitespace_is_normalised():
     base = _seed()
     assert (
-        _scrambler(device_id=" ECPAIR-SN-8A3F91 ", custom_factor="\tbiz-2024-q3\n")
-        .seed_for(
+        _scrambler(device_id=" ECPAIR-SN-8A3F91 ", custom_factor="\tbiz-2024-q3\n").seed_for(
             channel="  lwd_up  ",
             seqno=7,
             num_elements=2048,
@@ -165,9 +163,7 @@ def test_canonical_nonneg_int(raw, expected):
     assert ps._canonical_nonneg_int(raw) == expected
 
 
-@pytest.mark.parametrize(
-    ("raw", "expected"), [(None, ""), ("", ""), ("  a \n", "a")]
-)
+@pytest.mark.parametrize(("raw", "expected"), [(None, ""), ("", ""), ("  a \n", "a")])
 def test_canonical_str(raw, expected):
     assert ps._canonical_str(raw) == expected
 
@@ -283,7 +279,7 @@ def test_non_contiguous_tensor_is_rejected():
 
 def test_instance_is_immutable():
     scr = _scrambler()
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         scr.device_id = "other"
     assert hash(scr) == hash(_scrambler())
 
@@ -319,9 +315,7 @@ def test_seed_for_works_without_torch():
         "s = m.PayloadScrambler(device_id='a', custom_factor='b')\n"
         "print(s.seed_for(channel='lwd_up', seqno=1, num_elements=2))\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True
-    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() != ""
 
@@ -338,9 +332,7 @@ def test_public_surface_is_the_class_plus_the_process_factory():
         "get_payload_scrambler",
         "is_payload_scrambler_initialized",
     ]
-    public_methods = {
-        name for name in dir(ps.PayloadScrambler) if not name.startswith("_")
-    }
+    public_methods = {name for name in dir(ps.PayloadScrambler) if not name.startswith("_")}
     assert {"seed_for", "scramble", "descramble"} <= public_methods
     operators = {name for name in public_methods if "scramble" in name}
     assert operators == {"scramble", "descramble"}
