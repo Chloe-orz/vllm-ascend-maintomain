@@ -1,9 +1,10 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only duplex data-plane wire layer.
+"""Duplex data-plane wire layer of the LWD edge-cloud world.
 
 Owns the two physical channels (UP edge->cloud, DOWN cloud->edge):
-  * channel HCCL communicators: two dedicated ``new_group`` groups over
-    the edge/cloud endpoint pair (edge rank 0 and the first cloud rank);
+  * channel HCCL communicators: two dedicated ``new_group`` groups per DP
+    connection, over its endpoint pair (``LwdChannelEndpoints``: the first
+    edge rank and the first cloud rank);
   * one NPU stream per channel (wire ops are bridged onto it, keeping
     the compute stream free);
   * init-time warmup of both channels in both directions in a fixed
@@ -11,70 +12,56 @@ Owns the two physical channels (UP edge->cloud, DOWN cloud->edge):
     pipeline, where the two sides could otherwise arrive on different
     channels and deadlock).
 
-Only prefill_only mode builds these groups; other modes never reach
-here (gated by ``LwdConfig.is_prefill_only``).
+Design: docs/design/lwd_data_plane.md in the vLLM repository.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from vllm.config import get_current_vllm_config
+from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType
 
-# channel -> (device_group, peer_global_rank)
+_LWD_WARMUP_NUM_ELEMENTS = 8
+
+# channel -> (device_group, peer_global_rank), on the two endpoint ranks only
 _LWD_CHANNEL_GROUPS: dict[LwdChannelType, tuple[dist.ProcessGroup, int]] = {}
 _LWD_CHANNEL_STREAMS: dict[LwdChannelType, torch.npu.Stream] = {}
-_LWD_ENDPOINTS: tuple[int, int] | None = None  # (edge_global_rank, cloud_global_rank)
+_LWD_ENDPOINTS: LwdChannelEndpoints | None = None
 _INITIALIZED = False
 
 
 def init_lwd_duplex_channels() -> None:
-    """Create the two duplex channels for the edge/cloud endpoint pair.
+    """Create the UP and DOWN channels of every DP connection. Idempotent.
 
-    Called once per worker process in prefill_only mode. Idempotent.
-
-    Ranks follow the contiguous edge-first layout derived from
-    ``--edge-npu-count`` / ``--cloud-npu-count``: edge [0, E), cloud
-    [E, E + C), endpoints (0, E). Only the two endpoints ever touch the
-    channels; the other ranks join the group creation (a world
-    collective) with peer=-1.
+    Called once by every worker of the shared world after its distributed
+    environment is up. Group creation is a world collective, so every rank
+    creates the groups of every connection in the order of
+    ``LwdParallelGroupsSpec``; only the two endpoint ranks keep them.
     """
     global _INITIALIZED, _LWD_ENDPOINTS
     if _INITIALIZED:
         return
-    from vllm.config import get_current_vllm_config
-
-    lwd_cfg = get_current_vllm_config().parallel_config.lwd_config
-    if lwd_cfg.edge_npu_count <= 0 or lwd_cfg.cloud_npu_count <= 0:
-        raise RuntimeError(
-            "[Lwd] prefill_only duplex channels require positive "
-            "--edge-npu-count and --cloud-npu-count, got "
-            f"edge={lwd_cfg.edge_npu_count}, cloud={lwd_cfg.cloud_npu_count}"
-        )
-    edge_rank, cloud_rank = 0, lwd_cfg.edge_npu_count
-    ranks = [edge_rank, cloud_rank]
+    lwd_config = get_current_vllm_config().lwd_config
+    assert lwd_config is not None, "the data plane requires lwd_config"
+    spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
-    for channel in LwdChannelType:
-        # Both channels span the same rank pair; direction is given by
-        # who sends.  new_group is a world collective — every rank must
-        # participate in every creation, in the same order.
-        group = dist.new_group(ranks, backend=backend)
-        # P2P peer = the other rank of the pair, defined only on the two
-        # endpoint ranks; other ranks (e.g. extra cloud TP ranks) never
-        # touch the channels.
-        if my_rank == edge_rank:
-            peer = cloud_rank
-        elif my_rank == cloud_rank:
-            peer = edge_rank
-        else:
-            peer = -1
-        _LWD_CHANNEL_GROUPS[channel] = (group, peer)
-        _LWD_CHANNEL_STREAMS[channel] = torch.npu.Stream()
-    _LWD_ENDPOINTS = (edge_rank, cloud_rank)
+    for endpoints in spec.channel_endpoints:
+        ranks = [endpoints.edge_rank, endpoints.cloud_rank]
+        for channel in LwdChannelType:
+            # Both channels span the same rank pair; the direction is given
+            # by who sends.
+            group = dist.new_group(ranks, backend=backend)
+            if my_rank in ranks:
+                peer = endpoints.cloud_rank if my_rank == endpoints.edge_rank else endpoints.edge_rank
+                _LWD_CHANNEL_GROUPS[channel] = (group, peer)
+                _LWD_CHANNEL_STREAMS[channel] = torch.npu.Stream()
+    _LWD_ENDPOINTS = spec.channel_endpoints_of(my_rank)
     # The cloud-internal embeds broadcast does not build its own group: a
     # dedicated new_group delivered nothing under torch_npu in testing
     # (suspected group creation order mismatch), so it uses the framework TP
@@ -83,9 +70,10 @@ def init_lwd_duplex_channels() -> None:
     # the forward TP collectives, so the two cannot interleave.
     _INITIALIZED = True
     logger.info(
-        "[lwd-wire] duplex channels created over ranks=%s (my_rank=%d)",
-        ranks,
+        "[LWD] data-plane channels created for %s (my_rank=%d, endpoints=%s)",
+        spec.channel_endpoints,
         my_rank,
+        _LWD_ENDPOINTS,
     )
     # Exactly two channels, always warmed up: the first-use HCCL
     # rendezvous is moved to init time, where both sides are guaranteed
@@ -98,64 +86,51 @@ def warmup_lwd_duplex_channels() -> None:
 
     A tiny payload is exchanged on each channel in a fixed global order
     (UP then DOWN), so both sides rendezvous identically regardless of
-    when the first real message is posted.
+    when the first real message is posted. Non-endpoint ranks only join
+    the closing world barrier.
     """
-    my_rank = dist.get_rank()
-    assert _LWD_ENDPOINTS is not None
-    edge_rank, cloud_rank = _LWD_ENDPOINTS
-    for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-        group, peer = _LWD_CHANNEL_GROUPS[channel]
-        am_sender = (channel is LwdChannelType.UP and my_rank == edge_rank) or (
-            channel is LwdChannelType.DOWN and my_rank == cloud_rank
-        )
-        am_receiver = (channel is LwdChannelType.UP and my_rank == cloud_rank) or (
-            channel is LwdChannelType.DOWN and my_rank == edge_rank
-        )
-        # Non-endpoint ranks participate in new_group/barrier (world
-        # collectives) but skip the P2P ops entirely.
-        if not (am_sender or am_receiver):
-            continue
-        payload = torch.zeros(8, dtype=torch.bfloat16, device="npu")
-        if am_sender:
-            logger.info(
-                "[lwd-warmup] SEND post channel=%s my_rank=%d peer=%d group_ranks=%s",
-                channel,
-                my_rank,
-                peer,
-                dist.get_process_group_ranks(group),
-            )
-            handle = dist.isend(payload, dst=peer, group=group)
-        else:
-            logger.info(
-                "[lwd-warmup] RECV post channel=%s my_rank=%d src=%d group_ranks=%s",
-                channel,
-                my_rank,
-                peer,
-                dist.get_process_group_ranks(group),
-            )
-            handle = dist.irecv(payload, src=peer, group=group)
-        handle.wait()
-        logger.info("[lwd-warmup] DONE channel=%s my_rank=%d", channel, my_rank)
+    if _LWD_ENDPOINTS is not None:
+        my_rank = dist.get_rank()
+        for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
+            group, peer = _LWD_CHANNEL_GROUPS[channel]
+            sender = _LWD_ENDPOINTS.edge_rank if channel is LwdChannelType.UP else _LWD_ENDPOINTS.cloud_rank
+            payload = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.bfloat16, device="npu")
+            if my_rank == sender:
+                handle = dist.isend(payload, dst=peer, group=group)
+            else:
+                handle = dist.irecv(payload, src=peer, group=group)
+            handle.wait()
+            logger.info("[LWD] data-plane warmup done: channel=%s my_rank=%d peer=%d", channel, my_rank, peer)
     get_world_group().barrier()
-    logger.info("[lwd-wire] duplex channels warmed up (UP + DOWN)")
 
 
 def lwd_channels_initialized() -> bool:
     return _INITIALIZED
 
 
+def _lwd_channel(channel: LwdChannelType) -> tuple[dist.ProcessGroup, int]:
+    try:
+        return _LWD_CHANNEL_GROUPS[channel]
+    except KeyError:
+        raise RuntimeError(
+            f"[LWD] rank {dist.get_rank()} holds no {channel.value} channel; "
+            "only the endpoint ranks of a DP connection do"
+        ) from None
+
+
 def get_lwd_channel_device_group(channel: LwdChannelType) -> dist.ProcessGroup:
-    group, _ = _LWD_CHANNEL_GROUPS[channel]
+    group, _ = _lwd_channel(channel)
     return group
 
 
 def get_lwd_channel_peer(channel: LwdChannelType) -> int:
     """Global rank of this process's P2P peer on the channel."""
-    _, peer = _LWD_CHANNEL_GROUPS[channel]
+    _, peer = _lwd_channel(channel)
     return peer
 
 
 def get_lwd_channel_stream(channel: LwdChannelType) -> torch.npu.Stream:
+    _lwd_channel(channel)
     return _LWD_CHANNEL_STREAMS[channel]
 
 
@@ -165,7 +140,7 @@ def destroy_lwd_duplex_channels() -> None:
         try:
             dist.destroy_process_group(group)
         except Exception:
-            logger.warning("[lwd-wire] failed to destroy group for %s", channel.value)
+            logger.warning("[LWD] failed to destroy the data-plane group for %s", channel.value)
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
     _LWD_ENDPOINTS = None
