@@ -1,16 +1,21 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only LWD data plane: duplex comm package.
+"""LWD edge-cloud data plane: duplex comm package.
 
-Two physical channels, direction-only (no per-type channels):
+Two physical channels per DP connection, direction-only (no per-type
+channels):
 
-    UP   edge -> cloud : whole-prompt embeddings, one message per request
-    DOWN cloud -> edge : combined c2e packet (final hidden + topk +
-                         num_accepted of the last decode step), one
-                         message per request
+    UP   edge -> cloud : prompt embeddings of one prefill batch, plus an
+                         optional mrope-positions aux frame
+    DOWN cloud -> edge : c2e packet of one cloud step (final hidden +
+                         topk + num_accepted)
 
 The machinery (send snapshot, per-channel seqno reorder buffer, lazy
 reap, HCCL->stream bridge) is ported from the demo branch's
-``lwd_comm`` package with draft/plain wire variants removed —
-the payloads here are always single contiguous bf16 tensors whose shape
-the receiver learns from the control plane before posting the irecv.
+``lwd_comm`` package with draft/plain wire variants removed: the main
+payload is one contiguous bf16 tensor whose size the receiver learns from
+the control plane before posting the irecv.
+
+``lwd_wire`` owns the channel groups and streams; the rank layout comes
+from ``vllm.distributed.lwd.LwdParallelGroupsSpec``. Design:
+docs/design/lwd_data_plane.md in the vLLM repository.
 """

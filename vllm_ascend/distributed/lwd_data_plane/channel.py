@@ -355,14 +355,13 @@ class LwdChannel:
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
-            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s shape=%s dtype=%s op=%s",
+            "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s shape=%s dtype=%s op=isend",
             self.channel_type,
             dist.get_rank(),
             peer,
             dist.get_process_group_ranks(group),
             list(tensor.shape),
             tensor.dtype,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP else "isend",
         )
         # UP (edge -> cloud) takes two hops: this channel carries only the
         # edge -> cloud endpoint P2P, so it waits for the endpoint alone
@@ -388,14 +387,13 @@ class LwdChannel:
         if peer is None:
             peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
         logger.debug(
-            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=%s",
+            "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
             self.channel_type,
             dist.get_rank(),
             peer,
             dist.get_process_group_ranks(group),
             req.num_elements,
             req.aux_num_elements,
-            "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP else "irecv",
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
