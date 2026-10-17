@@ -38,6 +38,9 @@ the factors can recompute the seed, and the operator only uses the low 16 bits
 of it.  See ``blog-repo/vllm/加扰与解扰-设计.md``.
 """
 
+# TODO(lwd): bring the design doc referenced above into the repository; it
+# lives outside it.
+
 from __future__ import annotations
 
 import hashlib

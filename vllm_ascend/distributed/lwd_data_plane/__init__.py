@@ -19,3 +19,6 @@ the control plane before posting the irecv.
 from ``vllm.distributed.lwd.LwdParallelGroupsSpec``. Design:
 docs/design/lwd_data_plane.md in the vLLM repository.
 """
+
+# TODO(lwd): switch the [lwd-comm] log and error prefix of this package to
+# [LWD] once it is confirmed that no log analysis tool matches on it.

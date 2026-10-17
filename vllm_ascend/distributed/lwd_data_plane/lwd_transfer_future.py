@@ -147,6 +147,9 @@ class LwdTransferFuture:
         )
 
     def result(self) -> LwdTransferResult:
+        # TODO(lwd): confirm the behavior for a held future that is not bound
+        # yet: it returns tensor=None, and wait_on_current_stream() is a no-op
+        # before _bind.
         with self._lock:
             status, tensor, aux_tensor, error = (
                 self._status,

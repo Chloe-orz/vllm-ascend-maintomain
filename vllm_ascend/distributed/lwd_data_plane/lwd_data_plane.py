@@ -65,6 +65,10 @@ class LwdDataPlane:
         """Reap every channel once.  Call from an existing loop head;
         costs one head-of-line ``event.query()`` per channel with
         pending traffic."""
+        # TODO(lwd): confirm whether the edge should reap too. On the mm branch
+        # only the cloud worker calls this; submit() reaps its own queue only,
+        # so an edge UP send snapshot (one prefill batch) stays alive until the
+        # next UP send.
         with self._lock:
             queues = list(self._queues.values())
         completed = 0

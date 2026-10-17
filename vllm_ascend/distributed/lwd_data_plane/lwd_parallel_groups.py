@@ -28,6 +28,8 @@ def lwd_mc2_group_ranks(lwd_config: LwdConfig) -> list[list[int]]:
     return [list(group) for group in spec.tp_groups]
 
 
+# TODO(lwd): move this check to NPUPlatform.check_and_update_config, so that
+# an unsupported config fails at startup, before any worker joins the world.
 def _lwd_check_ascend_features() -> None:
     ascend_config = get_ascend_config()
     finegrained = ascend_config.finegrained_tp_config

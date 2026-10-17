@@ -191,6 +191,9 @@ class LwdTransferQueue:
             return future
         future = self._execute_next(request)
         self._next_seqno += 1
+        # TODO(lwd): confirm whether this drain should also step over skipped
+        # seqnos, as _advance_past_skipped does: a held seqno right after a
+        # skipped one is only posted on the next submit or skip_seqno call.
         while self._next_seqno in self._held:
             held_request, held_future = self._held.pop(self._next_seqno)
             self._execute_next(held_request, into=held_future)
@@ -263,6 +266,9 @@ class LwdTransferQueue:
 
     @staticmethod
     def _finalize_many(futures: list[LwdTransferFuture]) -> None:
+        # TODO(lwd): confirm whether a transfer that completed in ERROR should
+        # raise here: no caller holds send futures, so a failed send is
+        # finalized silently.
         for future in futures:
             future._finalize()
 
@@ -397,6 +403,10 @@ class LwdTransferQueue:
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
+        # TODO(lwd): confirm two points about this buffer: it is allocated on
+        # the channel stream but read on the compute stream, so whether the
+        # consumer must record_stream it before dropping it; and the bf16
+        # dtype for models whose hidden states are not bf16.
         buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
@@ -433,6 +443,8 @@ class LwdTransferQueue:
         # [Lwd][perf] temporary probe: checks that handle.wait() really
         # returns immediately on the CPU, as documented; a large dur means
         # posting the send/recv blocks the host (the lockstep criterion).
+        # log_analyze_tools/lwd_backlog_probe.py (mm branch) parses this line,
+        # including the LwdChannelType repr in ch=; keep the format.
         logger.info(
             "[Lwd][perf] bridge-wait op=%s ch=%s dur=%.2fms",
             self.op,
