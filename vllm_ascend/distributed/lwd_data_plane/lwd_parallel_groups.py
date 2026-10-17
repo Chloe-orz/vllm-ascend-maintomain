@@ -23,12 +23,12 @@ def lwd_mc2_group_ranks(lwd_config: LwdConfig) -> list[list[int]]:
         NotImplementedError: An Ascend feature that derives its groups from
             the uniform rank grid is enabled.
     """
-    _check_lwd_ascend_features()
+    _lwd_check_ascend_features()
     spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     return [list(group) for group in spec.tp_groups]
 
 
-def _check_lwd_ascend_features() -> None:
+def _lwd_check_ascend_features() -> None:
     ascend_config = get_ascend_config()
     finegrained = ascend_config.finegrained_tp_config
     unsupported = [

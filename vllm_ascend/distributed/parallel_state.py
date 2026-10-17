@@ -65,7 +65,7 @@ def init_ascend_model_parallel(
     # Upstream vLLM has no lwd_config; only LWD runs import the LWD modules.
     lwd_config = getattr(get_current_vllm_config(), "lwd_config", None)
     if lwd_config is not None:
-        _init_lwd_ascend_model_parallel(lwd_config, backend)
+        _lwd_init_ascend_model_parallel(lwd_config, backend)
         return
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
@@ -190,7 +190,7 @@ def init_ascend_model_parallel(
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
 
 
-def _init_lwd_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> None:
+def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> None:
     """Build the Ascend groups of the HCCL world shared by the LWD edge and cloud."""
     from vllm_ascend.distributed.lwd_data_plane.lwd_parallel_groups import lwd_mc2_group_ranks
 

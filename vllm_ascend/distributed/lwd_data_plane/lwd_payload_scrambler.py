@@ -48,21 +48,21 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps import weight at zero
     from torch import Tensor
 
 __all__ = [
-    "PayloadScrambler",
-    "get_payload_scrambler",
-    "is_payload_scrambler_initialized",
+    "LwdPayloadScrambler",
+    "lwd_get_payload_scrambler",
+    "lwd_payload_scrambler_initialized",
 ]
 
 # Domain separator: bump the version suffix on any factor-set / canonical-form
 # / order change.  A bump makes two peers running different versions derive
 # different seeds loudly instead of silently deriving the wrong one.
-_KDF_DOMAIN = b"vllm-ascend/payload-scramble/v3"
-_US = b"\x1f"  # unit separator between factor fields
-_SEED_PERSON = b"ec-scr01"
-_SEED_BYTES = 8  # seed width (64 bit)
-_MASK16 = 0xFFFF  # the operator only uses the low 16 bits of the seed
+_LWD_KDF_DOMAIN = b"vllm-ascend/payload-scramble/v3"
+_LWD_FIELD_SEPARATOR = b"\x1f"  # unit separator between factor fields
+_LWD_SEED_PERSON = b"ec-scr01"
+_LWD_SEED_BYTES = 8  # seed width (64 bit)
+_LWD_MASK16 = 0xFFFF  # the operator only uses the low 16 bits of the seed
 
-_FALLBACK_NONNEG_INT = -1
+_LWD_FALLBACK_NONNEG_INT = -1
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ _FALLBACK_NONNEG_INT = -1
 # ---------------------------------------------------------------------------
 
 
-def _canonical_str(v: str | None) -> str:
+def _lwd_canonical_str(v: str | None) -> str:
     """String factor: strip surrounding whitespace, keep everything else.
 
     The static factors usually come from a config or a mounted file, and a
@@ -85,7 +85,7 @@ def _canonical_str(v: str | None) -> str:
     return (v or "").strip()
 
 
-def _canonical_nonneg_int(v: int | None) -> int:
+def _lwd_canonical_nonneg_int(v: int | None) -> int:
     """Non-negative int factor (seqno / num_elements): invalid/negative -> -1.
 
     Degrading instead of raising is deliberate: both peers must map the same
@@ -96,8 +96,8 @@ def _canonical_nonneg_int(v: int | None) -> int:
     try:
         n = int(v)
     except (TypeError, ValueError, OverflowError):
-        return _FALLBACK_NONNEG_INT
-    return n if n >= 0 else _FALLBACK_NONNEG_INT
+        return _LWD_FALLBACK_NONNEG_INT
+    return n if n >= 0 else _LWD_FALLBACK_NONNEG_INT
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def _canonical_nonneg_int(v: int | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _derive_seed(
+def _lwd_derive_seed(
     *,
     device_id: str,
     custom_factor: str,
@@ -120,42 +120,42 @@ def _derive_seed(
     order is frozen and each field is ``\\x1f``-separated so contents cannot be
     mistaken for a field boundary; reordering is a breaking change on purpose.
     """
-    h = hashlib.blake2b(digest_size=_SEED_BYTES, person=_SEED_PERSON)
-    h.update(_KDF_DOMAIN)
+    h = hashlib.blake2b(digest_size=_LWD_SEED_BYTES, person=_LWD_SEED_PERSON)
+    h.update(_LWD_KDF_DOMAIN)
     for part in (
-        _canonical_str(device_id),
-        _canonical_str(custom_factor),
-        _canonical_str(channel),
-        str(_canonical_nonneg_int(seqno)),
-        str(_canonical_nonneg_int(num_elements)),
+        _lwd_canonical_str(device_id),
+        _lwd_canonical_str(custom_factor),
+        _lwd_canonical_str(channel),
+        str(_lwd_canonical_nonneg_int(seqno)),
+        str(_lwd_canonical_nonneg_int(num_elements)),
     ):
-        h.update(_US)
+        h.update(_LWD_FIELD_SEPARATOR)
         h.update(part.encode("utf-8"))
     return int.from_bytes(h.digest(), "big")
 
 
-def _require_torch() -> Any:
+def _lwd_require_torch() -> Any:
     """Import torch on first use so the seed method stays torch-free."""
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - torch is a hard dep in prod
         raise RuntimeError(
-            "PayloadScrambler: the operators need torch; seed_for does not and remains usable without it"
+            "LwdPayloadScrambler: the operators need torch; seed_for does not and remains usable without it"
         ) from exc
     return torch
 
 
-def _require_seed(seed: int) -> int:
+def _lwd_require_seed(seed: int) -> int:
     """Validate ``seed`` and return the 16-bit offset ``k``.
 
     ``bool`` is rejected explicitly: ``True`` would silently mean ``k=1``.
     """
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ValueError(f"scramble/descramble: seed must be an int, got {type(seed).__name__}")
-    return seed & _MASK16
+    return seed & _LWD_MASK16
 
 
-def _signed_k(k: int) -> int:
+def _lwd_signed_k(k: int) -> int:
     """Express the 16-bit offset as a value int16 can hold.
 
     The bit pattern is unchanged (two's complement) and ``bitwise_xor_``
@@ -165,7 +165,7 @@ def _signed_k(k: int) -> int:
     return k if k <= 0x7FFF else k - 0x10000
 
 
-def _xor_in_place(t: Tensor, k: int, torch: Any) -> None:
+def _lwd_xor_in_place(t: Tensor, k: int, torch: Any) -> None:
     """XOR ``k`` into every element of ``t``, in place.
 
     The transform XORs the raw 16-bit float bit patterns: per-bit independent,
@@ -179,10 +179,10 @@ def _xor_in_place(t: Tensor, k: int, torch: Any) -> None:
     untouched, which would break the in-place contract and the zero-extra-
     memory property.
     """
-    t.view(torch.int16).bitwise_xor_(_signed_k(k))
+    t.view(torch.int16).bitwise_xor_(_lwd_signed_k(k))
 
 
-def _require_scrambleable(t: Tensor, torch: Any) -> None:
+def _lwd_require_scrambleable(t: Tensor, torch: Any) -> None:
     """Reject anything that cannot take a 16-bit bit view."""
     if not isinstance(t, torch.Tensor):
         raise ValueError(f"scramble/descramble: expected a torch.Tensor, got {type(t).__name__}")
@@ -200,7 +200,7 @@ def _require_scrambleable(t: Tensor, torch: Any) -> None:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class PayloadScrambler:
+class LwdPayloadScrambler:
     """Scramble / descramble of one hidden-state matrix with one seed.
 
     The two deployment-time factors are bound once at construction (the caller
@@ -224,12 +224,12 @@ class PayloadScrambler:
     def __post_init__(self) -> None:
         # Canonicalise once, at construction, so a whitespace-only factor fails
         # here rather than silently producing a different seed than the peer.
-        object.__setattr__(self, "device_id", _canonical_str(self.device_id))
-        object.__setattr__(self, "custom_factor", _canonical_str(self.custom_factor))
+        object.__setattr__(self, "device_id", _lwd_canonical_str(self.device_id))
+        object.__setattr__(self, "custom_factor", _lwd_canonical_str(self.custom_factor))
         if not self.device_id:
-            raise ValueError("PayloadScrambler: device_id must not be empty")
+            raise ValueError("LwdPayloadScrambler: device_id must not be empty")
         if not self.custom_factor:
-            raise ValueError("PayloadScrambler: custom_factor must not be empty")
+            raise ValueError("LwdPayloadScrambler: custom_factor must not be empty")
 
     # ------------------------------------------------------------ derivation
     def seed_for(self, *, channel: str, seqno: int, num_elements: int) -> int:
@@ -247,7 +247,7 @@ class PayloadScrambler:
         Recomputing is cheap and deterministic: a pure function of the five
         factors.
         """
-        return _derive_seed(
+        return _lwd_derive_seed(
             device_id=self.device_id,
             custom_factor=self.custom_factor,
             channel=channel,
@@ -274,26 +274,26 @@ class PayloadScrambler:
         return self._apply(t, seed=seed)
 
     def _apply(self, t: Tensor, *, seed: int) -> Tensor:
-        torch = _require_torch()
-        k = _require_seed(seed)
-        _require_scrambleable(t, torch)
-        _xor_in_place(t, k, torch)
+        torch = _lwd_require_torch()
+        k = _lwd_require_seed(seed)
+        _lwd_require_scrambleable(t, torch)
+        _lwd_xor_in_place(t, k, torch)
         return t
 
     # ------------------------------------------------------------ logging
     def __repr__(self) -> str:
         """Report only whether each factor is set -- never the values."""
         return (
-            f"PayloadScrambler(device_id={'set' if self.device_id else 'unset'}, "
+            f"LwdPayloadScrambler(device_id={'set' if self.device_id else 'unset'}, "
             f"custom_factor={'set' if self.custom_factor else 'unset'})"
         )
 
 
-_PROCESS_SCRAMBLER: PayloadScrambler | None = None
+_LWD_PROCESS_SCRAMBLER: LwdPayloadScrambler | None = None
 
 
-def get_payload_scrambler(*, device_id: str | None = None, custom_factor: str | None = None) -> PayloadScrambler:
-    """Return the process-wide instance, mirroring ``get_comm_service()``.
+def lwd_get_payload_scrambler(*, device_id: str | None = None, custom_factor: str | None = None) -> LwdPayloadScrambler:
+    """Return the process-wide instance, mirroring ``lwd_get_data_plane()``.
 
     The worker builds it once at startup (place 1 in the design doc) with the
     two static factors; the send/recv funnels (places 3 and 4) fetch it with
@@ -304,24 +304,24 @@ def get_payload_scrambler(*, device_id: str | None = None, custom_factor: str | 
     factors fixed for the whole process.  Do not stash ``channel`` / ``seqno``
     here: they are per flight.
     """
-    global _PROCESS_SCRAMBLER
-    if _PROCESS_SCRAMBLER is None:
+    global _LWD_PROCESS_SCRAMBLER
+    if _LWD_PROCESS_SCRAMBLER is None:
         if device_id is None or custom_factor is None:
-            raise ValueError("get_payload_scrambler: the first call must pass both device_id and custom_factor")
-        _PROCESS_SCRAMBLER = PayloadScrambler(device_id=device_id, custom_factor=custom_factor)
+            raise ValueError("lwd_get_payload_scrambler: the first call must pass both device_id and custom_factor")
+        _LWD_PROCESS_SCRAMBLER = LwdPayloadScrambler(device_id=device_id, custom_factor=custom_factor)
     elif device_id is not None or custom_factor is not None:
-        candidate = PayloadScrambler(
-            device_id=(device_id if device_id is not None else _PROCESS_SCRAMBLER.device_id),
-            custom_factor=(custom_factor if custom_factor is not None else _PROCESS_SCRAMBLER.custom_factor),
+        candidate = LwdPayloadScrambler(
+            device_id=(device_id if device_id is not None else _LWD_PROCESS_SCRAMBLER.device_id),
+            custom_factor=(custom_factor if custom_factor is not None else _LWD_PROCESS_SCRAMBLER.custom_factor),
         )
-        if candidate != _PROCESS_SCRAMBLER:
+        if candidate != _LWD_PROCESS_SCRAMBLER:
             raise ValueError(
-                "get_payload_scrambler: already initialised with different "
+                "lwd_get_payload_scrambler: already initialised with different "
                 "factors; the process-wide instance is bound once"
             )
-    return _PROCESS_SCRAMBLER
+    return _LWD_PROCESS_SCRAMBLER
 
 
-def is_payload_scrambler_initialized() -> bool:
+def lwd_payload_scrambler_initialized() -> bool:
     """True once the process-wide instance has been built (scramble is on)."""
-    return _PROCESS_SCRAMBLER is not None
+    return _LWD_PROCESS_SCRAMBLER is not None

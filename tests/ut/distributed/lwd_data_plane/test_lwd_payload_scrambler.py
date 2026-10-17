@@ -34,7 +34,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from vllm_ascend.distributed.lwd_data_plane import payload_scramble as ps
+from vllm_ascend.distributed.lwd_data_plane import lwd_payload_scrambler as ps
 
 _FACTORS = {
     "device_id": "ECPAIR-SN-8A3F91",
@@ -48,7 +48,7 @@ _MODULE_PATH = Path(ps.__file__)
 
 
 def _scrambler(device_id=None, custom_factor=None):
-    return ps.PayloadScrambler(
+    return ps.LwdPayloadScrambler(
         device_id=_FACTORS["device_id"] if device_id is None else device_id,
         custom_factor=(_FACTORS["custom_factor"] if custom_factor is None else custom_factor),
     )
@@ -79,7 +79,7 @@ def test_seed_survives_hash_randomisation():
         "m = importlib.util.module_from_spec(spec)\n"
         "sys.modules['ps'] = m\n"
         "spec.loader.exec_module(m)\n"
-        "s = m.PayloadScrambler(device_id='ECPAIR-SN-8A3F91',"
+        "s = m.LwdPayloadScrambler(device_id='ECPAIR-SN-8A3F91',"
         "custom_factor='biz-2024-q3')\n"
         "print(s.seed_for(channel='lwd_up', seqno=7, num_elements=2048))\n"
     )
@@ -160,12 +160,12 @@ def test_whitespace_is_normalised():
     ],
 )
 def test_canonical_nonneg_int(raw, expected):
-    assert ps._canonical_nonneg_int(raw) == expected
+    assert ps._lwd_canonical_nonneg_int(raw) == expected
 
 
 @pytest.mark.parametrize(("raw", "expected"), [(None, ""), ("", ""), ("  a \n", "a")])
 def test_canonical_str(raw, expected):
-    assert ps._canonical_str(raw) == expected
+    assert ps._lwd_canonical_str(raw) == expected
 
 
 # --------------------------------------------------------------------------
@@ -238,12 +238,12 @@ def test_two_scrambles_need_two_descrambles():
 )
 def test_empty_static_factor_is_rejected(device_id, custom_factor):
     with pytest.raises(ValueError):
-        ps.PayloadScrambler(device_id=device_id, custom_factor=custom_factor)
+        ps.LwdPayloadScrambler(device_id=device_id, custom_factor=custom_factor)
 
 
 def test_static_factors_are_keyword_only():
     with pytest.raises(TypeError):
-        ps.PayloadScrambler("a", "b")
+        ps.LwdPayloadScrambler("a", "b")
 
 
 def test_dynamic_factors_and_seed_are_keyword_only():
@@ -312,7 +312,7 @@ def test_seed_for_works_without_torch():
         "m = importlib.util.module_from_spec(spec)\n"
         "sys.modules['ps'] = m\n"
         "spec.loader.exec_module(m)\n"
-        "s = m.PayloadScrambler(device_id='a', custom_factor='b')\n"
+        "s = m.LwdPayloadScrambler(device_id='a', custom_factor='b')\n"
         "print(s.seed_for(channel='lwd_up', seqno=1, num_elements=2))\n"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -328,11 +328,11 @@ def test_seed_for_works_without_torch():
 def test_public_surface_is_the_class_plus_the_process_factory():
     """One class with three methods, plus the process-wide accessor."""
     assert ps.__all__ == [
-        "PayloadScrambler",
-        "get_payload_scrambler",
-        "is_payload_scrambler_initialized",
+        "LwdPayloadScrambler",
+        "lwd_get_payload_scrambler",
+        "lwd_payload_scrambler_initialized",
     ]
-    public_methods = {name for name in dir(ps.PayloadScrambler) if not name.startswith("_")}
+    public_methods = {name for name in dir(ps.LwdPayloadScrambler) if not name.startswith("_")}
     assert {"seed_for", "scramble", "descramble"} <= public_methods
     operators = {name for name in public_methods if "scramble" in name}
     assert operators == {"scramble", "descramble"}

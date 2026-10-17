@@ -1,8 +1,8 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LwdCommService: singleton entry point of the duplex comm layer.
+"""LwdDataPlane: singleton entry point of the LWD data plane.
 
 Compute side only ever calls ``submit_send`` / ``submit_recv`` and
-consumes ``LwdCommFuture`` notifications.  ``poll_completions`` is meant
+consumes ``LwdTransferFuture`` notifications.  ``poll_completions`` is meant
 to be invoked from an existing host loop head (worker busy loop);
 it drives keepalive reclamation via lazy reap.
 
@@ -15,19 +15,19 @@ import threading
 
 from vllm.logger import logger
 
-from vllm_ascend.distributed.lwd_data_plane.channel import LwdChannel
-from vllm_ascend.distributed.lwd_data_plane.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
+from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransferQueue
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
-class LwdCommService:
+class LwdDataPlane:
     """Process-wide singleton.  All public methods are thread-safe."""
 
-    _instance: LwdCommService | None = None
+    _instance: LwdDataPlane | None = None
     _instance_lock = threading.Lock()
 
     @classmethod
-    def instance(cls) -> LwdCommService:
+    def instance(cls) -> LwdDataPlane:
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = cls()
@@ -39,7 +39,7 @@ class LwdCommService:
         # match the other side's recv-post order), so the FIFO key is
         # (channel, op) — merging them would make a process's sends and
         # recvs on one channel collide on a shared seqno counter.
-        self._channels: dict[tuple[LwdChannelType, str], LwdChannel] = {}
+        self._queues: dict[tuple[LwdChannelType, str], LwdTransferQueue] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
 
@@ -47,11 +47,11 @@ class LwdCommService:
     # Submission                                                          #
     # ------------------------------------------------------------------ #
 
-    def submit_send(self, request: LwdCommRequest) -> LwdCommFuture:
+    def submit_send(self, request: LwdTransferRequest) -> LwdTransferFuture:
         assert request.op == "send", "submit_send requires op='send'"
         return self._submit(request)
 
-    def submit_recv(self, request: LwdCommRequest) -> LwdCommFuture:
+    def submit_recv(self, request: LwdTransferRequest) -> LwdTransferFuture:
         """Submit a recv.  The irecv is posted immediately — "early" is a
         property of when you submit, not a separate API."""
         assert request.op == "recv", "submit_recv requires op='recv'"
@@ -66,10 +66,10 @@ class LwdCommService:
         costs one head-of-line ``event.query()`` per channel with
         pending traffic."""
         with self._lock:
-            channels = list(self._channels.values())
+            queues = list(self._queues.values())
         completed = 0
-        for channel in channels:
-            completed += len(channel.reap())
+        for queue in queues:
+            completed += len(queue.reap())
         return completed
 
     def skip_seqno(self, channel_type: LwdChannelType, seqno: int, op: str = "recv") -> None:
@@ -78,9 +78,9 @@ class LwdCommService:
         op="recv"; the sender-side abort glue passes op="send".  Both
         peers must skip the same seqnos."""
         with self._lock:
-            channel = self._channels.get((channel_type, op))
-        if channel is not None:
-            channel.skip_seqno(seqno)
+            queue = self._queues.get((channel_type, op))
+        if queue is not None:
+            queue.skip_seqno(seqno)
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
@@ -91,13 +91,13 @@ class LwdCommService:
             if self._shutting_down:
                 return
             self._shutting_down = True
-            channels = list(self._channels.values())
+            queues = list(self._queues.values())
         try:
-            for channel in channels:
-                channel.shutdown(timeout=timeout)
+            for queue in queues:
+                queue.shutdown(timeout=timeout)
         finally:
             with self._lock:
-                self._channels.clear()
+                self._queues.clear()
                 self._shutting_down = False
         logger.info("[lwd-comm] service shut down")
 
@@ -105,17 +105,17 @@ class LwdCommService:
     # Internal                                                            #
     # ------------------------------------------------------------------ #
 
-    def _submit(self, request: LwdCommRequest) -> LwdCommFuture:
+    def _submit(self, request: LwdTransferRequest) -> LwdTransferFuture:
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("lwd-comm service is shutting down")
             key = (request.channel, request.op)
-            channel = self._channels.get(key)
-            if channel is None:
-                channel = LwdChannel(request.channel, request.op)
-                self._channels[key] = channel
-        return channel.submit(request)
+            queue = self._queues.get(key)
+            if queue is None:
+                queue = LwdTransferQueue(request.channel, request.op)
+                self._queues[key] = queue
+        return queue.submit(request)
 
 
-def get_lwd_comm_service() -> LwdCommService:
-    return LwdCommService.instance()
+def lwd_get_data_plane() -> LwdDataPlane:
+    return LwdDataPlane.instance()

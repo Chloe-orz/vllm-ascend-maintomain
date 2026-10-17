@@ -1,11 +1,11 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Duplex data-plane wire layer of the LWD edge-cloud world.
+"""UP and DOWN channels of the LWD edge-cloud data plane.
 
 Owns the two physical channels (UP edge->cloud, DOWN cloud->edge):
   * channel HCCL communicators: two dedicated ``new_group`` groups per DP
     connection, over its endpoint pair (``LwdChannelEndpoints``: the first
     edge rank and the first cloud rank);
-  * one NPU stream per channel (wire ops are bridged onto it, keeping
+  * one NPU stream per channel (channel ops are bridged onto it, keeping
     the compute stream free);
   * init-time warmup of both channels in both directions in a fixed
     global order (moves the first-use HCCL rendezvous out of the
@@ -24,7 +24,7 @@ from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
-from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 _LWD_WARMUP_NUM_ELEMENTS = 8
 
@@ -32,10 +32,10 @@ _LWD_WARMUP_NUM_ELEMENTS = 8
 _LWD_CHANNEL_GROUPS: dict[LwdChannelType, tuple[dist.ProcessGroup, int]] = {}
 _LWD_CHANNEL_STREAMS: dict[LwdChannelType, torch.npu.Stream] = {}
 _LWD_ENDPOINTS: LwdChannelEndpoints | None = None
-_INITIALIZED = False
+_LWD_CHANNELS_INITIALIZED = False
 
 
-def init_lwd_duplex_channels() -> None:
+def lwd_init_channels() -> None:
     """Create the UP and DOWN channels of every DP connection. Idempotent.
 
     Called once by every worker of the shared world after its distributed
@@ -43,8 +43,8 @@ def init_lwd_duplex_channels() -> None:
     creates the groups of every connection in the order of
     ``LwdParallelGroupsSpec``; only the two endpoint ranks keep them.
     """
-    global _INITIALIZED, _LWD_ENDPOINTS
-    if _INITIALIZED:
+    global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
+    if _LWD_CHANNELS_INITIALIZED:
         return
     lwd_config = get_current_vllm_config().lwd_config
     assert lwd_config is not None, "the data plane requires lwd_config"
@@ -68,7 +68,7 @@ def init_lwd_duplex_channels() -> None:
     # device_group, whose creation order the framework guarantees. The
     # broadcast is issued on the compute stream at injection time, FIFO with
     # the forward TP collectives, so the two cannot interleave.
-    _INITIALIZED = True
+    _LWD_CHANNELS_INITIALIZED = True
     logger.info(
         "[LWD] data-plane channels created for %s (my_rank=%d, endpoints=%s)",
         spec.channel_endpoints,
@@ -78,10 +78,10 @@ def init_lwd_duplex_channels() -> None:
     # Exactly two channels, always warmed up: the first-use HCCL
     # rendezvous is moved to init time, where both sides are guaranteed
     # to arrive in the same fixed order.
-    warmup_lwd_duplex_channels()
+    lwd_warm_up_channels()
 
 
-def warmup_lwd_duplex_channels() -> None:
+def lwd_warm_up_channels() -> None:
     """Pre-establish both channels' P2P links at init time.
 
     A tiny payload is exchanged on each channel in a fixed global order
@@ -105,7 +105,7 @@ def warmup_lwd_duplex_channels() -> None:
 
 
 def lwd_channels_initialized() -> bool:
-    return _INITIALIZED
+    return _LWD_CHANNELS_INITIALIZED
 
 
 def _lwd_channel(channel: LwdChannelType) -> tuple[dist.ProcessGroup, int]:
@@ -118,24 +118,24 @@ def _lwd_channel(channel: LwdChannelType) -> tuple[dist.ProcessGroup, int]:
         ) from None
 
 
-def get_lwd_channel_device_group(channel: LwdChannelType) -> dist.ProcessGroup:
+def lwd_get_channel_device_group(channel: LwdChannelType) -> dist.ProcessGroup:
     group, _ = _lwd_channel(channel)
     return group
 
 
-def get_lwd_channel_peer(channel: LwdChannelType) -> int:
+def lwd_get_channel_peer(channel: LwdChannelType) -> int:
     """Global rank of this process's P2P peer on the channel."""
     _, peer = _lwd_channel(channel)
     return peer
 
 
-def get_lwd_channel_stream(channel: LwdChannelType) -> torch.npu.Stream:
+def lwd_get_channel_stream(channel: LwdChannelType) -> torch.npu.Stream:
     _lwd_channel(channel)
     return _LWD_CHANNEL_STREAMS[channel]
 
 
-def destroy_lwd_duplex_channels() -> None:
-    global _INITIALIZED, _LWD_ENDPOINTS
+def lwd_destroy_channels() -> None:
+    global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
     for channel, (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
         try:
             dist.destroy_process_group(group)
@@ -144,4 +144,4 @@ def destroy_lwd_duplex_channels() -> None:
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
     _LWD_ENDPOINTS = None
-    _INITIALIZED = False
+    _LWD_CHANNELS_INITIALIZED = False

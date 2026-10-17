@@ -1,8 +1,8 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LwdChannel: one strict FIFO per physical (direction, peer) wire.
+"""LwdTransferQueue: one strict FIFO of transfers per channel and op.
 
 Simplified port of the demo branch's ``lwd_comm/channel.py`` for
-the prefill_only duplex data plane (two direction-only channels,
+the prefill_only data plane (two direction-only channels,
 single-tensor payloads).
 
 Mechanics preserved from the demo:
@@ -12,7 +12,7 @@ Mechanics preserved from the demo:
   * per-channel seqno reorder buffer: ops are posted to HCCL only once
     all lower seqnos have been submitted, so the send order and the
     peer's recv-post order always agree (HCCL P2P has no tags);
-  * every wire op is bridged onto the channel stream via
+  * every channel op is bridged onto the channel stream via
     ``handle.wait()`` (non-blocking HCCL semantics) followed by an event
     record; the next op waits for the predecessor's event.
 """
@@ -29,46 +29,46 @@ import torch
 import torch.distributed as dist
 from vllm.logger import logger
 
-from vllm_ascend.distributed.lwd_data_plane import lwd_wire
-from vllm_ascend.distributed.lwd_data_plane.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_data_plane.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.distributed.lwd_data_plane import lwd_channels
+from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
-def _scramble_seed_for(request: LwdCommRequest) -> int | None:
+def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
     """Derive the per-flight seed from the request's own fields, or None.
 
     The seed's three inputs (channel / seqno / num_elements) already live on
-    the request, so the comm layer derives it here instead of having the
+    the request, so the data plane derives it here instead of having the
     worker pre-compute and duplicate them.  Returns None when scramble is off
     (no process-wide scrambler has been built).
     """
-    from vllm_ascend.distributed.lwd_data_plane.payload_scramble import (
-        get_payload_scrambler,
-        is_payload_scrambler_initialized,
+    from vllm_ascend.distributed.lwd_data_plane.lwd_payload_scrambler import (
+        lwd_get_payload_scrambler,
+        lwd_payload_scrambler_initialized,
     )
 
-    if not is_payload_scrambler_initialized():
+    if not lwd_payload_scrambler_initialized():
         return None
-    return get_payload_scrambler().seed_for(
+    return lwd_get_payload_scrambler().seed_for(
         channel=request.channel.value,
         seqno=request.seqno,
         num_elements=request.num_elements,
     )
 
 
-class LwdChannel:
-    """One FIFO of pending requests for a physical channel/peer wire."""
+class LwdTransferQueue:
+    """One FIFO of pending requests for one channel and op."""
 
     def __init__(self, channel_type: LwdChannelType, op: str) -> None:
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
-        self._pending: deque[LwdCommFuture] = deque()
+        self._pending: deque[LwdTransferFuture] = deque()
         self._lock = threading.Lock()
         # The pending-queue lock alone cannot prevent two host threads
         # from interleaving HCCL calls of separate requests.
         self._submission_lock = threading.Lock()
         self._next_seqno: int | None = None
-        self._held: dict[int, tuple[LwdCommRequest, LwdCommFuture]] = {}
+        self._held: dict[int, tuple[LwdTransferRequest, LwdTransferFuture]] = {}
         # Abort holes: seqnos the peer will never submit (aborted
         # requests).  Skipped when advancing so one abort cannot wedge
         # every later request on this channel.
@@ -111,8 +111,8 @@ class LwdChannel:
     # Submission                                                          #
     # ------------------------------------------------------------------ #
 
-    def submit(self, request: LwdCommRequest) -> LwdCommFuture:
-        """Execute the wire op and enqueue the future."""
+    def submit(self, request: LwdTransferRequest) -> LwdTransferFuture:
+        """Execute the channel op and enqueue the future."""
         if request.op != self.op:
             raise RuntimeError(
                 f"op mismatch on {self.channel_type.value} FIFO: channel carries {self.op!r}, got {request.op!r}"
@@ -127,19 +127,19 @@ class LwdChannel:
             return self._execute_next(request)
 
     @staticmethod
-    def _snapshot_send(request: LwdCommRequest) -> LwdCommRequest:
-        """Give the comm layer ownership of the send payload."""
+    def _snapshot_send(request: LwdTransferRequest) -> LwdTransferRequest:
+        """Give the data plane ownership of the send payload."""
         assert request.tensor is not None, "send requires tensor"
         owned = request.tensor.detach().clone()
-        seed = _scramble_seed_for(request)
+        seed = _lwd_scramble_seed_for(request)
         if seed is not None:
             # Scramble the communication-owned snapshot (never the model
             # tensor the caller still owns).
-            from vllm_ascend.distributed.lwd_data_plane.payload_scramble import (
-                get_payload_scrambler,
+            from vllm_ascend.distributed.lwd_data_plane.lwd_payload_scrambler import (
+                lwd_get_payload_scrambler,
             )
 
-            get_payload_scrambler().scramble(owned, seed=seed)
+            lwd_get_payload_scrambler().scramble(owned, seed=seed)
         aux_owned = request.aux_tensor.detach().clone() if request.aux_tensor is not None else None
         return replace(request, tensor=owned, aux_tensor=aux_owned)
 
@@ -147,7 +147,7 @@ class LwdChannel:
     # Sequenced submission (reorder buffer)                               #
     # ------------------------------------------------------------------ #
 
-    def _submit_sequenced(self, request: LwdCommRequest) -> LwdCommFuture:
+    def _submit_sequenced(self, request: LwdTransferRequest) -> LwdTransferFuture:
         """Post in per-channel seqno order.  Caller holds the submission
         lock."""
         seqno = request.seqno
@@ -168,7 +168,7 @@ class LwdChannel:
                 self.op,
                 self._next_seqno,
             )
-            future = LwdCommFuture(request, [], None)
+            future = LwdTransferFuture(request, [], None)
             future._finalize(
                 error=RuntimeError(f"seqno {seqno} was skipped (aborted) on channel {self.channel_type.value}")
             )
@@ -179,7 +179,7 @@ class LwdChannel:
                 # the existing deferred future instead of overwriting it
                 # (its waiter would otherwise spin until timeout).
                 return self._held[seqno][1]
-            future = LwdCommFuture.deferred(request)
+            future = LwdTransferFuture.deferred(request)
             self._held[seqno] = (request, future)
             logger.debug(
                 "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
@@ -199,10 +199,10 @@ class LwdChannel:
 
     def _execute_next(
         self,
-        request: LwdCommRequest,
-        into: LwdCommFuture | None = None,
-    ) -> LwdCommFuture:
-        """Execute one wire op as the channel's new tail."""
+        request: LwdTransferRequest,
+        into: LwdTransferFuture | None = None,
+    ) -> LwdTransferFuture:
+        """Execute one channel op as the channel's new tail."""
         with self._lock:
             predecessor = self._pending[-1] if self._pending else None
         future = self._execute(request, predecessor, into=into)
@@ -214,7 +214,7 @@ class LwdChannel:
     # Reaping (head-of-line query)                                        #
     # ------------------------------------------------------------------ #
 
-    def reap(self) -> list[LwdCommFuture]:
+    def reap(self) -> list[LwdTransferFuture]:
         """Pop and finalize every completed request from the head.
 
         FIFO completion is in-order: if the head is not done, nothing
@@ -225,7 +225,7 @@ class LwdChannel:
         self._finalize_many(finalized)
         return finalized
 
-    def shutdown(self, timeout: float | None = None) -> list[LwdCommFuture]:
+    def shutdown(self, timeout: float | None = None) -> list[LwdTransferFuture]:
         """Wait for pending operations before releasing owned buffers."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._submission_lock:
@@ -254,29 +254,29 @@ class LwdChannel:
             self._finalize_many(finalized)
             return finalized
 
-    def _reap(self) -> list[LwdCommFuture]:
-        done: list[LwdCommFuture] = []
+    def _reap(self) -> list[LwdTransferFuture]:
+        done: list[LwdTransferFuture] = []
         with self._lock:
             while self._pending and self._pending[0].done():
                 done.append(self._pending.popleft())
         return done
 
     @staticmethod
-    def _finalize_many(futures: list[LwdCommFuture]) -> None:
+    def _finalize_many(futures: list[LwdTransferFuture]) -> None:
         for future in futures:
             future._finalize()
 
     # ------------------------------------------------------------------ #
-    # Wire execution                                                      #
+    # Channel ops                                                         #
     # ------------------------------------------------------------------ #
 
     def _execute(
         self,
-        req: LwdCommRequest,
-        predecessor: LwdCommFuture | None,
-        into: LwdCommFuture | None = None,
-    ) -> LwdCommFuture:
-        """Issue the wire op, bridge it onto the channel stream, record
+        req: LwdTransferRequest,
+        predecessor: LwdTransferFuture | None,
+        into: LwdTransferFuture | None = None,
+    ) -> LwdTransferFuture:
+        """Issue the channel op, bridge it onto the channel stream, record
         the completion event."""
         tensor: torch.Tensor | None = None
         aux_tensor: torch.Tensor | None = None
@@ -287,7 +287,7 @@ class LwdChannel:
         # the channel stream, so waiting on it there would be a no-op
         # self-wait and the send could read a half-written snapshot.
         producer_stream = torch.npu.current_stream()
-        # The wire op MUST be issued on the channel stream: seqno
+        # The channel op MUST be issued on the channel stream: seqno
         # ordering only holds if every op on this FIFO lands on the same
         # device stream (HCCL P2P has no tags; matching order = device
         # arrival order, not host submission order).
@@ -298,29 +298,29 @@ class LwdChannel:
                 # The snapshot was produced on the producer stream; order
                 # the channel stream after it.
                 stream.wait_stream(producer_stream)
-                handles = self._wire_send(req)
+                handles = self._post_send(req)
                 keepalive = (req.tensor, req.aux_tensor)
             else:
-                tensor, aux_tensor, handles = self._wire_recv(req)
+                tensor, aux_tensor, handles = self._post_recv(req)
             done_event = self._bridge_and_record(handles)
-            seed = _scramble_seed_for(req) if req.op == "recv" else None
+            seed = _lwd_scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
                 # payload is already complete here; XOR is its own inverse,
                 # so applying it in place undoes the sender's scramble.  The
                 # completion event is re-recorded AFTER the descramble so the
                 # consumer's wait() cannot observe the tensor mid-scramble.
-                from vllm_ascend.distributed.lwd_data_plane.payload_scramble import (
-                    get_payload_scrambler,
+                from vllm_ascend.distributed.lwd_data_plane.lwd_payload_scrambler import (
+                    lwd_get_payload_scrambler,
                 )
 
                 assert tensor is not None, "recv requires tensor"
-                get_payload_scrambler().descramble(tensor, seed=seed)
+                lwd_get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
-            return LwdCommFuture(
+            return LwdTransferFuture(
                 request=future_request,
                 handles=handles,
                 done_event=done_event,
@@ -338,20 +338,20 @@ class LwdChannel:
         return into
 
     def _stream(self):
-        return lwd_wire.get_lwd_channel_stream(self.channel_type)
+        return lwd_channels.lwd_get_channel_stream(self.channel_type)
 
-    def _order_after(self, predecessor: LwdCommFuture | None) -> None:
+    def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
             return
         event = predecessor._done_event
         if event is not None:
             self._stream().wait_event(event)
 
-    def _wire_send(self, req: LwdCommRequest) -> list[Any]:
-        group = lwd_wire.get_lwd_channel_device_group(self.channel_type)
-        peer = req.src_dst
+    def _post_send(self, req: LwdTransferRequest) -> list[Any]:
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type)
+        peer = req.peer_rank
         if peer is None:
-            peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type)
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
@@ -366,7 +366,7 @@ class LwdChannel:
         # UP (edge -> cloud) takes two hops: this channel carries only the
         # edge -> cloud endpoint P2P, so it waits for the endpoint alone
         # instead of every cloud TP rank; the cloud endpoint then broadcasts
-        # within the cloud TP group (see _wire_recv). DOWN (cloud leader ->
+        # within the cloud TP group (see _post_recv). DOWN (cloud leader ->
         # edge) is a single P2P.
         # The aux frame (mrope positions) is a second P2P op right after the
         # main one under the same seqno, so skip/drain semantics are
@@ -381,11 +381,11 @@ class LwdChannel:
             raise RuntimeError("aux payload is only supported on the UP channel")
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
-    def _wire_recv(self, req: LwdCommRequest):
-        group = lwd_wire.get_lwd_channel_device_group(self.channel_type)
-        peer = req.src_dst
+    def _post_recv(self, req: LwdTransferRequest):
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type)
+        peer = req.peer_rank
         if peer is None:
-            peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type)
         logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
             self.channel_type,

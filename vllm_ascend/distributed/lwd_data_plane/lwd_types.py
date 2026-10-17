@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Type definitions for the prefill_only duplex comm package."""
+"""Type definitions of the LWD data plane."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ class LwdChannelType(enum.Enum):
     """The two physical data-plane channels, direction-only.
 
     Each channel maps 1:1 to a dedicated HCCL communicator + NPU stream
-    (see ``vllm_ascend.distributed.lwd_data_plane.lwd_wire``).  HCCL P2P matching order
+    (see ``vllm_ascend.distributed.lwd_data_plane.lwd_channels``).  HCCL P2P matching order
     per (communicator, peer) is exactly the per-channel ``seqno``
     submission order — HCCL does not support tags.
     """
@@ -21,17 +21,17 @@ class LwdChannelType(enum.Enum):
     DOWN = "lwd_down"  # cloud -> edge: combined c2e packet
 
 
-class LwdCommStatus(enum.Enum):
+class LwdTransferStatus(enum.Enum):
     PENDING = "pending"
     OK = "ok"
     ERROR = "error"
 
 
 @dataclass
-class LwdCommRequest:
+class LwdTransferRequest:
     """One communication task submitted to the service.
 
-    Everything the comm layer needs travels with the request — it never
+    Everything the data plane needs travels with the request — it never
     reaches back into scheduler/model state.
     """
 
@@ -53,7 +53,7 @@ class LwdCommRequest:
     # channel.
     seqno: int | None = None
     # Explicit global peer rank; None -> the channel's configured peer.
-    src_dst: int | None = None
+    peer_rank: int | None = None
     # Optional second payload of the SAME logical request (currently
     # UP-only: mrope positions, int64 [n,3], accompanying an embeds chunk
     # when the batch has mm data).  Physically a second P2P issued right
@@ -78,10 +78,10 @@ class LwdCommRequest:
 
 
 @dataclass
-class LwdCommResult:
+class LwdTransferResult:
     """Outcome of a completed request (cross-node P2P finished on device)."""
 
-    status: LwdCommStatus
+    status: LwdTransferStatus
     tensor: Any | None = None
     error: BaseException | None = None
     # Received aux payload (mrope positions int64), None when the
