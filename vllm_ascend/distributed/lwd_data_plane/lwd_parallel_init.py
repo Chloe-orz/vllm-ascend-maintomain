@@ -1,14 +1,15 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
-"""Lwd 边云模式的 ascend 侧并行组初始化。
+"""Ascend-side parallel groups of the LWD edge-cloud mode.
 
-原生 ``init_ascend_model_parallel`` 按 (dp, pp, pcp, tp) 均匀网格切分
-全局 rank,表达不了"边 edge_npu_count + 云 cloud_npu_count"的非对称
-拓扑。本模块按 Lwd 布局构建 ascend 侧依赖的通信组(MC2 等)并注入
-``vllm_ascend.distributed.parallel_state``,由 LwdCloudWorker /
-LwdEdgeWorker 覆写的 ``_init_worker_distributed_environment`` 调用,
-替代原生入口。
+The native ``init_ascend_model_parallel`` slices the global ranks on a
+uniform (dp, pp, pcp, tp) grid, which cannot express the asymmetric
+"edge_npu_count edge + cloud_npu_count cloud" topology. This module builds
+the Ascend-side groups (MC2 and the like) from the LWD layout and injects
+them into ``vllm_ascend.distributed.parallel_state``. The
+``_init_worker_distributed_environment`` overrides of LwdCloudWorker /
+LwdEdgeWorker call it in place of the native entry.
 """
 
 import torch
@@ -26,10 +27,11 @@ logger = init_logger(__name__)
 
 
 def init_lwd_ascend_model_parallel(parallel_config) -> None:
-    """按 Lwd 布局构建 ascend 侧通信组。
+    """Build the Ascend-side groups from the LWD layout.
 
-    对齐原生 ``init_ascend_model_parallel`` 的无特性开启路径:仅 MC2,
-    及与其同分组的 dynamic_eplb / multistream_overlap_gate 变体。
+    Mirrors the native ``init_ascend_model_parallel`` with no optional
+    feature enabled: MC2 only, plus the dynamic_eplb /
+    multistream_overlap_gate variants that share its groups.
     """
     if ascend_parallel_state.model_parallel_initialized():
         return
@@ -74,8 +76,9 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
             group_name="fc3_quant_x",
         )
 
-    # 以下特性依赖均匀网格推导的通信组,尚未适配 Lwd 非对称布局;
-    # 开启时显式失败,避免缺组问题拖到运行期才暴露。
+    # The features below rely on groups derived from the uniform grid and are
+    # not adapted to the asymmetric LWD layout yet; fail at startup instead
+    # of surfacing a missing group at runtime.
     finegrained = ascend_config.finegrained_tp_config
     enabled_finegrained = [
         name

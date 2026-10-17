@@ -364,12 +364,15 @@ class LwdChannel:
             tensor.dtype,
             "world_broadcast(src=0)" if self.channel_type == LwdChannelType.UP else "isend",
         )
-        # UP(边→云)两层通信:第一段边→云端点 P2P(只等端点 join,
-        # 不再被 8 卡 join 拖住);第二段端点在云 TP 组内 broadcast
-        # (见 _wire_recv)。DOWN(云 leader→边)保持点对点。
-        # aux 帧(mrope positions)为紧跟主帧的第二条 P2P op——同
-        # seqno 管两帧,skip/drain 语义不变;第二段(云 TP 组内广播)
-        # 由云 runner 在消费时刻对 aux 同样补发(见 lwd_cloud_model_runner)。
+        # UP (edge -> cloud) takes two hops: this channel carries only the
+        # edge -> cloud endpoint P2P, so it waits for the endpoint alone
+        # instead of every cloud TP rank; the cloud endpoint then broadcasts
+        # within the cloud TP group (see _wire_recv). DOWN (cloud leader ->
+        # edge) is a single P2P.
+        # The aux frame (mrope positions) is a second P2P op right after the
+        # main one under the same seqno, so skip/drain semantics are
+        # unchanged; the cloud runner broadcasts it within the cloud TP group
+        # at consume time as well (see lwd_cloud_model_runner).
         if self.channel_type == LwdChannelType.UP:
             handles = [dist.isend(tensor.contiguous(), dst=peer, group=group)]
             if req.aux_tensor is not None:
@@ -399,8 +402,9 @@ class LwdChannel:
         buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
-            # aux 帧尺寸 = num_tokens*3(mrope positions);dtype 取
-            # 请求的 aux_dtype(缺省 int64),与发送端严格同 numel。
+            # aux frame size = num_tokens * 3 (mrope positions); the dtype is
+            # the request's aux_dtype (int64 by default), and the numel must
+            # match the sender's exactly.
             aux_buffer = torch.empty(
                 req.aux_num_elements,
                 dtype=req.aux_dtype or torch.int64,
@@ -428,8 +432,9 @@ class LwdChannel:
         _t = time.monotonic()
         for handle in handles:
             handle.wait()
-        # [Lwd][perf] 临时探针:测 handle.wait() 是否真如注释所述"CPU 立即
-        # 返回"——dur 大 = 发送/接收 posting 阻塞主机(锁定步判定依据)
+        # [Lwd][perf] temporary probe: checks that handle.wait() really
+        # returns immediately on the CPU, as documented; a large dur means
+        # posting the send/recv blocks the host (the lockstep criterion).
         logger.info(
             "[Lwd][perf] bridge-wait op=%s ch=%s dur=%.2fms",
             self.op,

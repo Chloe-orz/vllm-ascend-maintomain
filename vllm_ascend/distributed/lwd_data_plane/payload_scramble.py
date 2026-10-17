@@ -220,7 +220,7 @@ class PayloadScrambler:
     #: startup logs or version control.
     custom_factor: str
 
-    # ---------------------------------------------------------------- 构造
+    # ---------------------------------------------------------------- construction
     def __post_init__(self) -> None:
         # Canonicalise once, at construction, so a whitespace-only factor fails
         # here rather than silently producing a different seed than the peer.
@@ -231,7 +231,7 @@ class PayloadScrambler:
         if not self.custom_factor:
             raise ValueError("PayloadScrambler: custom_factor must not be empty")
 
-    # ------------------------------------------------------------ 派生
+    # ------------------------------------------------------------ derivation
     def seed_for(self, *, channel: str, seqno: int, num_elements: int) -> int:
         """Derive the 64-bit seed of one flight.
 
@@ -255,7 +255,7 @@ class PayloadScrambler:
             num_elements=num_elements,
         )
 
-    # ------------------------------------------------------------ 算子
+    # ------------------------------------------------------------ operators
     def scramble(self, t: Tensor, *, seed: int) -> Tensor:
         """Scramble one matrix in place; returns ``t``.
 
@@ -280,7 +280,7 @@ class PayloadScrambler:
         _xor_in_place(t, k, torch)
         return t
 
-    # ------------------------------------------------------------ 日志
+    # ------------------------------------------------------------ logging
     def __repr__(self) -> str:
         """Report only whether each factor is set -- never the values."""
         return (

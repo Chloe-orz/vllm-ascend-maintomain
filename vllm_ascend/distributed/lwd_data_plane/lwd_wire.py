@@ -75,10 +75,12 @@ def init_lwd_duplex_channels() -> None:
         _LWD_CHANNEL_GROUPS[channel] = (group, peer)
         _LWD_CHANNEL_STREAMS[channel] = torch.npu.Stream()
     _LWD_ENDPOINTS = (edge_rank, cloud_rank)
-    # embeds 组内广播不再自建通信域(自建 new_group 在 torch_npu 下实测
-    # 零交付,疑建组顺序错位),改用框架 TP device_group(demo 同款,
-    # 建组顺序由框架保证);广播在注入时刻于计算流上发起,与前向 TP
-    # 集合同流 FIFO,天然不串台。
+    # The cloud-internal embeds broadcast does not build its own group: a
+    # dedicated new_group delivered nothing under torch_npu in testing
+    # (suspected group creation order mismatch), so it uses the framework TP
+    # device_group, whose creation order the framework guarantees. The
+    # broadcast is issued on the compute stream at injection time, FIFO with
+    # the forward TP collectives, so the two cannot interleave.
     _INITIALIZED = True
     logger.info(
         "[lwd-wire] duplex channels created over ranks=%s (my_rank=%d)",
