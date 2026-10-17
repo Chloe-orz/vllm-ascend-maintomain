@@ -368,6 +368,17 @@ ai维护?
 
 ---
 
+## LWD CI
+
+- CI 检查与 workflow 集中在 [`vllm-data-comm/ci-infra`](https://github.com/vllm-data-comm/ci-infra)（设计文档 `docs/design/lwd_ci.md`），本仓只放调用文件；改检查规则去 ci-infra 提 PR，两个仓同时生效
+- 每项检查两个属性：快线/慢线 × 必须通过/纯粹检查。纯粹检查（入参数、函数长度、类名前缀、新文件路径、patch 使用、RFC 关联、bugfix 无测试）只写进 PR 的 checklist 评论，不卡合入，由 committer 评审时判断
+- 本仓本轮只接快线（不跑单测）；后续要接慢线时加 `lwd_slow.yml` 调用文件即可
+- `no-test` 标签只放行慢线
+- 每次 merge 上游后，重跑 `ci-infra` 仓的 `scripts/disable_inherited_workflows.sh vllm-data-comm/<repo>`，停用上游新带来的 workflow
+- 本地跑检查：clone ci-infra 后 `uv run python -m lwd_checks.<module> --help`
+
+---
+
 ## vllm-ascend 开发工作流
 
 > 本节按本仓语境由上游 vllm-ascend 的 AGENTS.md 裁剪而来; merge 上游时注意核对上游变化, 勿直接用上游原文覆盖本节.
