@@ -31,13 +31,13 @@ class LwdEdgeWorker(LwdWorkerBase):
 
     def init_device(self) -> None:
         # comm_service and group setup belong to the base init_device; see
-        # LwdWorkerBase._init_lwd_duplex_channels。
+        # LwdWorkerBase._init_lwd_data_plane。
         super().init_device()
         # Swap in the edge runner (same pattern as the cloud side): embed/unembed compute lives in the runner.
         self.model_runner = LwdEdgeModelRunner(
             self.vllm_config, self.device, worker=self,
         )
-        self._init_lwd_duplex_channels()
+        self._init_lwd_data_plane()
         lwd_logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",

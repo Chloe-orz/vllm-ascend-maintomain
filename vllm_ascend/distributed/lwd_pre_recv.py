@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING
 
 from vllm.lwd_logger import lwd_logger
 
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue

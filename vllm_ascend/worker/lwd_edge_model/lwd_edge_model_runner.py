@@ -20,7 +20,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
@@ -177,7 +177,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # (wire_version>=2); the data plane sends only the main embeds
         # frame. The aux frame mechanism stays in the channel layer for
         # deepstack and other future payloads; mrope no longer uses it.
-        request = LwdCommRequest(
+        request = LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
@@ -209,7 +209,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
         _t0 = time.monotonic()
         recv_future = self.worker.comm_service.submit_recv(
-            LwdCommRequest(
+            LwdTransferRequest(
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
@@ -217,8 +217,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             )
         )
         _t_post = time.monotonic()
-        # wait_for_comm: device-ordered wait; the host never blocks
-        recv_future.wait_for_comm()
+        # wait_on_current_stream: device-ordered wait; the host never blocks
+        recv_future.wait_on_current_stream()
         result = recv_future.result()
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()

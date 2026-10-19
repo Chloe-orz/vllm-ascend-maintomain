@@ -21,9 +21,9 @@ import torch
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import GrammarOutput  # noqa: F401  (type)
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
+from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import lwd_get_data_plane
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 # ops must initialize before the model_runner chain, otherwise device_op
 # and the ops package circularly import (mirrors worker.py's import order)
@@ -55,11 +55,11 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_down_next_seqno = 0
         # req_id -> posted UP recv futures (consumed by the runner's device-side inject)
         self._lwd_up_recv_futures: dict[
-            int, tuple["LwdCommFuture | None", "LwdEmbedBatch"]
+            int, tuple["LwdTransferFuture | None", "LwdEmbedBatch"]
         ] = {}
         # [Lwd][pre-recv] Early receive: only the endpoint rank (= the only
         # cloud rank holding a cross-node P2P channel, same convention as
-        # lwd_wire) pre-posts the real irecv and reports completion
+        # the data-plane channels) pre-posts the real irecv and reports completion
         # watermarks; every other rank gets its data via the in-group TP
         # broadcast at inject time — no recv posted, nothing reported.
         self._init_lwd_early_recv_state()
@@ -79,7 +79,7 @@ class LwdCloudWorker(LwdWorkerBase):
         self.model_runner = LwdCloudModelRunner(
             self.vllm_config, self.device, worker=self
         )
-        self._init_lwd_duplex_channels()
+        self._init_lwd_data_plane()
         # Only the endpoint rank (the cloud leader — first rank of the
         # first cloud DP in the topology) has a cross-node channel: start
         # its early-recv comm thread. The hint MQ was created by the
@@ -157,7 +157,7 @@ class LwdCloudWorker(LwdWorkerBase):
         if scheduler_output.finished_req_ids:
             self._lwd_cloud_flush_finished(scheduler_output.finished_req_ids)
 
-        get_lwd_comm_service().poll_completions()  # lazy keepalive reap
+        lwd_get_data_plane().poll_completions()  # lazy keepalive reap
         _t0 = time.monotonic()
         output = super().execute_model(scheduler_output)
         # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
@@ -278,7 +278,7 @@ class LwdCloudWorker(LwdWorkerBase):
         yet and the gate would run ahead of the recv.
         """
         self._early_recv_max_inflight = 3
-        self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdCommFuture] = {}
+        self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdTransferFuture] = {}
         self._early_recv_lock = threading.Lock()
         # Keys already taken by the consume point: prevents the comm thread from posting a duplicate recv on a late hint
         self._early_recv_consumed: set[tuple[LwdChannelType, int]] = set()
@@ -301,7 +301,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def _lwd_build_up_recv_request(
         self, seqno: int, num_tokens: int, aux_rows: int
-    ) -> LwdCommRequest:
+    ) -> LwdTransferRequest:
         """The single construction point for UP recv requests (the hint path
         and the consume-point re-post share the same shape).
 
@@ -312,7 +312,7 @@ class LwdCloudWorker(LwdWorkerBase):
         wire_version 2; callers always pass aux_rows=0). The size formula
         is computed here exactly once so the two paths cannot drift.
         """
-        return LwdCommRequest(
+        return LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="recv",
             num_elements=hash_payload_numel(
@@ -338,7 +338,7 @@ class LwdCloudWorker(LwdWorkerBase):
         both lines but no SUBMIT = no hints arrived (hint MQ not attached;
         the log will say attached/none).
         """
-        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+        from vllm_ascend.distributed.lwd_pre_recv import (
             attach_hint_mq,
             create_report_mq,
         )
@@ -439,7 +439,7 @@ class LwdCloudWorker(LwdWorkerBase):
         the consume point already handled, are ignored — two irecvs on one
         channel would race the sender's single isend.
         """
-        from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
+        from vllm_ascend.distributed.lwd_pre_recv import hint_fields
 
         fields = hint_fields(hint)
         if fields is None:
@@ -466,7 +466,7 @@ class LwdCloudWorker(LwdWorkerBase):
         cap; ``get_or_post_early_recv`` calls this after consuming one to
         post the next, so the hint queue never drops anything.
         """
-        from vllm_ascend.distributed.lwd_comm.pre_recv import hint_fields
+        from vllm_ascend.distributed.lwd_pre_recv import hint_fields
 
         while True:
             with self._early_recv_lock:
@@ -479,7 +479,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 key, hint = next(iter(self._early_recv_pending.items()))
                 del self._early_recv_pending[key]
                 seqno, num_tokens, aux_rows = hint_fields(hint)
-                future = get_lwd_comm_service().submit_recv(
+                future = lwd_get_data_plane().submit_recv(
                     self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
                 )
                 self._early_recv_futures[key] = future
@@ -538,7 +538,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def get_or_post_early_recv(
         self, seqno: int, num_tokens: int, aux_rows: int
-    ) -> LwdCommFuture | None:
+    ) -> LwdTransferFuture | None:
         """Take the comm thread's pre-posted UP recv future; if absent,
         post one on the spot and register it.
 
@@ -565,7 +565,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 # The hint was still queued while slots were full: this batch is dispatched, so post it now
                 hint = self._early_recv_pending.pop(key, None)
                 if hint is not None:
-                    future = get_lwd_comm_service().submit_recv(
+                    future = lwd_get_data_plane().submit_recv(
                         self._lwd_build_up_recv_request(
                             seqno, num_tokens, aux_rows
                         )
@@ -582,7 +582,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 # SO): re-post from the same information so the report chain
                 # has no gaps and the watermark can keep advancing
                 lwd_logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
-                future = get_lwd_comm_service().submit_recv(
+                future = lwd_get_data_plane().submit_recv(
                     self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
                 )
                 self._early_recv_futures[key] = future
@@ -619,8 +619,8 @@ class LwdCloudWorker(LwdWorkerBase):
                 "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
                 seqno, hidden.numel(),
             )
-            get_lwd_comm_service().submit_send(
-                LwdCommRequest(
+            lwd_get_data_plane().submit_send(
+                LwdTransferRequest(
                     channel=LwdChannelType.DOWN,
                     op="send",
                     num_elements=hidden.numel(),

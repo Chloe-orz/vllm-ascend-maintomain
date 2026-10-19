@@ -36,7 +36,7 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import LwdEmbedBatch
     from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-    from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
+    from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
 
 
 # Endpoint host-gate timeout for the UP harvest wait: exceeding it means the
@@ -57,7 +57,7 @@ class LwdUpStagedBatch(NamedTuple):
 
     seqno: int
     meta: LwdEmbedBatch
-    future: LwdCommFuture | None
+    future: LwdTransferFuture | None
     num_tokens: int
     t_wait: float
 
@@ -561,7 +561,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_stage_up_batch(
         self,
         batch_seqno: int,
-        future: LwdCommFuture | None,
+        future: LwdTransferFuture | None,
         meta: LwdEmbedBatch,
     ) -> LwdUpStagedBatch:
         """Harvest staging: compute the batch token count and check the meta

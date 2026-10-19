@@ -174,7 +174,7 @@ class TestMixedInjection(unittest.TestCase):
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
             LwdEmbedBatch=object,
-            LwdCommFuture=object,
+            LwdTransferFuture=object,
         )
         self.runner = cls()
         self.embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
