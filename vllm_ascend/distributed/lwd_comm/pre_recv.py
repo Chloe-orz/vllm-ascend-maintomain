@@ -58,7 +58,7 @@ import threading
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 
@@ -73,7 +73,6 @@ if TYPE_CHECKING:
 # (the healthy-path HINT/watermark/gate/worker segments are all logged in
 # lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py /
 # lwd_cloud_worker.py).
-logger = init_logger("vllm.lwd.pre_recv")
 
 #: Env var carrying the downstream hint MQ handle. The executor exports it
 #: before creating the worker; the worker rebuilds the reader in
@@ -204,7 +203,7 @@ def post_irecv_hint(hint: dict) -> None:
         # (e.g. the phase-scheduler escape hatch): losing a hint costs no
         # correctness — that branch has no gate waiting on it, and the
         # consume point posts the recv itself.
-        logger.warning(
+        lwd_logger.warning(
             "[Lwd][pre-recv] HINT DROPPED: no sender registered seqno=%s",
             hint.get("seqno"),
         )

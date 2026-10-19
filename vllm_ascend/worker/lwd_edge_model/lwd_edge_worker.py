@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
@@ -38,7 +38,7 @@ class LwdEdgeWorker(LwdWorkerBase):
             self.vllm_config, self.device, worker=self,
         )
         self._init_lwd_duplex_channels()
-        logger.info(
+        lwd_logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
             self.rank,
@@ -52,7 +52,7 @@ class LwdEdgeWorker(LwdWorkerBase):
         # fail unpacking at the final norm. Skip entirely.
         from vllm.v1.worker.worker_base import CompilationTimes
 
-        logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")
+        lwd_logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")
         return CompilationTimes(language_model=0.0, encoder=0.0)
 
     def execute_model(
@@ -68,12 +68,12 @@ class LwdEdgeWorker(LwdWorkerBase):
                 scheduler_output.finished_req_ids
             )
         if lwd_batch is None:
-            logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
+            lwd_logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
 
         batch_meta = lwd_batch.batch_meta
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][edge-worker] EMBED seqno=%d reqs=%d tokens=%d "
                 "has_mrope=%s",
                 lwd_batch.seqno,
@@ -85,7 +85,7 @@ class LwdEdgeWorker(LwdWorkerBase):
                 lwd_batch.seqno, batch_meta, scheduler_output
             )
         if lwd_batch.batch_type == LwdBatchType.LWD_UNEMBED:
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][edge-worker] UNEMBED seqno=%d reqs=%d accepted=%d "
                 "num_elements=%d",
                 lwd_batch.seqno,
@@ -109,7 +109,7 @@ class LwdEdgeWorker(LwdWorkerBase):
             )
             return result
 
-        logger.debug(
+        lwd_logger.debug(
             "[lwd-edge] unknown LWD batch type %r; nothing to do",
             lwd_batch.batch_type,
         )

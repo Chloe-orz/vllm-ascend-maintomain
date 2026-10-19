@@ -27,7 +27,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed import lwd_wire
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
@@ -141,7 +141,7 @@ class LwdChannel:
             # abort raced its send — do NOT crash the process; complete
             # the request with an error result so the caller's readiness
             # gate fails this request promptly.
-            logger.warning(
+            lwd_logger.warning(
                 "[lwd-comm] dropping submission of skipped/duplicate "
                 "seqno %d on channel %s %s (next expected %d)",
                 seqno, self.channel_type.value, self.op, self._next_seqno,
@@ -162,7 +162,7 @@ class LwdChannel:
                 return self._held[seqno][1]
             future = LwdCommFuture.deferred(request)
             self._held[seqno] = (request, future)
-            logger.debug(
+            lwd_logger.debug(
                 "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
                 self.channel_type.value, request.op, seqno, self._next_seqno,
             )
@@ -208,7 +208,7 @@ class LwdChannel:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._submission_lock:
             if self._held:
-                logger.warning(
+                lwd_logger.warning(
                     "[lwd-comm] shutdown on channel %s with %d held "
                     "(never-posted) request(s); lowest missing seqno=%s",
                     self.channel_type.value, len(self._held), self._next_seqno,
@@ -321,7 +321,7 @@ class LwdChannel:
             peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
         tensor = req.tensor
         assert tensor is not None
-        logger.debug(
+        lwd_logger.debug(
             "[lwd-comm] SEND post channel=%s my_rank=%d peer=%s group_ranks=%s "
             "shape=%s dtype=%s op=%s",
             self.channel_type, dist.get_rank(), peer,
@@ -360,7 +360,7 @@ class LwdChannel:
         peer = req.src_dst
         if peer is None:
             peer = lwd_wire.get_lwd_channel_peer(self.channel_type)
-        logger.debug(
+        lwd_logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s "
             "num_elements=%d aux_elements=%d op=%s",
             self.channel_type, dist.get_rank(), peer,
@@ -407,11 +407,11 @@ class LwdChannel:
         # [Lwd][perf] Temporary probe: test whether handle.wait() really
         # "returns immediately on the CPU" as the comment claims — a large
         # dur means send/recv posting blocks the host (lockstep evidence)
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] bridge-wait op=%s ch=%s dur=%.2fms",
             self.op, self.channel_type, (time.monotonic() - _t) * 1000,
         )
-        logger.debug(
+        lwd_logger.debug(
             "[lwd-comm] DONE channel=%s my_rank=%d handles=%d",
             self.channel_type, dist.get_rank(), len(handles),
         )

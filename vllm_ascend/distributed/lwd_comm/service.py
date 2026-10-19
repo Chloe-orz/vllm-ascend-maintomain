@@ -14,7 +14,7 @@ from __future__ import annotations
 import threading
 import time
 
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed.lwd_comm.channel import LwdChannel
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
@@ -102,7 +102,7 @@ class LwdCommService:
             with self._lock:
                 self._channels.clear()
                 self._shutting_down = False
-        logger.info("[lwd-comm] service shut down")
+        lwd_logger.info("[lwd-comm] service shut down")
 
     # ------------------------------------------------------------------ #
     # Internal                                                            #

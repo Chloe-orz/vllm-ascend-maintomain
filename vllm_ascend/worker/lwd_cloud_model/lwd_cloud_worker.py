@@ -18,7 +18,7 @@ import threading
 import time
 
 import torch
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import GrammarOutput  # noqa: F401  (type)
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
@@ -92,7 +92,7 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
-        logger.info(
+        lwd_logger.info(
             "[Lwd][pre-recv] worker rank=%d endpoint=%s hidden=%d",
             self.rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
         )
@@ -124,7 +124,7 @@ class LwdCloudWorker(LwdWorkerBase):
             n for n, _ in model.named_modules()
             if n.count("layers.") == 1 and n.endswith(tuple("0123456789"))
         ]
-        logger.info(
+        lwd_logger.info(
             "[Lwd][cloud-model] loaded layers=%s first=%s last=%s "
             "(config pp=%d tp=%d, my rank=%d) — full load should cover every layer from 0",
             len(layers) if layers is not None else "?",
@@ -143,7 +143,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # [Lwd][perf] Worker start time (subtract the engine's rpc-enqueue
         # ts = dispatch-to-start latency; spread across ranks = collective
         # alignment cost)
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
             self.rank, time.monotonic(),
         )
@@ -163,7 +163,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
         # whole forward pass (sample/collect are itemized separately in
         # sample_tokens)
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] cloud-exec total=%.2fms",
             (time.monotonic() - _t0) * 1000,
         )
@@ -227,7 +227,7 @@ class LwdCloudWorker(LwdWorkerBase):
             # Seven INFO lines per batch is pure noise; demoted to DEBUG
             # (with VLLM_LOGGING_LEVEL=DEBUG the per-rank forward entry
             # times/spread are still visible)
-            logger.debug(
+            lwd_logger.debug(
                 "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
                 "endpoint=False ts=%.3f",
                 batch.seqno, len(meta.req_ids), num_tokens,
@@ -238,7 +238,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # buffers): a climbing peak = something is leaking; mem_free
         # approaching 0 = OOM precursor.
         free_bytes, _total = torch.npu.mem_get_info()
-        logger.info(
+        lwd_logger.info(
             "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
             "endpoint=True ts=%.3f mem_alloc=%.2fGiB mem_peak=%.2fGiB "
             "mem_free=%.2fGiB",
@@ -346,7 +346,7 @@ class LwdCloudWorker(LwdWorkerBase):
         self._irecv_hint_mq = attach_hint_mq()
         self._irecv_done_mq = create_report_mq()
         self.irecv_done_mq = self._irecv_done_mq
-        logger.info(
+        lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank, "attached" if self._irecv_hint_mq is not None else "none",
         )
@@ -370,7 +370,7 @@ class LwdCloudWorker(LwdWorkerBase):
         """
         # The current device is thread-local state; the comm thread must set it once itself (or the irecv lands on card 0)
         torch.npu.set_device(self.device)
-        logger.info(
+        lwd_logger.info(
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
             self.rank, self.device,
             "attached" if self._irecv_hint_mq is not None else "none",
@@ -386,7 +386,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     # Ring cancelled at shutdown etc.: log once and sleep a
                     # little; never hot-spin (daemon threads exit with the
                     # process)
-                    logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
+                    lwd_logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
                     time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
                 else:
                     self.start_early_irecv(hint)
@@ -424,7 +424,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self._early_recv_stuck_log_at = now
             oldest = next(iter(self._early_recv_pending))[1]
             holders = sorted(key[1] for key in self._early_recv_futures)
-        logger.warning(
+        lwd_logger.warning(
             "[Lwd][pre-recv] queue stuck: oldest queued seqno=%d, %d slot(s) "
             "held by seqno=%s (slots held = those batches posted recv but "
             "were never consumed; downstream dispatch is the pacer)",
@@ -443,7 +443,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
         fields = hint_fields(hint)
         if fields is None:
-            logger.warning("[Lwd][pre-recv] malformed hint %s, skipped", hint)
+            lwd_logger.warning("[Lwd][pre-recv] malformed hint %s, skipped", hint)
             return
         seqno, _num_tokens, _aux_rows = fields
         key = (hint["channel"], seqno)
@@ -485,7 +485,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 self._early_recv_futures[key] = future
                 inflight = len(self._early_recv_futures)
                 queued = len(self._early_recv_pending)
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][pre-recv] SUBMIT channel=%s seqno=%d num_tokens=%d "
                 "aux_rows=%d inflight=%d queued=%d ts=%.3f",
                 key[0].value, seqno, num_tokens, aux_rows, inflight, queued,
@@ -514,13 +514,13 @@ class LwdCloudWorker(LwdWorkerBase):
             if not future.done():
                 continue
             # ① Completed: this recv's data (main frame + aux frame) has fully landed
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][pre-recv] DONE channel=%s seqno=%d ts=%.3f",
                 key[0].value, key[1], time.monotonic(),
             )
             # ② Report: write (channel, seqno) into the done MQ; the engine drains it each step to advance the watermark
             done_mq.enqueue(key)
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][pre-recv] REPORT channel=%s seqno=%d ts=%.3f",
                 key[0].value, key[1], time.monotonic(),
             )
@@ -581,7 +581,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 # The hint truly never arrived (or lands later than this
                 # SO): re-post from the same information so the report chain
                 # has no gaps and the watermark can keep advancing
-                logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
+                lwd_logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
                 future = get_lwd_comm_service().submit_recv(
                     self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
                 )
@@ -590,7 +590,7 @@ class LwdCloudWorker(LwdWorkerBase):
             queued = len(self._early_recv_pending)
         # Slot returned: post the next queued hint
         self._early_recv_pump()
-        logger.info(
+        lwd_logger.info(
             "[Lwd][pre-recv] stats seqno=%d inflight=%d queued=%d",
             seqno, inflight, queued,
         )
@@ -615,7 +615,7 @@ class LwdCloudWorker(LwdWorkerBase):
         if payload is not None and output is not None:
             hidden, pinned, _event, req_ids, _accepted = payload
             seqno = self._lwd_next_down_seqno()
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
                 seqno, hidden.numel(),
             )
@@ -637,7 +637,7 @@ class LwdCloudWorker(LwdWorkerBase):
             # collection (rank computation included); send = the DOWN
             # submit (snapshot clone + isend + bridge wait); total = the
             # whole step
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f "
                 "total=%.2fms rows=%d",
                 seqno,
@@ -660,7 +660,7 @@ class LwdCloudWorker(LwdWorkerBase):
         (``lwd_release_finished``, the single owner of the release path);
         finished_req_ids is the engine's own liveness signal, so this
         cleanup does not depend on the control plane."""
-        logger.info(
+        lwd_logger.info(
             "[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids)
         )
         self.model_runner.lwd_release_finished(finished_req_ids)

@@ -15,7 +15,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
@@ -77,9 +77,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if not 0 <= num_hash_layers <= config.num_hidden_layers:
             raise ValueError(f"Invalid DeepSeek V4 num_hash_layers: {num_hash_layers}")
         if num_hash_layers == 0:
-            logger.info("[lwd-edge] tid2eid loading skipped: num_hash_layers=0")
+            lwd_logger.info("[lwd-edge] tid2eid loading skipped: num_hash_layers=0")
             return
-        logger.info("[lwd-edge] loading tid2eid tables for %d Hash MoE layers", num_hash_layers)
+        lwd_logger.info("[lwd-edge] loading tid2eid tables for %d Hash MoE layers", num_hash_layers)
         # Reuse vLLM's checkpoint resolution (revision, cache and shard filtering).
         loader = DefaultModelLoader(self.vllm_config.load_config)
         _, weight_files, use_safetensors = loader._prepare_weights(
@@ -142,7 +142,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
-        logger.debug(
+        lwd_logger.debug(
             "[Lwd][edge-worker] embed token_ids=%s", flat_token_ids
         )
         token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
@@ -169,7 +169,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             cpu_ids = torch.tensor(flat_token_ids, dtype=torch.int64)
             expert_ids = torch.stack([table[cpu_ids] for table in self.tid2eid_tables], dim=1)
             payload = pack_hash_payload(embeds, expert_ids)
-            logger.info(
+            lwd_logger.info(
                 "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
                 seqno, tuple(expert_ids.shape), payload.numel(),
             )
@@ -191,7 +191,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # bridge's handle.wait) — if the UP world broadcast is waiting on
         # the cloud's enqueue, this segment grows visibly (direct evidence
         # of chunk-level lockstep)
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f "
             "total=%.2fms tokens=%d",
             seqno, (_t_fwd - _t0) * 1000,
@@ -253,7 +253,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 if lwd_layer_trace_enabled() and logits.dim() == 2:
                     row = logits[0].detach().float()
                     vals, tids = torch.topk(row, min(20, row.numel()))
-                    logger.info(
+                    lwd_logger.info(
                         "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f "
                         "top20=%s",
                         tuple(logits.shape), row.norm().item(),
@@ -278,7 +278,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # tensor to land (network); lm_head = the vocabulary forward
         # (weight bandwidth); select = argsort name lookup (.item sync);
         # total = the whole edge tail
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] unembed seqno=%s post_recv=%.2f wait_tensor=%.2f "
             "lm_head=%.2f select=%.2f total=%.2fms reqs=%d",
             seqno,

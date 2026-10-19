@@ -20,13 +20,12 @@ from vllm.distributed.parallel_state import (
     get_world_group,
     init_model_parallel_group,
 )
-from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 
 import vllm_ascend.distributed.parallel_state as ascend_parallel_state
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import flashcomm2_enable
 
-logger = init_logger(__name__)
 
 
 def init_lwd_ascend_model_parallel(vllm_config) -> None:
@@ -118,7 +117,7 @@ def init_lwd_ascend_model_parallel(vllm_config) -> None:
             + ", ".join(unsupported)
         )
 
-    logger.info(
+    lwd_logger.info(
         "Lwd ascend model parallel initialized: world_size=%s, MC2 groups=%s",
         world_size,
         mc2_groups,

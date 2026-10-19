@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 from vllm.distributed.parallel_state import get_world_group
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
 
@@ -45,7 +45,7 @@ def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
 
     flat = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)
     with np.printoptions(threshold=np.inf, linewidth=10000, precision=8):
-        logger.info(
+        lwd_logger.info(
             "%s shape=%s dtype=%s head10=%s tail10=%s sum=%.6f mean=%.8f",
             tag, tuple(tensor.shape), tensor.dtype,
             flat[:10], flat[-10:], float(flat.sum()), float(flat.mean()),
@@ -117,7 +117,7 @@ def init_lwd_duplex_channels() -> None:
     # launches on the compute stream at inject time, sharing an in-stream
     # FIFO with the forward's TP collectives — naturally crosstalk-free.
     _INITIALIZED = True
-    logger.info(
+    lwd_logger.info(
         "[lwd-wire] duplex channels created over ranks=%s (my_rank=%d)",
         ranks, my_rank,
     )
@@ -153,21 +153,21 @@ def warmup_lwd_duplex_channels() -> None:
             continue
         payload = torch.zeros(8, dtype=torch.bfloat16, device="npu")
         if am_sender:
-            logger.info(
+            lwd_logger.info(
                 "[lwd-warmup] SEND post channel=%s my_rank=%d peer=%d "
                 "group_ranks=%s", channel, my_rank, peer,
                 dist.get_process_group_ranks(group))
             handle = dist.isend(payload, dst=peer, group=group)
         else:
-            logger.info(
+            lwd_logger.info(
                 "[lwd-warmup] RECV post channel=%s my_rank=%d src=%d "
                 "group_ranks=%s", channel, my_rank, peer,
                 dist.get_process_group_ranks(group))
             handle = dist.irecv(payload, src=peer, group=group)
         handle.wait()
-        logger.info("[lwd-warmup] DONE channel=%s my_rank=%d", channel, my_rank)
+        lwd_logger.info("[lwd-warmup] DONE channel=%s my_rank=%d", channel, my_rank)
     get_world_group().barrier()
-    logger.info("[lwd-wire] duplex channels warmed up (UP + DOWN)")
+    lwd_logger.info("[lwd-wire] duplex channels warmed up (UP + DOWN)")
 
 
 def lwd_channels_initialized() -> bool:
@@ -195,7 +195,7 @@ def destroy_lwd_duplex_channels() -> None:
         try:
             dist.destroy_process_group(group)
         except Exception:
-            logger.warning(
+            lwd_logger.warning(
                 "[lwd-wire] failed to destroy group for %s", channel.value
             )
     _LWD_CHANNEL_GROUPS.clear()
@@ -211,7 +211,7 @@ def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
 
     flat = tensor.detach().to("cpu", torch.float32).numpy().reshape(-1)
     with np.printoptions(threshold=np.inf, linewidth=10000, precision=8):
-        logger.info(
+        lwd_logger.info(
             "%s shape=%s dtype=%s head10=%s tail10=%s sum=%.6f mean=%.8f",
             tag, tuple(tensor.shape), tensor.dtype,
             flat[:10], flat[-10:], float(flat.sum()), float(flat.mean()),

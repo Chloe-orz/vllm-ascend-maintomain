@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context
-from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend import envs
@@ -675,7 +675,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             # frombuffer + direct CPU write into req_state (control-plane
             # delivery, no device round-trip); delta = last-chunk max()
             # self-derivation, accumulated per request
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][perf] cloud mrope-inject seqno=%s rows=%d "
                 "cpu=%.2f delta=%.2fms",
                 batch_seqno, mrope_rows,
@@ -731,11 +731,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 async_op=True,
             )
             work.wait()  # Bridge broadcast completion onto the current (compute) stream so later copies are ordered
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
             staged.seqno, (time.monotonic() - staged.t_wait) * 1000,
         )
-        logger.info(
+        lwd_logger.info(
             "[Lwd][cloud-runner] UP embeds harvested seqno=%s rows=%d "
             "reqs=%s mrope_reqs=%s",
             staged.seqno, staged.num_tokens, staged.meta.req_ids,
@@ -793,7 +793,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 )
             else:
                 embeds = up_flat.view(num_tokens, hidden_size)
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][cloud-runner] UP embeds injected seqno=%s rows=%s "
                 "reqs=%s",
                 batch_seqno, embeds.shape[0], meta.req_ids,
@@ -874,7 +874,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             req_state.mrope_position_delta = (
                 int(positions.max().item()) + 1 - prompt_len
             )
-            logger.info(
+            lwd_logger.info(
                 "[Lwd][cloud-runner] mrope complete: req=%s prompt=%d "
                 "delta=%d",
                 req_id, prompt_len, req_state.mrope_position_delta,
@@ -999,7 +999,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
         # [Lwd][perf] Collection segments: rank = rank computation + row
         # gathering; pinned = meta packaging + copy
-        logger.info(
+        lwd_logger.info(
             "[Lwd][perf] collect rows=%d rank=%.2f pinned=%.2f total=%.2fms",
             hidden_packet.shape[0],
             (selection_done - _t0) * 1000,

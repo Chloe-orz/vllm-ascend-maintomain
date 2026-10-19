@@ -65,9 +65,7 @@ def _hidden_from(x: Any) -> Any:
 
 
 def _make_hook(label: str) -> Callable[..., None]:
-    from vllm.logger import init_logger
-
-    log = init_logger(__name__)
+    from vllm.lwd_logger import lwd_logger as log
 
     def hook(
         module: "torch.nn.Module",
@@ -87,9 +85,7 @@ def _make_hook(label: str) -> Callable[..., None]:
 
 
 def _make_step_hook() -> Callable[..., None]:
-    from vllm.logger import init_logger
-
-    log = init_logger(__name__)
+    from vllm.lwd_logger import lwd_logger as log
 
     def pre_hook(
         module: "torch.nn.Module", args: "tuple[torch.Tensor, ...]"
@@ -137,9 +133,7 @@ def install_lwd_layer_trace(model: "torch.nn.Module") -> None:
     if getattr(model, "_lwd_layer_traced", False):
         return
     model._lwd_layer_traced = True
-    from vllm.logger import init_logger
-
-    log = init_logger(__name__)
+    from vllm.lwd_logger import lwd_logger as log
     backbone, layers = _find_text_backbone(model)
     if layers is None:
         log.warning(
