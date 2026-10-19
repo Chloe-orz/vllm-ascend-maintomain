@@ -383,6 +383,12 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor | None = None,
         hidden_states_fp32: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Inject the hash layer index into the context at every layer's
+        # forward (hash layer = its index, ordinary layer = None to clear
+        # any carry-over from the previous layer) for the router's LWD
+        # expert merge to read — a single injection point, so the multiple
+        # forwarding layers cannot overwrite each other.
+        get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 

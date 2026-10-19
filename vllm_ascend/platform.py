@@ -1318,7 +1318,23 @@ def _setup_worker_and_scheduler(
     # Select worker class and refresh block size
     parallel_config = vllm_config.parallel_config
     if parallel_config and parallel_config.worker_cls == "auto":
-        hardware_profile = get_current_hardware_profile()
+        # LWD edge/cloud worker selection (takes priority over hardware
+        # defaults). Main's config/lwd generation: LwdConfig presence
+        # means LWD; role ("edge"/"cloud") selects the worker class.
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None:
+            if lwd_config.role == "edge":
+                parallel_config.worker_cls = (
+                    "vllm_ascend.worker.lwd_edge_model.lwd_edge_worker."
+                    "LwdEdgeWorker"
+                )
+            else:
+                parallel_config.worker_cls = (
+                    "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker."
+                    "LwdCloudWorker"
+                )
+        else:
+            hardware_profile = get_current_hardware_profile()
         if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
             HardwareCapability.STANDARD_WORKER_PATCHES
         ):
