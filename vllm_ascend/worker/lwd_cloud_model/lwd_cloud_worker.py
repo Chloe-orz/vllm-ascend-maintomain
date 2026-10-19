@@ -338,7 +338,7 @@ class LwdCloudWorker(LwdWorkerBase):
         both lines but no SUBMIT = no hints arrived (hint MQ not attached;
         the log will say attached/none).
         """
-        from vllm_ascend.distributed.lwd_pre_recv import (
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             attach_hint_mq,
             create_report_mq,
         )
@@ -439,7 +439,7 @@ class LwdCloudWorker(LwdWorkerBase):
         the consume point already handled, are ignored — two irecvs on one
         channel would race the sender's single isend.
         """
-        from vllm_ascend.distributed.lwd_pre_recv import hint_fields
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         fields = hint_fields(hint)
         if fields is None:
@@ -466,7 +466,7 @@ class LwdCloudWorker(LwdWorkerBase):
         cap; ``get_or_post_early_recv`` calls this after consuming one to
         post the next, so the hint queue never drops anything.
         """
-        from vllm_ascend.distributed.lwd_pre_recv import hint_fields
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         while True:
             with self._early_recv_lock:
