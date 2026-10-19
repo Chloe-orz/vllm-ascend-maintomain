@@ -179,7 +179,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 def _backup_token_id(req_state, idx: int) -> int:
     """Placeholder-embeds tolerance for get_token_id.
 
-    LWD (prefill_only) cloud requests have their prompt injected as
+    LWD cloud requests have their prompt injected as
     embeds; prompt_token_ids is None and reading an id at a prompt
     position would raise (gpu_input_batch.py:get_token_id). The backup
     value is only selected by torch.where when the request has no valid
@@ -198,7 +198,7 @@ def _backup_token_id(req_state, idx: int) -> int:
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
-    # prefill_only LWD: provider of edge-computed prompt embeddings for the
+    # LWD: provider of edge-computed prompt embeddings for the
     # draft model's first pass (set by the worker at bring-up on the cloud).
     # provider(req_id) -> Tensor [N, H] | None.
     _lwd_prompt_embeds_provider = None
@@ -1190,7 +1190,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample, common_attn_metadata,
         )
         if lwd_inputs_embeds is not None:
-            # prefill_only LWD: organize the first-pass inputs from the
+            # LWD: organize the first-pass inputs from the
             # edge-computed prompt embeddings (received over the UP
             # channel), not from token-id lookups.
             inputs_embeds = lwd_inputs_embeds
@@ -1792,7 +1792,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         token_indices_to_sample: torch.Tensor,
         cad: CommonAttentionMetadata,
     ) -> torch.Tensor | None:
-        """prefill_only LWD: organize the draft first-pass inputs from the
+        """LWD: organize the draft first-pass inputs from the
         edge-computed prompt embeddings (received over the UP channel)
         instead of token-id lookups.
 

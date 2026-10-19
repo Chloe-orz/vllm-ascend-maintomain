@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only LWD (edge-cloud) worker subclass.
+"""LWD (edge-cloud) worker subclass.
 
 All LWD worker-side logic lives here (moved out of ``worker.py``):
 init bring-up of the duplex channels + recv managers, the EDGE_EMBED
@@ -9,7 +9,7 @@ DOWN send (draining the runner's per-step hidden payload + attaching
 
 Selected via ``parallel_config.worker_cls`` (see platform.py:
 ``vllm_ascend.worker.lwd_cloud_worker.LwdCloudWorker``) when
-``lwd_config`` enables prefill_only.
+``lwd_config`` is set (LWD deployment).
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class LwdCloudWorker(LwdWorkerBase):
             # (separate class) lacks them entirely — fail fast at bring-up
             # instead of AttributeError at first request.
             raise RuntimeError(
-                "prefill_only (LWD) data plane requires the V1 model runner; "
+                "LWD data plane requires the V1 model runner; "
                 "use_v2_model_runner is not supported"
             )
         # Swap in the LWD model runner BEFORE any model load/usage.
@@ -80,13 +80,15 @@ class LwdCloudWorker(LwdWorkerBase):
             self.vllm_config, self.device, worker=self
         )
         self._init_lwd_duplex_channels()
-        # Only the endpoint rank has a cross-node channel: start its
-        # early-recv comm thread (the hint MQ was created by the executor
-        # before worker construction and exported via env; this side
-        # creates the done MQ writer, its handle rides the READY handshake
-        # back to the engine). Other ranks just register as non-endpoint.
+        # Only the endpoint rank (the cloud leader — first rank of the
+        # first cloud DP in the topology) has a cross-node channel: start
+        # its early-recv comm thread. The hint MQ was created by the
+        # executor before worker construction and exported via env; this
+        # side creates the done MQ writer, its handle rides the READY
+        # handshake back to the engine. Other ranks register non-endpoint.
         self._lwd_early_recv_endpoint = (
-            self.rank == self.parallel_config.lwd_config.edge_npu_count
+            self.rank
+            == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
@@ -171,7 +173,7 @@ class LwdCloudWorker(LwdWorkerBase):
         """Bind the UP recv for an incoming LWD_EMBED batch.
 
         The UP two-phase communication splits into two instants per the
-        prefill_only_demo_br pattern:
+        demo_br pattern:
           * post time (this function): only the endpoint rank posts the
             channel P2P recv; non-endpoints just register the meta;
           * consume time (the runner's inject side): every rank launches

@@ -162,7 +162,7 @@ class AscendFusedTopKRouter(AscendGroupedTopKRouter):
                 if input_ids is None:
                     raise ValueError("DeepSeek V4 vision/hash MoE routing requires input_ids.")
                 input_ids = input_ids.to(torch.int64)
-                # LWD prefill_only: prompt rows' expert IDs arrive from the
+                # LWD LWD: prompt rows' expert IDs arrive from the
                 # edge's table lookup over the UP channel (the cloud has no
                 # prompt token ids). Build the per-step merged table
                 # (prompt rows = remote IDs, decode rows = local lookup

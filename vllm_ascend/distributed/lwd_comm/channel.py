@@ -2,7 +2,7 @@
 """LwdChannel: one strict FIFO per physical (direction, peer) wire.
 
 Simplified port of the demo branch's ``lwd_comm/channel.py`` for
-the prefill_only duplex data plane (two direction-only channels,
+the LWD duplex data plane (two direction-only channels,
 single-tensor payloads).
 
 Mechanics preserved from the demo:

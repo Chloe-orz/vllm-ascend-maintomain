@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only duplex data-plane wire layer.
+"""LWD duplex data-plane wire layer.
 
 Owns the two physical channels (UP edge->cloud, DOWN cloud->edge):
   * channel HCCL communicators: two dedicated ``new_group`` groups over
@@ -13,15 +13,15 @@ Owns the two physical channels (UP edge->cloud, DOWN cloud->edge):
     pipeline, where the two sides could otherwise arrive on different
     channels and deadlock).
 
-Only prefill_only mode builds these groups; other modes never reach
-here (gated by ``LwdConfig.is_prefill_only``).
+Only LWD deployments build these groups; native deployments never
+reach here (gated by ``VllmConfig.lwd_config``).
 """
 
 from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-from vllm.distributed.parallel_state import get_pp_group, get_world_group
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
@@ -55,7 +55,7 @@ def dump_tensor(tag: str, tensor: "torch.Tensor") -> None:
 def init_lwd_duplex_channels() -> None:
     """Create the two duplex channels for the edge/cloud rank pair.
 
-    Called once per worker process when ``is_prefill_only`` is on.
+    Called once per worker process in an LWD deployment.
     Idempotent.
 
     Endpoint ranks are resolved from existing deployment info, in order:
@@ -76,21 +76,19 @@ def init_lwd_duplex_channels() -> None:
         return
     from vllm.config import get_current_vllm_config
 
-    lwd_cfg = get_current_vllm_config().parallel_config.lwd_config
-    if lwd_cfg.enable_lwd and lwd_cfg.edge_npu_count > 0:
-        # Contiguous edge-first layout: edge [0, E), cloud [E, E+C); the endpoint takes (0, E)
-        edge_rank, cloud_rank = 0, lwd_cfg.edge_npu_count
-    else:
-        pp_group = get_pp_group()
-        if pp_group.world_size != 2:
-            raise RuntimeError(
-                "prefill_only duplex channels cannot resolve edge/cloud "
-                "endpoint ranks: lwd_config endpoint ranks unset (check "
-                "--edge-npu-count/--cloud-npu-count) and the PP group "
-                "does not span exactly the edge/cloud pair "
-                f"(pp world_size={pp_group.world_size})"
-            )
-        edge_rank, cloud_rank = pp_group.ranks[0], pp_group.ranks[1]
+    # Endpoint pair = the leader (TP0) rank of each side, authoritative
+    # from the YAML LwdTopology (see LwdDeploymentFacts).
+    from vllm_ascend.worker.lwd_base_model.lwd_topology_adapter import (
+        LwdDeploymentFacts,
+    )
+
+    facts = LwdDeploymentFacts.from_vllm_config(get_current_vllm_config())
+    if facts is None:
+        raise RuntimeError(
+            "LWD duplex channels require VllmConfig.lwd_config (the "
+            "YAML LwdTopology generation on main)")
+    edge_rank = facts.edge_leader_rank
+    cloud_rank = facts.cloud_leader_rank
     ranks = [edge_rank, cloud_rank]
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()

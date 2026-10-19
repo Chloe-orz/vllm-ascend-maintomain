@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only LWD model runner subclass (cloud side).
+"""LWD model runner subclass (cloud side).
 
 All LWD runner-side logic lives here (moved out of
 ``model_runner_v1.py``): the per-step cloud-side collection of the
@@ -8,7 +8,7 @@ DOWN payload (hidden-only tensor) plus the step metadata (global ranks
 ``ModelRunnerOutput.lwd_c2e_meta``.
 
 Selected via ``LwdCloudWorker`` (worker_cls), which swaps the model
-runner class at init_device when ``lwd_config`` enables prefill_only.
+runner class at init_device when ``lwd_config`` is set.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ class LwdDownSelection(NamedTuple):
 
 
 class LwdCloudModelRunner(LwdBaseModelRunner):
-    """NPUModelRunner + prefill_only LWD cloud-side runner logic."""
+    """NPUModelRunner + LWD cloud-side runner logic."""
 
     # Config-derived constants, computed once at first use; lwd_config and
     # the HF config are immutable at runtime. Class-level defaults keep
@@ -100,7 +100,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self._lwd_hash_step_tokens = None
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
-        if num_hash_layers and vllm_config.lwd_config.mode == "prefill_only":
+        if num_hash_layers and vllm_config.lwd_config is not None:
             # UP currently broadcasts one edge's batch to one cloud TP group.
             # CP/DP need additional request-to-rank layouts before supporting V4.
             parallel = vllm_config.parallel_config
@@ -120,9 +120,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
 
     def _get_drafter(self) -> "SpecDecodeBaseProposer | None":
-        """Use the LWD MTP embedding adapter only in prefill_only mode."""
+        """Use the LWD MTP embedding adapter only in LWD mode."""
         if (
-            self.vllm_config.lwd_config.mode == "prefill_only"
+            self.vllm_config.lwd_config is not None
             and self.speculative_config.method == "mtp"
             and not self.speculative_config.use_step3p5_mtp()
         ):
@@ -689,7 +689,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """Harvest tensor stage (single batch): endpoint passes the host gate,
         then an in-place TP-group broadcast lands the main embeds frame
         (each frame is its own launch+wait atomic pair on the current
-        stream — the prefill_only_demo_br discipline; unreliable
+        stream — the demo_br discipline; unreliable
         cross-stream ordering was the root cause of truncated broadcast
         deliveries before). Returns None when the endpoint res.tensor is
         None (the pre-split continue semantics)."""

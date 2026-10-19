@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only LWD data plane: duplex comm package.
+"""LWD data plane: duplex comm package.
 
 Two physical channels, direction-only (no per-type channels):
 

@@ -1,7 +1,7 @@
 #
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is a part of the vllm-ascend project.
-"""LWD (layerwise disaggregated) prefill_only mode edge worker.
+"""LWD (layerwise disaggregated) LWD mode edge worker.
 
 Dispatcher only: the edge data-plane compute (embed/unembed forward,
 MM cache, tid2eid tables) lives on LwdEdgeModelRunner — same

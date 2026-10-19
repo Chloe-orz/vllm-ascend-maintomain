@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Type definitions for the prefill_only duplex comm package."""
+"""Type definitions for the LWD duplex comm package."""
 
 from __future__ import annotations
 

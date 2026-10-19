@@ -1318,18 +1318,12 @@ def _setup_worker_and_scheduler(
     # Select worker class and refresh block size
     parallel_config = vllm_config.parallel_config
     if parallel_config and parallel_config.worker_cls == "auto":
-        # LWD prefill_only edge/cloud worker selection (takes priority
-        # over hardware defaults). enabled/is_edge are read defensively
-        # via getattr: main's new config/lwd generation (path/role/
-        # instance) and the v0.23.0-lineage dict generation coexist;
-        # until the activation bridge lands, both safely fall through to
-        # the hardware-default path.
+        # LWD edge/cloud worker selection (takes priority over hardware
+        # defaults). Main's config/lwd generation: LwdConfig presence
+        # means LWD; role ("edge"/"cloud") selects the worker class.
         lwd_config = getattr(vllm_config, "lwd_config", None)
-        if lwd_config is not None and getattr(lwd_config, "enabled", False):
-            is_edge = getattr(lwd_config, "is_edge", None)
-            if is_edge is None:
-                is_edge = getattr(lwd_config, "role", "") == "edge"
-            if is_edge:
+        if lwd_config is not None:
+            if lwd_config.role == "edge":
                 parallel_config.worker_cls = (
                     "vllm_ascend.worker.lwd_edge_model.lwd_edge_worker."
                     "LwdEdgeWorker"

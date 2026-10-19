@@ -5,9 +5,11 @@
 
 The native ``init_ascend_model_parallel`` splits global ranks on a
 uniform (dp, pp, pcp, tp) grid, which cannot express the asymmetric
-"edge edge_npu_count + cloud cloud_npu_count" topology. This module
-builds the ascend-side communication groups (MC2 etc.) per the LWD
-layout and injects them into
+edge/cloud topology. Rank sets come from the YAML LwdTopology carried
+by ``VllmConfig.lwd_config`` (the main-branch config generation):
+each instance link pairs an edge DP with a cloud DP and lists both
+rank sets explicitly. This module builds the ascend-side groups
+(MC2 etc.) from those rank sets and injects them into
 ``vllm_ascend.distributed.parallel_state``; it is invoked by the
 ``_init_worker_distributed_environment`` override in LwdCloudWorker /
 LwdEdgeWorker, replacing the native entry point.
@@ -27,7 +29,7 @@ from vllm_ascend.utils import flashcomm2_enable
 logger = init_logger(__name__)
 
 
-def init_lwd_ascend_model_parallel(parallel_config) -> None:
+def init_lwd_ascend_model_parallel(vllm_config) -> None:
     """Build the ascend-side communication groups per the LWD layout.
 
     Mirrors the feature-free path of native
@@ -37,26 +39,34 @@ def init_lwd_ascend_model_parallel(parallel_config) -> None:
     if ascend_parallel_state.model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
-    lwd = parallel_config.lwd_config
-    edge_count = lwd.edge_npu_count
-    cloud_count = lwd.cloud_npu_count
-    world_per_dp = edge_count + cloud_count
-    data_parallel_size = parallel_config.data_parallel_size
+    lwd = vllm_config.lwd_config
+    if lwd is None:
+        raise RuntimeError(
+            "init_lwd_ascend_model_parallel requires VllmConfig.lwd_config "
+            "(the YAML LwdTopology generation on main)")
     world_size = torch.distributed.get_world_size()
-    assert world_size == data_parallel_size * world_per_dp, (
-        f"Lwd world size mismatch: got {world_size}, expected "
-        f"{data_parallel_size} * ({edge_count} + {cloud_count})")
     backend = torch.distributed.get_backend(get_world_group().device_group)
 
-    # MC2 groups: split by pp segment — segment 0 holds the edge ranks,
-    # segment 1 this instance's cloud ranks, aligned with the vllm-side
-    # PP grouping ([edge0, cloud0] two-stage chain + singletons) link
-    # semantics.
+    # MC2 groups per instance link: segment 0 holds the edge ranks,
+    # segment 1 the paired cloud ranks, both read verbatim from the
+    # topology (no arithmetic rank layout is assumed).
     mc2_groups: list[list[int]] = []
-    for dp_idx in range(data_parallel_size):
-        base = dp_idx * world_per_dp
-        mc2_groups.append([base + r for r in range(edge_count)])
-        mc2_groups.append([base + edge_count + r for r in range(cloud_count)])
+    covered: set[int] = set()
+    for link in lwd.topology.instance_links:
+        edge_inst = lwd.topology.edges[link.edge]
+        cloud_inst = lwd.topology.clouds[link.cloud]
+        if link.dp_idx >= len(edge_inst.dp) or link.dp_idx >= len(cloud_inst.dp):
+            raise ValueError(
+                f"Lwd instance link dp_idx {link.dp_idx} out of range: "
+                f"edge dp={len(edge_inst.dp)} cloud dp={len(cloud_inst.dp)}")
+        mc2_groups.append(list(edge_inst.dp[link.dp_idx].ranks))
+        mc2_groups.append(list(cloud_inst.dp[link.dp_idx].ranks))
+        covered.update(edge_inst.dp[link.dp_idx].ranks)
+        covered.update(cloud_inst.dp[link.dp_idx].ranks)
+    if len(covered) != world_size:
+        raise ValueError(
+            "Lwd topology ranks do not cover the comm world: covered "
+            f"{sorted(covered)} of world_size={world_size}")
     ascend_parallel_state._MC2 = init_model_parallel_group(
         mc2_groups,
         get_world_group().local_rank,

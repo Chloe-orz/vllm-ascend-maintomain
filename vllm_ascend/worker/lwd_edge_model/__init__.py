@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""prefill_only LWD edge-side modules.
+"""LWD edge-side modules.
 
 - ``lwd_edge_worker``: NPUWorker subclass (batch dispatch only)
 - ``lwd_edge_model_runner``: LwdEdgeModelRunner (embed/unembed compute)

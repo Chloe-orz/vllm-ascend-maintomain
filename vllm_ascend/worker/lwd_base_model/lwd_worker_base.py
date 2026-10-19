@@ -61,7 +61,7 @@ class LwdWorkerBase(NPUWorker):
             self.parallel_config.prefill_context_parallel_size,
             self.parallel_config.decode_context_parallel_size,
         )
-        init_lwd_ascend_model_parallel(self.parallel_config)
+        init_lwd_ascend_model_parallel(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
     def _init_lwd_duplex_channels(self) -> None:
