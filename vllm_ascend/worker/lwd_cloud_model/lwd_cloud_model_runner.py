@@ -289,36 +289,34 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _update_states(
         self, scheduler_output: "SchedulerOutput"
     ) -> "Callable[[], None] | None":
-        """LWD: rebuild shape-only placeholder embeds in place before they
+        """LWD: materialize meta placeholder embeds in place before they
         reach the base (zero base seams).
 
-        The edge-cloud transport carries only the shape
-        (prompt_embeds=None + shape); the base CachedRequestState
-        construction passes new_req_data.prompt_embeds straight
-        through — rebuild the all-zeros placeholder here first, native
-        path behavior unchanged."""
+        The engine attaches prompt embeds as meta tensors (shape only,
+        empty storage), so the placeholder rides the MQ inline pickle
+        path instead of the overflow slow channel; the base
+        CachedRequestState construction passes new_req_data.prompt_embeds
+        straight through — swap meta tensors for local all-zeros
+        allocations here, native path behavior unchanged.
+        NOTE: a meta tensor still reports full nbytes (numel * element_size);
+        do not infer transport cost from nbytes."""
         for new_req in scheduler_output.scheduled_new_reqs:
-            if (
-                new_req.prompt_embeds is None
-                and new_req.prompt_embeds_shape is not None
-            ):
+            embeds = new_req.prompt_embeds
+            if embeds is not None and embeds.is_meta:
                 new_req.prompt_embeds = torch.zeros(
-                    new_req.prompt_embeds_shape,
-                    dtype=new_req.prompt_embeds_dtype,
+                    embeds.shape, dtype=embeds.dtype
                 )
         return super()._update_states(scheduler_output)
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: "NewRequestData"
     ) -> "CachedRequestState":
-        """LWD: placeholder rebuild for streaming updates (same as _update_states, zero base seams)."""
-        if (
-            new_req_data.prompt_embeds is None
-            and new_req_data.prompt_embeds_shape is not None
-        ):
+        """LWD: meta placeholder materialization for streaming updates
+        (same as _update_states, zero base seams)."""
+        embeds = new_req_data.prompt_embeds
+        if embeds is not None and embeds.is_meta:
             new_req_data.prompt_embeds = torch.zeros(
-                new_req_data.prompt_embeds_shape,
-                dtype=new_req_data.prompt_embeds_dtype,
+                embeds.shape, dtype=embeds.dtype
             )
         return super()._update_streaming_request(req_id, new_req_data)
 

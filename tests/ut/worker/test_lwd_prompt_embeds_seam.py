@@ -56,6 +56,61 @@ def test_zero_weave_overrides_delegate_to_super() -> None:
     assert "super()._init_mrope_positions(req_state)" in src
 
 
+def test_placeholder_wash_uses_meta_protocol() -> None:
+    """The placeholder wash keys off is_meta (the engine attaches meta
+    tensors): the shape/dtype transport fields must stay gone from the
+    cloud runner."""
+    src = CLOUD.read_text(encoding="utf-8")
+    assert "is_meta" in src
+    for stale in ("prompt_embeds_shape", "prompt_embeds_dtype"):
+        assert stale not in src, f"stale transport field reference: {stale}"
+
+
+def test_runtime_meta_placeholder_materialization(
+    monkeypatch,
+) -> None:
+    """A meta placeholder entering _update_states / _update_streaming
+    request must come out as a local all-zeros tensor with identical
+    shape/dtype, and the base must still run (super delegated)."""
+    cls = _cloud_cls()
+    import torch
+
+    def fake_base_update_states(self, scheduler_output):
+        self._base_saw = scheduler_output
+        return "BASE_RET"
+
+    def fake_base_update_streaming(self, req_id, new_req_data):
+        self._base_streaming_saw = (req_id, new_req_data)
+        return "STREAM_RET"
+
+    runner = cls.__new__(cls)
+    base_cls = type(runner).__mro__[1]
+    monkeypatch.setattr(base_cls, "_update_states", fake_base_update_states)
+    monkeypatch.setattr(
+        base_cls, "_update_streaming_request", fake_base_update_streaming
+    )
+    meta_embeds = torch.empty(4, 8, dtype=torch.float32, device="meta")
+    assert meta_embeds.is_meta
+    new_req = NS(prompt_embeds=meta_embeds)
+    so = NS(scheduled_new_reqs=[new_req])
+
+    ret = runner._update_states(so)
+    assert ret == "BASE_RET" and runner._base_saw is so
+    washed = new_req.prompt_embeds
+    assert washed is not None and not washed.is_meta
+    assert tuple(washed.shape) == (4, 8) and washed.dtype == torch.float32
+    assert torch.equal(washed, torch.zeros(4, 8, dtype=torch.float32))
+
+    streaming_req = NS(prompt_embeds=meta_embeds.clone())
+    ret = runner._update_streaming_request("rid", streaming_req)
+    assert ret == "STREAM_RET"
+    assert runner._base_streaming_saw[0] == "rid"
+    assert not streaming_req.prompt_embeds.is_meta
+    assert torch.equal(
+        streaming_req.prompt_embeds, torch.zeros(4, 8, dtype=torch.float32)
+    )
+
+
 def _cloud_cls():
     pytest_import = __import__("pytest")
     pytest_import.importorskip(
