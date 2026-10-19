@@ -20,7 +20,6 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend import envs
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
@@ -224,54 +223,41 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
-        # Diagnostic bypass (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1): the DOWN
-        # tensor is still received (transport cost stays in the
-        # measurement), but lm_head + rank-replay are skipped and the
-        # cloud's c2e notify piggybacked token ids are delivered directly —
-        # if performance recovers, the bottleneck is the edge-side
-        # unembed.
-        if envs.VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE and batch_meta.token_ids:
-            assert len(batch_meta.token_ids) == len(batch_meta.req_ids)
-            sampled_token_ids: list[list[int]] = [
-                list(t) for t in batch_meta.token_ids
-            ]
-            _t_lm = time.monotonic()
-        else:
-            # lm_head must not be called directly (ParallelLMHead.forward
-            # forces the sampler path); compute_logits is the standard
-            # interface present on both wrapper and monolithic models.
-            logits = model.compute_logits(hidden_states)   # (rows_total, V)
-            _t_lm = time.monotonic()
-            # L5 parity check: the first row's top-20 compared entrywise
-            # against the cloud sampler's [layer-trace] top-20 — any rank
-            # swap is a direct view of replay drift.
-            try:
-                from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
-                    lwd_layer_trace_enabled,
-                )
-
-                if lwd_layer_trace_enabled() and logits.dim() == 2:
-                    row = logits[0].detach().float()
-                    vals, tids = torch.topk(row, min(20, row.numel()))
-                    lwd_logger.info(
-                        "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f "
-                        "top20=%s",
-                        tuple(logits.shape), row.norm().item(),
-                        list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-
-            flat_ids = select_token_batch(
-                logits, [r for ths in batch_meta.top_id_ths for r in ths]
+        # lm_head must not be called directly (ParallelLMHead.forward
+        # forces the sampler path); compute_logits is the standard
+        # interface present on both wrapper and monolithic models.
+        logits = model.compute_logits(hidden_states)   # (rows_total, V)
+        _t_lm = time.monotonic()
+        # L5 parity check: the first row's top-20 compared entrywise
+        # against the cloud sampler's [layer-trace] top-20 — any rank
+        # swap is a direct view of replay drift.
+        try:
+            from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
+                lwd_layer_trace_enabled,
             )
-            sampled_token_ids = []
-            off = 0
-            for accept, ths in zip(
-                batch_meta.num_accept_tokens, batch_meta.top_id_ths
-            ):
-                sampled_token_ids.append(flat_ids[off : off + accept])
-                off += len(ths)
+
+            if lwd_layer_trace_enabled() and logits.dim() == 2:
+                row = logits[0].detach().float()
+                vals, tids = torch.topk(row, min(20, row.numel()))
+                lwd_logger.info(
+                    "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f "
+                    "top20=%s",
+                    tuple(logits.shape), row.norm().item(),
+                    list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        flat_ids = select_token_batch(
+            logits, [r for ths in batch_meta.top_id_ths for r in ths]
+        )
+        sampled_token_ids = []
+        off = 0
+        for accept, ths in zip(
+            batch_meta.num_accept_tokens, batch_meta.top_id_ths
+        ):
+            sampled_token_ids.append(flat_ids[off : off + accept])
+            off += len(ths)
         _t_sel = time.monotonic()
         # [Lwd][perf] Temporary probes attributing single-request latency:
         # post_recv = posting the irecv; wait_tensor = waiting for the

@@ -23,7 +23,6 @@ from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend import envs
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
@@ -916,12 +915,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
-        # VLLM_ASCEND_LWD_DISABLE_DOWN=1 diagnostics: skip the collect (the
-        # cloud engine switches to token_ids pass-through notify); a None
-        # payload makes the worker skip the DOWN send naturally
         if (captured is not None
-                and self._lwd_captured_sampler_output is not None
-                and not envs.VLLM_ASCEND_LWD_DISABLE_DOWN):
+                and self._lwd_captured_sampler_output is not None):
             self._lwd_pending_down_payload = self._lwd_collect_down_payload(
                 captured[0], captured[1], captured[2], captured[3],
                 captured[4], captured[5], self._lwd_captured_sampler_output,
