@@ -463,10 +463,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         embeds.copy_(torch.where(is_token_ids.unsqueeze(-1), tokens_to_embeds, embeds))
 
         # Match the parent's position layout and clear padding for graph replay.
+        # The retired base exposed an xdrope-dimension attribute here; this
+        # base splits positions two-way (mrope/plain) exactly like its own
+        # dummy run, so xdrope models follow whichever layout the base uses.
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
-        elif self.uses_xdrope_dim > 0:
-            positions = self.xdrope_positions.gpu[:, :num_input_tokens]
         else:
             positions = self.positions[:num_input_tokens]
             if num_input_tokens > count:
