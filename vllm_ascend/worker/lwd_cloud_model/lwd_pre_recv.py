@@ -22,8 +22,9 @@ hint queued there would never get its recv posted "early".
 
 * hint MQ: the engine creates the writer (handle exported to env before
   worker creation); the cloud endpoint rank attaches the reader by handle;
-* done MQ: the cloud endpoint rank creates the writer, the handle rides
-  the READY handshake back, and the engine attaches the reader.
+* done MQ: the cloud endpoint rank creates the writer; after the executor
+  is up, the engine fetches its handle over ``collective_rpc``
+  (``LwdCloudWorker.lwd_early_recv_done_handle``) and attaches the reader.
 
 Watermark semantics: ``is_irecv_complete(channel, seqno)`` ==
 ``seqno <= watermark``. Per-channel completion order = seqno order
@@ -119,7 +120,8 @@ def _new_sideband_mq() -> MessageQueue:
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
     return MessageQueue(
-        1, 1,
+        1,
+        1,
         max_chunk_bytes=_SIDEBAND_MAX_CHUNK_BYTES,
         max_chunks=_SIDEBAND_MAX_CHUNKS,
     )
@@ -177,7 +179,8 @@ def attach_hint_mq() -> MessageQueue | None:
 
 
 def create_report_mq() -> MessageQueue:
-    """Worker side: create the done MQ (writer); the handle returns to the engine with the READY handshake."""
+    """Worker side: create the done MQ (writer); the engine fetches its
+    handle over ``collective_rpc`` once the executor is up."""
     return _new_sideband_mq()
 
 

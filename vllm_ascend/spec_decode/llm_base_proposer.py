@@ -1185,8 +1185,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.sliding_window.apply(common_attn_metadata)
 
         lwd_inputs_embeds = self._lwd_build_first_pass_embeds(
-            num_tokens, num_input_tokens, next_token_ids,
-            token_indices_to_sample, common_attn_metadata,
+            num_tokens,
+            num_input_tokens,
+            next_token_ids,
+            token_indices_to_sample,
+            common_attn_metadata,
         )
         if lwd_inputs_embeds is not None:
             # LWD: organize the first-pass inputs from the
@@ -1855,9 +1858,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if computed is None:
             return None
         num_prompt = runner.input_batch.num_prompt_tokens
-        qsl = (cad.query_start_loc_cpu.tolist()
-               if getattr(cad, "query_start_loc_cpu", None) is not None
-               else cad.query_start_loc.tolist())
+        qsl = (
+            cad.query_start_loc_cpu.tolist()
+            if getattr(cad, "query_start_loc_cpu", None) is not None
+            else cad.query_start_loc.tolist()
+        )
         out = self.inputs_embeds  # persistent buffer (graph-safe)
         # Seed pass: after the right shift, input_ids are real tokens in
         # the decode segments and at the sampling position — embed the

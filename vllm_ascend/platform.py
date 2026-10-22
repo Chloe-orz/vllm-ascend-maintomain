@@ -1332,13 +1332,13 @@ def _setup_worker_and_scheduler(
                 parallel_config.worker_cls = "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker.LwdCloudWorker"
         else:
             hardware_profile = get_current_hardware_profile()
-        if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
-            HardwareCapability.STANDARD_WORKER_PATCHES
-        ):
-            logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
-            parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
-        else:
-            parallel_config.worker_cls = hardware_profile.default_worker_cls
+            if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
+                HardwareCapability.STANDARD_WORKER_PATCHES
+            ):
+                logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
+                parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+            else:
+                parallel_config.worker_cls = hardware_profile.default_worker_cls
 
     refresh_block_size(vllm_config)
 

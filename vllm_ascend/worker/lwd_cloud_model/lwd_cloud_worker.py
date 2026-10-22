@@ -80,9 +80,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # ids on its input), so the native prompt-embeds path must be
         # enabled for the runner to allocate inputs_embeds buffers.
         self.model_config.enable_prompt_embeds = True
-        self.model_runner = LwdCloudModelRunner(
-            self.vllm_config, self.device, worker=self
-        )
+        self.model_runner = LwdCloudModelRunner(self.vllm_config, self.device, worker=self)
         self._init_lwd_data_plane()
         # Only the endpoint rank (the cloud leader — first rank of the
         # first cloud DP in the topology) has a cross-node channel: start
@@ -127,8 +125,7 @@ class LwdCloudWorker(LwdWorkerBase):
         layers = getattr(backbone, "layers", None) or getattr(backbone, "decoder_layers", None)
         pc = self.vllm_config.parallel_config
         layer_names = [
-            n for n, _ in model.named_modules()
-            if n.count("layers.") == 1 and n.endswith(tuple("0123456789"))
+            n for n, _ in model.named_modules() if n.count("layers.") == 1 and n.endswith(tuple("0123456789"))
         ]
         lwd_logger.info(
             "[Lwd][cloud-model] loaded layers=%s first=%s last=%s "
@@ -136,7 +133,9 @@ class LwdCloudWorker(LwdWorkerBase):
             len(layers) if layers is not None else "?",
             layer_names[0] if layer_names else "?",
             layer_names[-1] if layer_names else "?",
-            pc.pipeline_parallel_size, pc.tensor_parallel_size, self.rank,
+            pc.pipeline_parallel_size,
+            pc.tensor_parallel_size,
+            self.rank,
         )
 
     # ------------------------------------------------------------------ #
@@ -149,7 +148,8 @@ class LwdCloudWorker(LwdWorkerBase):
         # alignment cost)
         lwd_logger.info(
             "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
-            self.rank, time.monotonic(),
+            self.rank,
+            time.monotonic(),
         )
         # cloud: post the exact-size UP irecv for every incoming
         # LWD_EMBED batch (control info rides scheduler_output.lwd_batch).
@@ -218,9 +218,7 @@ class LwdCloudWorker(LwdWorkerBase):
         # The aux frame mechanism stays in the channel layer for deepstack
         # and other future payloads.
         if self._lwd_early_recv_endpoint:
-            future = self.get_or_post_early_recv(
-                batch.seqno, num_tokens, 0
-            )
+            future = self.get_or_post_early_recv(batch.seqno, num_tokens, 0)
         else:
             # Non-endpoint: never touches the cross-node channel; the
             # broadcast receive is deferred to inject time. None marks
@@ -247,11 +245,13 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
             "endpoint=True ts=%.3f mem_alloc=%.2fGiB mem_peak=%.2fGiB "
             "mem_free=%.2fGiB",
-            batch.seqno, len(meta.req_ids), num_tokens,
+            batch.seqno,
+            len(meta.req_ids),
+            num_tokens,
             time.monotonic(),
-            torch.npu.memory_allocated() / 2 ** 30,
-            torch.npu.max_memory_allocated() / 2 ** 30,
-            free_bytes / 2 ** 30,
+            torch.npu.memory_allocated() / 2**30,
+            torch.npu.max_memory_allocated() / 2**30,
+            free_bytes / 2**30,
         )
 
     # ------------------------------------------------------------------ #
@@ -293,7 +293,9 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_pending: dict[tuple[LwdChannelType, int], dict[str, Any]] = {}
         # Rate-limit timestamp for the stuck-queue diagnostic
         self._early_recv_stuck_log_at = 0.0
-        # Downstream hint MQ (reader) / upstream completion MQ (writer)
+        # Downstream hint MQ (reader) / upstream completion MQ (writer); the
+        # engine attaches the done reader through the handle returned by
+        # lwd_early_recv_done_handle (fetched over collective_rpc).
         self._irecv_hint_mq = None
         self._irecv_done_mq = None
         self._lwd_early_recv_thread: threading.Thread | None = None
@@ -313,7 +315,8 @@ class LwdCloudWorker(LwdWorkerBase):
             channel=LwdChannelType.UP,
             op="recv",
             num_elements=hash_payload_numel(
-                num_tokens, self._lwd_up_hidden_size,
+                num_tokens,
+                self._lwd_up_hidden_size,
                 hash_layer_count(self.model_config.hf_config),
                 getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
             ),
@@ -347,7 +350,8 @@ class LwdCloudWorker(LwdWorkerBase):
         # is up, so the vllm executor stays free of LWD plumbing.
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
-            self.rank, "attached" if self._irecv_hint_mq is not None else "none",
+            self.rank,
+            "attached" if self._irecv_hint_mq is not None else "none",
         )
         self._lwd_early_recv_thread = threading.Thread(
             target=self._lwd_early_recv_loop,
@@ -375,11 +379,13 @@ class LwdCloudWorker(LwdWorkerBase):
         a channel plus a cross-thread wait on the other is disallowed by
         HCCL).
         """
-        # The current device is thread-local state; the comm thread must set it once itself (or the irecv lands on card 0)
+        # The current device is thread-local state; the comm thread must
+        # set it once itself (or the irecv lands on card 0)
         torch.npu.set_device(self.device)
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
-            self.rank, self.device,
+            self.rank,
+            self.device,
             "attached" if self._irecv_hint_mq is not None else "none",
         )
         hint_mq = self._irecv_hint_mq
@@ -429,7 +435,9 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][pre-recv] queue stuck: oldest queued seqno=%d, %d slot(s) "
             "held by seqno=%s (slots held = those batches posted recv but "
             "were never consumed; downstream dispatch is the pacer)",
-            oldest, len(holders), holders,
+            oldest,
+            len(holders),
+            holders,
         )
 
     def start_early_irecv(self, hint: dict[str, Any]) -> None:
@@ -472,9 +480,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 key, hint = next(iter(self._early_recv_pending.items()))
                 del self._early_recv_pending[key]
                 seqno, num_tokens, aux_rows = hint_fields(hint)
-                future = lwd_get_data_plane().submit_recv(
-                    self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
-                )
+                future = lwd_get_data_plane().submit_recv(self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows))
                 self._early_recv_futures[key] = future
                 inflight = len(self._early_recv_futures)
                 queued = len(self._early_recv_pending)
@@ -513,13 +519,17 @@ class LwdCloudWorker(LwdWorkerBase):
             # ① Completed: this recv's data (main frame + aux frame) has fully landed
             lwd_logger.info(
                 "[Lwd][pre-recv] DONE channel=%s seqno=%d ts=%.3f",
-                key[0].value, key[1], time.monotonic(),
+                key[0].value,
+                key[1],
+                time.monotonic(),
             )
             # ② Report: write (channel, seqno) into the done MQ; the engine drains it each step to advance the watermark
             done_mq.enqueue(key)
             lwd_logger.info(
                 "[Lwd][pre-recv] REPORT channel=%s seqno=%d ts=%.3f",
-                key[0].value, key[1], time.monotonic(),
+                key[0].value,
+                key[1],
+                time.monotonic(),
             )
             with self._early_recv_lock:
                 self._early_recv_reported.add(key)
@@ -561,9 +571,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 hint = self._early_recv_pending.pop(key, None)
                 if hint is not None:
                     future = lwd_get_data_plane().submit_recv(
-                        self._lwd_build_up_recv_request(
-                            seqno, num_tokens, aux_rows
-                        )
+                        self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
                     )
                     self._early_recv_futures[key] = future
             if future is not None:
@@ -577,9 +585,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 # SO): re-post from the same information so the report chain
                 # has no gaps and the watermark can keep advancing
                 lwd_logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
-                future = lwd_get_data_plane().submit_recv(
-                    self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
-                )
+                future = lwd_get_data_plane().submit_recv(self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows))
                 self._early_recv_futures[key] = future
             inflight = len(self._early_recv_futures)
             queued = len(self._early_recv_pending)
@@ -587,7 +593,9 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_pump()
         lwd_logger.info(
             "[Lwd][pre-recv] stats seqno=%d inflight=%d queued=%d",
-            seqno, inflight, queued,
+            seqno,
+            inflight,
+            queued,
         )
         return future
 
@@ -603,16 +611,18 @@ class LwdCloudWorker(LwdWorkerBase):
         output = self.model_runner.sample_tokens(grammar_output)
         _t_sample = time.monotonic()
         # rank-replay DOWN: send the hidden packet (channel-async,
-        # in-stream ordered); the pinned view rides the output's inner
-        # layer (readiness guaranteed by get_output's wait_stream on the
-        # main stream), and the engine side decodes/publishes the meta.
+        # in-stream ordered); the step meta stays on device until the
+        # fenced harvest below brings it to the host with a device-side
+        # stream dependency (dedicated stream wait_event on the ready
+        # event, completion event recorded on the copy stream itself).
         payload = self.model_runner.take_lwd_pending_down_payload()
         if payload is not None and output is not None:
             (hidden, meta_dev, seg_lens_host, ready_event, req_ids) = payload
             seqno = self._lwd_next_down_seqno()
             lwd_logger.info(
                 "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
-                seqno, hidden.numel(),
+                seqno,
+                hidden.numel(),
             )
             lwd_get_data_plane().submit_send(
                 LwdTransferRequest(
@@ -654,8 +664,8 @@ class LwdCloudWorker(LwdWorkerBase):
             )
             # [Lwd][perf] Per-step cloud timing: sample = sampling +
             # collection (rank computation included); send = the DOWN
-            # submit (snapshot clone + isend + bridge wait); total = the
-            # whole step
+            # submit (snapshot clone + isend + bridge wait); harvest =
+            # the fenced meta copy; total = the whole step
             lwd_logger.info(
                 "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f harvest=%.2f total=%.2fms rows=%d",
                 seqno,
@@ -696,9 +706,7 @@ class LwdCloudWorker(LwdWorkerBase):
         (``lwd_release_finished``, the single owner of the release path);
         finished_req_ids is the engine's own liveness signal, so this
         cleanup does not depend on the control plane."""
-        lwd_logger.info(
-            "[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids)
-        )
+        lwd_logger.info("[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids))
         self.model_runner.lwd_release_finished(finished_req_ids)
 
     def _register_lwd_prompt_embeds_provider(self) -> None:
@@ -722,9 +730,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 return None
             return runner.input_batch.req_prompt_embeds.get(idx)
 
-        AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(
-            _lwd_prompt_embeds_provider
-        )
+        AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
     def _lwd_next_down_seqno(self) -> int:
         seqno = self._lwd_down_next_seqno
