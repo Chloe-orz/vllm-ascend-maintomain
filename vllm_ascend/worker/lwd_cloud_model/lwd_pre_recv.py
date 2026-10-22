@@ -52,27 +52,17 @@ endpoint rank only.
 from __future__ import annotations
 
 import base64
+import json
 import os
-import pickle
 import threading
 from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from typing import TYPE_CHECKING
-
-from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 if TYPE_CHECKING:
-    from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
-
-# The logger name must sit inside the **vllm.** namespace: vLLM attaches
-# handlers only to loggers named "vllm" (DEFAULT_LOGGING_CONFIG,
-# propagate=False); child loggers reach that handler by propagation.
-# vllm_ascend.* loggers cannot reach "vllm" (the root logger has no
-# handler). This module's own logging keeps only exception diagnostics
-# (the healthy-path HINT/watermark/gate/worker segments are all logged in
-# lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py /
-# lwd_cloud_worker.py).
+    from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 
 #: Env var carrying the downstream hint MQ handle. The executor exports it
 #: before creating the worker; the worker rebuilds the reader in
@@ -124,7 +114,7 @@ def hint_fields(hint: dict) -> tuple[int, int, int] | None:
 # ---------------------------------------------------------------------- #
 # Bypass MQ lifecycle                                                    #
 # ---------------------------------------------------------------------- #
-def _new_sideband_mq() -> "MessageQueue":
+def _new_sideband_mq() -> MessageQueue:
     """A 1-reader 1-writer bypass MQ (hint and report share the spec; only the endpoint rank participates)."""
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -135,7 +125,30 @@ def _new_sideband_mq() -> "MessageQueue":
     )
 
 
-def create_hint_mq() -> "MessageQueue":
+def _encode_handle(handle: Handle) -> str:
+    """Encode a MessageQueue handle into an env-safe ASCII string.
+
+    Every Handle field is a JSON-native type, so the sideband handoff
+    never needs pickle (a forbidden import in this repo).
+    """
+    return base64.b64encode(json.dumps(asdict(handle)).encode("ascii")).decode("ascii")
+
+
+def _decode_handle(raw: str) -> Handle:
+    """Rebuild a Handle from its JSON encoding.
+
+    JSON arrays come back as lists; restore the tuple the MessageQueue
+    expects in buffer_handle.
+    """
+    fields = json.loads(base64.b64decode(raw))
+    if fields.get("buffer_handle") is not None:
+        fields["buffer_handle"] = tuple(fields["buffer_handle"])
+    from vllm.distributed.device_communicators.shm_broadcast import Handle
+
+    return Handle(**fields)
+
+
+def create_hint_mq() -> MessageQueue:
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
@@ -143,13 +156,11 @@ def create_hint_mq() -> "MessageQueue":
     from the env at startup); both fork and spawn inherit via env vars.
     """
     mq = _new_sideband_mq()
-    os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(
-        pickle.dumps(mq.export_handle())
-    ).decode("ascii")
+    os.environ[LWD_RECV_HINT_MQ_ENV] = _encode_handle(mq.export_handle())
     return mq
 
 
-def attach_hint_mq() -> "MessageQueue | None":
+def attach_hint_mq() -> MessageQueue | None:
     """Worker side: rebuild the hint MQ reader from the handle in the
     environment.
 
@@ -162,10 +173,10 @@ def attach_hint_mq() -> "MessageQueue | None":
         return None
     from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
-    return MessageQueue.create_from_handle(pickle.loads(base64.b64decode(raw)), 0)
+    return MessageQueue.create_from_handle(_decode_handle(raw), 0)
 
 
-def create_report_mq() -> "MessageQueue":
+def create_report_mq() -> MessageQueue:
     """Worker side: create the done MQ (writer); the handle returns to the engine with the READY handshake."""
     return _new_sideband_mq()
 
@@ -199,15 +210,11 @@ def post_irecv_hint(hint: dict) -> None:
     and they must be visible in the logs.
     """
     if _hint_sender is None:
-        # No transport = this process does not participate in early recv
-        # (e.g. the phase-scheduler escape hatch): losing a hint costs no
-        # correctness — that branch has no gate waiting on it, and the
-        # consume point posts the recv itself.
-        lwd_logger.warning(
-            "[Lwd][pre-recv] HINT DROPPED: no sender registered seqno=%s",
-            hint.get("seqno"),
-        )
-        return
+        # The engine registers the sender during startup, before it accepts
+        # any edge message, so a missing one is a wiring error; dropping the
+        # hint would stall the pre-recv gate forever (nobody would pre-post
+        # that recv, the watermark would never advance).
+        raise RuntimeError(f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no registered sender")
     _hint_sender(hint)
 
 

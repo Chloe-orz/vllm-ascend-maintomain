@@ -67,9 +67,7 @@ class LwdPinnedStaging:
         self._index = (index + 1) % self._depth
         return index
 
-    def stage_to_device(
-        self, src: Sequence[int] | np.ndarray, n: int
-    ) -> torch.Tensor:
+    def stage_to_device(self, src: Sequence[int] | np.ndarray, n: int) -> torch.Tensor:
         """Stage ``src`` and issue an async H2D; return the ``[:n]`` device view.
 
         Same-stream ordering guarantees the consumer kernel reads this
