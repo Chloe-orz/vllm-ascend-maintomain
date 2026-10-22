@@ -565,6 +565,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             context.input_ids = self._lwd_hash_token_ids[:num_tokens_padded]
             context.lwd_hash_expert_ids = self._lwd_hash_experts[:num_tokens_padded]
             context.lwd_hash_prompt_mask = self._lwd_hash_prompt_mask[:num_tokens_padded]
+            if input_ids is None:
+                # Covers the dummy/profile run: with enable_prompt_embeds it
+                # also takes the inputs_embeds branch (input_ids=None), and
+                # the model-layer hash fail-fast rejects None before the
+                # router's dummy-token-0 path can run. Same contract as the
+                # request-side placeholder: all zeros, never read (the
+                # router swaps in row indices).
+                input_ids = torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])
         return super()._model_forward(
             num_tokens_padded,
             input_ids,
