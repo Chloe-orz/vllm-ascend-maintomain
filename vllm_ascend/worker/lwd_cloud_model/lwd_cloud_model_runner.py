@@ -471,8 +471,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             positions = self.positions[:num_input_tokens]
             if num_input_tokens > count:
                 self.positions[count:num_input_tokens].zero_()
+
+        # DSV4-only: the upstream model-layer fail-fast requires a non-None ids
+        # tensor on hash MoE layers, but LWD keeps real token IDs off the cloud
+        # entirely. Nothing true exists here, so the placeholder is
+        # information-free by construction (all zeros): the gate below and the
+        # remote expert-table publication in _model_forward key off the same
+        # lwd_hash_state, so the router always swaps the tensor for row
+        # indices before any read -- the values are dead on arrival. Other
+        # models keep the native None unchanged.
+        model_input_ids: torch.Tensor | None = None
+        if self.lwd_hash_state is not None:
+            model_input_ids = torch.zeros_like(self.input_ids.gpu[:num_input_tokens])
         return (
-            None,
+            model_input_ids,
             self.inputs_embeds.gpu[:num_input_tokens],
             positions,
             None,
