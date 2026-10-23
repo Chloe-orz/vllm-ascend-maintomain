@@ -181,6 +181,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
+            dp_idx=batch_meta.dp_idx,
             tensor=payload,
             seqno=seqno,
         )
@@ -213,6 +214,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
+                dp_idx=batch_meta.dp_idx,
                 seqno=seqno,
             )
         )

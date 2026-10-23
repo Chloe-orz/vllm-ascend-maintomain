@@ -42,6 +42,10 @@ class LwdTransferRequest:
     # 32 + R*(H+3K)).  recv: used to allocate the exact-size buffer
     # (HCCL P2P requires matching numel on both ends).
     num_elements: int
+    # DP connection this transfer belongs to; the edge serves several
+    # connections, so its channel choice is per transfer. Defaults to 0
+    # and keeps single-connection behaviour.
+    dp_idx: int = 0
     # send: payload tensor (snapshotted into a communication-owned buffer
     # at submit time).  recv: None.
     tensor: Any | None = None

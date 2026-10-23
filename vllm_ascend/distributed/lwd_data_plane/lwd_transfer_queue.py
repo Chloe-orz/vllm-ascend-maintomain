@@ -57,9 +57,10 @@ def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
 
 
 class LwdTransferQueue:
-    """One FIFO of pending requests for one channel and op."""
+    """One FIFO of pending requests for one DP connection, channel and op."""
 
-    def __init__(self, channel_type: LwdChannelType, op: str) -> None:
+    def __init__(self, dp_idx: int, channel_type: LwdChannelType, op: str) -> None:
+        self.dp_idx = dp_idx
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self._pending: deque[LwdTransferFuture] = deque()
@@ -344,7 +345,7 @@ class LwdTransferQueue:
         return into
 
     def _stream(self):
-        return lwd_channels.lwd_get_channel_stream(self.channel_type)
+        return lwd_channels.lwd_get_channel_stream(self.channel_type, self.dp_idx)
 
     def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
@@ -354,10 +355,10 @@ class LwdTransferQueue:
             self._stream().wait_event(event)
 
     def _post_send(self, req: LwdTransferRequest) -> list[Any]:
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type)
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
         tensor = req.tensor
         assert tensor is not None
         logger.debug(
@@ -388,10 +389,10 @@ class LwdTransferQueue:
         return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _post_recv(self, req: LwdTransferRequest):
-        group = lwd_channels.lwd_get_channel_device_group(self.channel_type)
+        group = lwd_channels.lwd_get_channel_device_group(self.channel_type, self.dp_idx)
         peer = req.peer_rank
         if peer is None:
-            peer = lwd_channels.lwd_get_channel_peer(self.channel_type)
+            peer = lwd_channels.lwd_get_channel_peer(self.channel_type, self.dp_idx)
         logger.debug(
             "[lwd-comm] RECV post channel=%s my_rank=%d src=%s group_ranks=%s num_elements=%d aux_elements=%d op=irecv",
             self.channel_type,

@@ -82,23 +82,31 @@ class LwdCloudWorker(LwdWorkerBase):
         self.model_config.enable_prompt_embeds = True
         self.model_runner = LwdCloudModelRunner(self.vllm_config, self.device, worker=self)
         self._init_lwd_data_plane()
-        # Only the endpoint rank (the cloud leader — first rank of the
-        # first cloud DP in the topology) has a cross-node channel: start
+        # Only the endpoint rank of this engine's DP connection (the first
+        # rank of its cloud DP allocation) has a cross-node channel: start
         # its early-recv comm thread. The topology ranks are GLOBAL, while
         # self.rank is the executor's per-node numbering — the edge card
         # count offsets them (seen live: local rank 1 of the cloud was
         # picked as "endpoint", its comm thread then died on "rank 2 holds
-        # no lwd_up channel"). Compare the distributed global rank.
+        # no lwd_up channel"). Compare the distributed global rank. The
+        # dp_idx follows this worker's engine (each engine process maps one
+        # DP's allocation), so each engine posts recvs on its own
+        # connection only.
         import torch.distributed as dist
 
+        lwd_config = self.vllm_config.lwd_config
+        assert lwd_config is not None
+        self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
+        endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
+        self._lwd_early_recv_endpoint = global_rank == endpoint_rank
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         lwd_logger.info(
-            "[Lwd][pre-recv] worker local_rank=%d global_rank=%d endpoint=%s hidden=%d",
+            "[Lwd][pre-recv] worker local_rank=%d global_rank=%d dp_idx=%d endpoint=%s hidden=%d",
             self.rank,
             global_rank,
+            self._lwd_dp_idx,
             self._lwd_early_recv_endpoint,
             self._lwd_up_hidden_size,
         )
@@ -314,6 +322,7 @@ class LwdCloudWorker(LwdWorkerBase):
         return LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="recv",
+            dp_idx=self._lwd_dp_idx,
             num_elements=hash_payload_numel(
                 num_tokens,
                 self._lwd_up_hidden_size,
@@ -629,6 +638,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     channel=LwdChannelType.DOWN,
                     op="send",
                     num_elements=hidden.numel(),
+                    dp_idx=self._lwd_dp_idx,
                     tensor=hidden,
                     seqno=seqno,
                 )
