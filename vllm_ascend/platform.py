@@ -1439,14 +1439,27 @@ def _setup_worker_and_scheduler(
     # store it on ParallelConfig. Draft replace() rejects undeclared fields.
     parallel_config = vllm_config.parallel_config
     if parallel_config and parallel_config.worker_cls == "auto":
-        hardware_profile = get_current_hardware_profile()
-        if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
-            HardwareCapability.STANDARD_WORKER_PATCHES
-        ):
-            logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
-            parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+        # LWD edge/cloud worker selection (takes priority over hardware
+        # defaults). Main's config/lwd generation: LwdConfig presence
+        # means LWD; role ("edge"/"cloud") selects the worker class.
+        # The selection is exclusive, as on the mm branch: the xlite and
+        # hardware-default fallbacks must not touch (or overwrite) the
+        # LWD worker class.
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None:
+            if lwd_config.role == "edge":
+                parallel_config.worker_cls = "vllm_ascend.worker.lwd_edge_model.lwd_edge_worker.LwdEdgeWorker"
+            else:
+                parallel_config.worker_cls = "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker.LwdCloudWorker"
         else:
-            parallel_config.worker_cls = hardware_profile.default_worker_cls
+            hardware_profile = get_current_hardware_profile()
+            if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
+                HardwareCapability.STANDARD_WORKER_PATCHES
+            ):
+                logger.info("openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite")
+                parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
+            else:
+                parallel_config.worker_cls = hardware_profile.default_worker_cls
 
     refresh_block_size(vllm_config)
 

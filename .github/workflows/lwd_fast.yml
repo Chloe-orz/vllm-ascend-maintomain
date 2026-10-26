@@ -1,0 +1,22 @@
+name: LWD Fast
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: lwd-fast-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  lwd-fast:
+    uses: vllm-data-comm/ci-infra/.github/workflows/lwd_fast.yml@main
+    with:
+      upstream_repo: vllm-project/vllm-ascend
+      source_roots: vllm_ascend/
+      pre_commit_skip: ""

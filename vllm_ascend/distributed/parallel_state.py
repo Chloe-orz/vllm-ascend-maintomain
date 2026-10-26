@@ -13,6 +13,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 
 if TYPE_CHECKING:
     from vllm.config import EngramConfig
+    from vllm.config.lwd import LwdConfig
 
 # Currently, mc2 op need their own group coordinator.
 _MC2: GroupCoordinator | None = None
@@ -68,6 +69,11 @@ def init_ascend_model_parallel(
     assert torch.distributed.is_initialized()
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
+    # Upstream vLLM has no lwd_config; only LWD runs import the LWD modules.
+    lwd_config = getattr(get_current_vllm_config(), "lwd_config", None)
+    if lwd_config is not None:
+        _lwd_init_ascend_model_parallel(lwd_config, backend)
+        return
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
@@ -210,6 +216,18 @@ def init_ascend_model_parallel(
         _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
+
+
+def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> None:
+    """Build the Ascend groups of the HCCL world shared by the LWD edge and cloud."""
+    from vllm_ascend.distributed.lwd_data_plane.lwd_parallel_groups import lwd_mc2_group_ranks
+
+    global _MC2, _DYNAMIC_EPLB
+    group_ranks = lwd_mc2_group_ranks(lwd_config)
+    local_rank = get_world_group().local_rank
+    _MC2 = init_model_parallel_group(group_ranks, local_rank, backend, group_name="mc2")
+    if get_ascend_config().eplb_config.dynamic_eplb:
+        _DYNAMIC_EPLB = init_model_parallel_group(group_ranks, local_rank, backend, group_name="dynamic_eplb")
 
 
 def model_parallel_initialized():

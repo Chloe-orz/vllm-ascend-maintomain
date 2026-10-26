@@ -1,56 +1,44 @@
-<!--  Thanks for sending a pull request!
+<!-- markdownlint-disable -->
+# 方案 (复杂的需要方案架构图, 不复杂的不需要)
 
-BEFORE SUBMITTING, PLEASE READ https://docs.vllm.ai/en/latest/contributing/overview.html
+# 评审截图 (涉及外部的需要评审, 不涉及的不需要)
 
--->
-### What this PR does / why we need it?
-<!--
-- Please clarify what changes you are proposing. The purpose of this section is to outline the changes and how this PR fixes the issue.
-If possible, please consider writing useful notes for better and faster reviews in your PR.
+# 修改影响 (类似代码注释的功能, 建议补充, 方便回忆意图)
 
-- Please clarify why the changes are needed. For instance, the use case and bug description.
+# 测试结果
 
-- Fixes #
--->
+## 命令
+<!-- 运行命令 -->
 
-### Does this PR introduce _any_ user-facing change?
-<!--
-Note that it means *any* user-facing change including all aspects such as API, interface or other behavior changes.
-Documentation-only updates are not considered user-facing changes.
+## 修改前
+<!-- 截图 -->
 
-If yes, add a release note fragment `release_notes/fragments/<PR number>.yaml` in this PR.
-If no, no fragment is needed. When unsure, add one; the release manager can drop extras later.
-See release_notes/README.md for the principles and format.
--->
+## 修改后
+<!-- 截图 -->
 
-### How was this patch tested?
-<!--
-CI passed with new added/existing test.
-If it was tested in a way different from regular unit tests, please clarify how you tested step by step, ideally copy and paste-able, so that other reviewers can test and check, and descendants can verify in the future.
-If tests were not added, please describe why they were not added and/or why it was difficult to add.
--->
+# Checklist
+- [ ] 实现全面, 功能完备 -- 需要人看!
+- [ ] 避免 if-else 堆叠: 公共流程抽象为基类, 差异流程用子类继承承载 -- 需要人看!
+- [ ] 模块间隔离: 模块间依赖要少, 要高内聚, 避免改动一个模块影响无关模块 -- 需要人看!
+- [ ] 性能敏感路径要评估性能影响 -- 需要人看!
+- [ ] 命名要清晰 -- 需要人看!
 
----
+- [ ] PR描述说明要清晰, 完备
+- [ ] PR要有自验证报告, 和测试截图
+- [ ] vllm 和 vllm-ascend 的 PR 描述中要互相贴关联链接
 
-### Checklist
+- [ ] bugfix需要补充回归测试
+- [ ] CI 已通过, 否则打`no-test`标签
 
-<!--
-Please go through the checklist below before requesting review.
-Tick the boxes that apply ([x]). If an item does not apply, leave it unchecked;
-optionally explain why in the PR description.
--->
+- [ ] 避免侵入式修改, 不要使用patch
+- [ ] fail-fast, 避免往下传递异常情况
+- [ ] 类型标注要全面
+- [ ] 函数职责要单一
+- [ ] 注释不要冗余
+- [ ] 公共函数要提取
+- [ ] 检查魔法数字
+- [ ] 没做完的地方是否有TODO注释
+- [ ] 使用英文, 不要使用中文
+- [ ] 测试是否覆盖失败分支
+- [ ] 逻辑性比较强的有业务逻辑需要ut. 初始化等代码不需要测试.
 
-#### Testing
-
-- [ ] **Boundary / edge-case coverage**: I reviewed whether this change involves
-  boundary conditions (e.g. empty input, single/zero element, min/max values,
-  off-by-one, sequence-length limits, integer overflow). Where applicable, I
-  added unit tests covering these edge cases in `tests/ut/` or `tests/e2e/`.
-- [ ] **Regression test**: If this PR fixes a bug, I added a regression test
-  that would fail without the fix.
-- [ ] **Error / failure path coverage**: I covered abnormal paths (exceptions,
-  timeouts, out-of-range, division by zero) in addition to the happy path.
-- [ ] **Meaningful & reliable tests**: New tests assert real behavior and are
-  not written merely to satisfy CI.
-- [ ] **Performance impact**: If this PR touches a performance-sensitive path,
-  I attached benchmark results and added performance regression tests.

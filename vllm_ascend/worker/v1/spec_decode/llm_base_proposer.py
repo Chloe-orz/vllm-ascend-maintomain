@@ -110,8 +110,40 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+def _backup_token_id(req_state, idx: int) -> int:
+    """Placeholder-embeds tolerance for get_token_id.
+
+    LWD cloud requests have their prompt injected as
+    embeds; prompt_token_ids is None and reading an id at a prompt
+    position would raise (gpu_input_batch.py:get_token_id). The backup
+    value is only selected by torch.where when the request has no valid
+    sampled token this step: for a mid-prefill (chunked) request, that
+    position's draft input is overwritten by provider embeds (the prompt
+    overwrite in _lwd_build_first_pass_embeds), the id never reaches the
+    draft forward, so a zero placeholder suffices; decode/finished
+    requests always carry a valid sampled token and never consume the
+    backup.
+    """
+    if req_state.prompt_token_ids is None and idx < req_state.num_prompt_tokens:
+        return 0
+    return req_state.get_token_id(idx)
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
+
+    # LWD: provider of edge-computed prompt embeddings for the
+    # draft model's first pass (set by the worker at bring-up on the cloud).
+    # provider(req_id) -> Tensor [N, H] | None.
+    _lwd_prompt_embeds_provider = None
+
+    @classmethod
+    def set_lwd_prompt_embeds_provider(cls, provider) -> None:
+        # A bare function stored on the class binds self when read through an
+        # instance (descriptor protocol), adding a spurious argument at the
+        # call site; staticmethod keeps provider(req_id) as the raw callable.
+        cls._lwd_prompt_embeds_provider = staticmethod(provider)
+
     arange: torch.Tensor
     # GLM family: draft graph capture is not yet supported (see the forced-eager
     # gate in ``__init__``). Subclasses whose draft family supports graph input
@@ -1184,7 +1216,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # it would also window the target model.
             self.sliding_window.apply(common_attn_metadata)
 
-        if self.supports_mm_inputs:
+        lwd_inputs_embeds = self._lwd_build_first_pass_embeds(
+            num_tokens,
+            num_input_tokens,
+            next_token_ids,
+            token_indices_to_sample,
+            common_attn_metadata,
+        )
+        if lwd_inputs_embeds is not None:
+            # LWD: organize the first-pass inputs from the
+            # edge-computed prompt embeddings (received over the UP
+            # channel), not from token-id lookups.
+            inputs_embeds = lwd_inputs_embeds
+        elif self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
             if _draft_embed_accepts_mm(self.model.embed_input_ids):
                 inputs_embeds = self.model.embed_input_ids(
@@ -1774,6 +1818,112 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
         return draft_token_ids
 
+    def _lwd_build_first_pass_embeds(
+        self,
+        num_tokens: int,
+        num_input_tokens: int,
+        next_token_ids: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        cad: CommonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        """LWD: organize the draft first-pass inputs from the
+        edge-computed prompt embeddings (received over the UP channel)
+        instead of token-id lookups.
+
+        Alignment with ``set_inputs_first_pass``: after the one-position
+        right shift, position j of request i holds prompt token j+1, so
+        its input embedding is exactly prompt_embeds[j+1]; the sampling
+        position of each request holds the next token (already shifted
+        into ``self.input_ids`` by the caller).
+
+        Per-request hybrid construction (after mixed batching the batch
+        may hold prefill and decode requests simultaneously): seed the
+        whole batch via the token-id path first — after the one-position
+        right shift the decode segments are real tokens and the sampling
+        position holds the next token; only prompt segments carry
+        placeholder zeros. Then overwrite the prompt segments of the
+        requests that have any prompt rows in-segment (base+1 <
+        prompt_len) with provider embeds. Decode requests (whose
+        assembly buffer was already released when prefill completed)
+        never query the provider; unlike the original implementation,
+        one request missing its buffer no longer degrades the whole
+        batch — that regression returned same-batch prefill requests'
+        prompt segments to placeholder zeros, corrupting draft state at
+        the root (a known defect under MTP mixed batching).
+
+        Returns None (caller falls back to the token-id path) when no
+        provider is configured, a request that needs prompt embeds lacks
+        received rows / the chunk's rows are not yet fully assembled, the
+        draft model does not consume ``inputs_embeds``, or a CP (pcp)
+        manager rewrites first-pass inputs (different layout).
+        """
+        runner = self.runner
+        if runner is None:
+            return None
+        # The draft model must actually consume inputs_embeds (checked
+        # once); otherwise the token-id path stays authoritative.
+        accepts = getattr(self, "_lwd_accepts_inputs_embeds", None)
+        if accepts is None:
+            import inspect
+
+            try:
+                accepts = "inputs_embeds" in inspect.signature(self.model.forward).parameters
+            except (TypeError, ValueError):
+                accepts = False
+            self._lwd_accepts_inputs_embeds = accepts
+        if not accepts:
+            return None
+        # CP (pcp) first-pass rewriting changes the token layout
+        # (all-gather); the shift alignment below no longer holds.
+        if getattr(runner, "pcp_manager", None) is not None:
+            return None
+        req_ids = list(runner.input_batch.req_ids)
+        if not req_ids:
+            return None
+        # Chunk base per request: the draft runs every chunk in lockstep
+        # with the main model; slot j of the segment holds prompt token
+        # base+j+1 after the right shift, so the draft window is
+        # buf[base+1 : base+seg_len] — the SAME rows the main model
+        # consumes this chunk (buf[base : base+seg_len)), one position
+        # ahead, from the SAME assembly buffer.
+        computed = getattr(runner.input_batch, "num_computed_tokens_cpu", None)
+        if computed is None:
+            return None
+        num_prompt = runner.input_batch.num_prompt_tokens
+        qsl = (
+            cad.query_start_loc_cpu.tolist()
+            if getattr(cad, "query_start_loc_cpu", None) is not None
+            else cad.query_start_loc.tolist()
+        )
+        out = self.inputs_embeds  # persistent buffer (graph-safe)
+        # Seed pass: after the right shift, input_ids are real tokens in
+        # the decode segments and at the sampling position — embed the
+        # whole batch once; the placeholder-zero prompt embeddings are
+        # overwritten per-request below
+        out[:num_tokens] = self.model.embed_input_ids(self.input_ids[:num_tokens])
+        wrote_any = False
+        for i, req_id in enumerate(req_ids):
+            s, e = int(qsl[i]), int(qsl[i + 1])
+            base = int(computed[i]) if i < len(computed) else 0
+            prompt_len = int(num_prompt[i]) if i < len(num_prompt) else 0
+            if base + 1 >= prompt_len:
+                # No prompt rows in-segment (decode request): the seed pass is already correct; skip
+                continue
+            # Read the main model's inputs_embeds.gpu directly (replacing
+            # the CPU assembly buffer): injection already wrote the
+            # authoritative embeds into that window — bitwise-identical
+            # to the assembly buffer (the buffer was D2H'd from this very
+            # tensor). Window mapping: scheduling segment [s,e) rows =
+            # prompt positions [base, base+seg_len), the provider needs
+            # [base+1, base+seg_len) ⇒ gpu[s+1:e]. Eliminates the
+            # per-chunk 84MB synchronous D2H tail (measured as the bulk of
+            # the inject segment).
+            out[s : e - 1] = runner.inputs_embeds.gpu[s + 1 : e]
+            wrote_any = True
+        if not wrote_any:
+            return None
+        return out[:num_input_tokens]
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -2204,10 +2354,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # TODO(Ben): Combine this into a custom fused kernel
 
         # Precompute get_token_id for when there is no valid next token
+        # (_backup_token_id: prompt-position ids are unknowable for LWD
+        # placeholder-embeds requests; backfill zero — wherever the value
+        # would be truly consumed, provider embeds overwrite it)
         num_reqs = gpu_input_batch.num_reqs
         seq_lens_list = (gpu_input_batch.num_tokens_no_spec[:num_reqs] - 1).tolist()
         self.backup_next_token_ids.np[:num_reqs] = np.array(
-            [requests[gpu_input_batch.req_ids[i]].get_token_id(seq_lens_list[i]) for i in range(num_reqs)]
+            [_backup_token_id(requests[gpu_input_batch.req_ids[i]], seq_lens_list[i]) for i in range(num_reqs)]
         )
         self.backup_next_token_ids.copy_to_gpu(num_reqs)
 
