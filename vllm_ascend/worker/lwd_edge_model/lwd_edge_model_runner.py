@@ -81,7 +81,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         lwd_logger.info("[lwd-edge] loading tid2eid tables for %d Hash MoE layers", num_hash_layers)
         # Reuse vLLM's checkpoint resolution (revision, cache and shard filtering).
         loader = DefaultModelLoader(self.vllm_config.load_config)
-        _, weight_files, use_safetensors = loader._prepare_weights(
+        _, weight_files, use_safetensors, _ = loader._prepare_weights(
             self.model_config.model,
             subfolder=None,
             revision=self.model_config.revision,
