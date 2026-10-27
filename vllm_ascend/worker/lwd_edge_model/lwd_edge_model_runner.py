@@ -23,7 +23,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 
 if TYPE_CHECKING:
@@ -72,7 +72,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         config = self.model_config.hf_config
         if getattr(config, "model_type", None) != "deepseek_v4":
             return
-        num_hash_layers = config.num_hash_layers
+        num_hash_layers = hash_layer_count(config)
         if not 0 <= num_hash_layers <= config.num_hidden_layers:
             raise ValueError(f"Invalid DeepSeek V4 num_hash_layers: {num_hash_layers}")
         if num_hash_layers == 0:
