@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """AST weave guard: the shared vllm-ascend base classes must stay LWD-free.
 
-Scans ``vllm_ascend/worker/worker.py`` and ``model_runner_v1.py`` for LWD
+Scans ``vllm_ascend/worker/worker.py`` and ``worker/v1/model_runner.py`` for LWD
 symbols (identifiers, attributes, import aliases, getattr strings). Every
 allowlist entry is a known weave-in scheduled for removal by the base-class
 sinking batches; the test fails on
@@ -23,7 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 BASE_FILES = [
     "vllm_ascend/worker/worker.py",
-    "vllm_ascend/worker/model_runner_v1.py",
+    "vllm_ascend/worker/v1/model_runner.py",
 ]
 
 # Allowlist pins the currently restored weave-ins (see ALLOWED below).
@@ -34,7 +34,7 @@ BASE_FILES = [
 # production). Any new weave-in fails immediately.
 ALLOWED = {
     "vllm_ascend/worker/worker.py": set(),
-    "vllm_ascend/worker/model_runner_v1.py": set(),
+    "vllm_ascend/worker/v1/model_runner.py": set(),
 }
 
 

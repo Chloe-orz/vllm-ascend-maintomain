@@ -718,7 +718,7 @@ class LwdCloudWorker(LwdWorkerBase):
         (not scheduled / not LWD) returns None and the proposer falls
         back to the token-id path.
         """
-        from vllm_ascend.spec_decode.llm_base_proposer import (
+        from vllm_ascend.worker.v1.spec_decode.llm_base_proposer import (
             AscendSpecDecodeBaseProposer,
         )
 
