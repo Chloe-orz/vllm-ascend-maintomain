@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
 
 class LwdBaseModelRunner(NPUModelRunner):

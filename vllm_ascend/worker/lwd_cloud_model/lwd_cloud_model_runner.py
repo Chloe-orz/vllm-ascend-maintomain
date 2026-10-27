@@ -2,7 +2,7 @@
 """LWD model runner subclass (cloud side).
 
 All LWD runner-side logic lives here (moved out of
-``model_runner_v1.py``): the per-step cloud-side collection of the
+``vllm_ascend/worker/v1/model_runner.py``): the per-step cloud-side collection of the
 DOWN payload (hidden-only tensor) plus the step metadata (global ranks
 / num_accepted / req_ids) that rides back to the scheduler on
 ``ModelRunnerOutput.lwd_c2e_meta``.
@@ -183,7 +183,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         Idempotent per InputBatch instance: initialize_kv_cache
         REBUILDS the InputBatch when the final KV geometry differs from
         the pre-load guess (always true for the hybrid groups here,
-        model_runner_v1 re-init), so the hook must be re-anchored on
+        NPUModelRunner re-init), so the hook must be re-anchored on
         the live instance - see initialize_kv_cache below. The first
         acceptance run failed exactly this way: the wrapper stayed on
         the discarded instance and the residue poison survived.
@@ -194,7 +194,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         batch._lwd_row_reset_hooked = True
         orig_add = batch.add_request
 
-        def add_request_then_reset_row(request):
+        def add_request_then_reset_row(request: CachedRequestState) -> int:
             req_index = orig_add(request)
             self._lwd_reset_reused_row(request, req_index)
             return req_index
@@ -240,7 +240,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         mrope timing contract (fixes a source-branch defect found during
         the multimodal migration review): _calc_mrope_positions inside
         super() copies the req_state.mrope_positions window rows to the
-        GPU within the same step (model_runner_v1.py:1033-1045). If the
+        GPU within the same step in NPUModelRunner._prepare_inputs. If the
         mrope write landed after super() (the original shape), the
         current chunk's mrope rows would never be seen by its own
         forward (every chunk uses the ids=None arange initialization,
@@ -313,7 +313,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         num_computed_tokens_cpu assumes every previous draft was accepted
         (r tokens past the real commit position), while the native
         flattening (token_indices = positions + idx*M in
-        model_runner_v1.py) gathers from the 2D mask with those
+        NPUModelRunner._prepare_inputs) gathers from the 2D mask with those
         optimistic positions — decode rows shift right by r and the last
         r rows of each segment fall past the True-marked region, reading
         False/stale values. The prompt-embeds branch then treats them as
@@ -1038,7 +1038,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         wire_endpoint = get_tp_group().is_first_rank
         captured = None
         if wire_endpoint and self.execute_model_state is not None:
-            # ExecuteModelState layout (see model_runner_v1.sample_tokens):
+            # ExecuteModelState layout (see NPUModelRunner.sample_tokens):
             # (scheduler_output, logits, spec_decode_metadata,
             #  spec_decode_common_attn_metadata, hidden_states,
             #  sample_hidden_states, ...)
