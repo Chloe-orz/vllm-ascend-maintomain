@@ -5,8 +5,10 @@ import torch
 
 
 def hash_layer_count(config: "PretrainedConfig") -> int:
-    """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
-    return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
+    """Count upstream DeepSeek V4 Hash MoE layers; zero for other models."""
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return 0
+    return config.mlp_layer_types.count("hash_moe")
 
 
 def hash_payload_numel(num_tokens: int, hidden_size: int, num_layers: int, top_k: int) -> int:
