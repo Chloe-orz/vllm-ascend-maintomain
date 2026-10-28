@@ -106,7 +106,13 @@ def lwd_warm_up_channels() -> None:
                 else:
                     handle = dist.irecv(payload, src=peer, group=group)
                 handle.wait()
-                logger.info("[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d", endpoints.dp_idx, channel, my_rank, peer)
+                logger.info(
+                    "[LWD] data-plane warmup done: dp_idx=%d channel=%s my_rank=%d peer=%d",
+                    endpoints.dp_idx,
+                    channel,
+                    my_rank,
+                    peer,
+                )
     get_world_group().barrier()
 
 
@@ -124,9 +130,7 @@ def _lwd_channel(dp_idx: int, channel: LwdChannelType) -> tuple[dist.ProcessGrou
         ) from None
 
 
-def lwd_get_channel_device_group(
-    channel: LwdChannelType, dp_idx: int = 0
-) -> dist.ProcessGroup:
+def lwd_get_channel_device_group(channel: LwdChannelType, dp_idx: int = 0) -> dist.ProcessGroup:
     group, _ = _lwd_channel(dp_idx, channel)
     return group
 
@@ -137,9 +141,7 @@ def lwd_get_channel_peer(channel: LwdChannelType, dp_idx: int = 0) -> int:
     return peer
 
 
-def lwd_get_channel_stream(
-    channel: LwdChannelType, dp_idx: int = 0
-) -> torch.npu.Stream:
+def lwd_get_channel_stream(channel: LwdChannelType, dp_idx: int = 0) -> torch.npu.Stream:
     _lwd_channel(dp_idx, channel)
     return _LWD_CHANNEL_STREAMS[(dp_idx, channel)]
 
