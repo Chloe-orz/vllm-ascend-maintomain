@@ -26,6 +26,8 @@ extend-ignore-re = []
 
 [default.extend-identifiers]
 nd_to_nz_2d = "nd_to_nz_2d"
+# LWD wire field: per-request top-k id positions (top_id_ths)
+top_id_ths = "top_id_ths"
 bbc5b7ede = "bbc5b7ede"
 womens_doubles = "womens_doubles"
 v_2nd = "v_2nd"

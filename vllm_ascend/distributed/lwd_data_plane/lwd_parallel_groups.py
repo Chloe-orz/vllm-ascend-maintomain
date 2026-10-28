@@ -8,6 +8,7 @@ The native ``init_ascend_model_parallel`` slices the ranks on a uniform
 rank counts; the groups come from ``LwdParallelGroupsSpec`` instead.
 """
 
+from vllm.config import get_current_vllm_config
 from vllm.config.lwd import LwdConfig
 from vllm.distributed.lwd import LwdParallelGroupsSpec
 
@@ -15,17 +16,22 @@ from vllm_ascend.ascend_config import get_ascend_config
 
 
 def lwd_mc2_group_ranks(lwd_config: LwdConfig) -> list[list[int]]:
-    """MC2 group ranks: one group per edge instance DP and cloud instance DP.
+    """MC2 group ranks.
 
-    These match the vLLM-side EP groups, as the native MC2 groups do.
-
-    Raises:
-        NotImplementedError: An Ascend feature that derives its groups from
-            the uniform rank grid is enabled.
+    These match the vLLM-side EP groups, as the native MC2 groups do: one
+    group per edge instance, one group spanning every DP's ranks of each
+    cloud instance. A MoE cloud shards its experts dp x tp over all its
+    ranks, so the MC2 all2all of an engine must reach every cloud rank of
+    its instance -- grouping per engine would let tokens reach only a
+    fraction of the experts. Without MoE (or one DP per instance) the EP
+    groups equal the TP groups.
     """
     _lwd_check_ascend_features()
     spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
-    return [list(group) for group in spec.tp_groups]
+    config = get_current_vllm_config()
+    is_moe = config is None or config.model_config is None or config.model_config.is_moe
+    groups = spec.ep_groups if is_moe else spec.tp_groups
+    return [list(group) for group in groups]
 
 
 # TODO(lwd): move this check to NPUPlatform.check_and_update_config, so that
