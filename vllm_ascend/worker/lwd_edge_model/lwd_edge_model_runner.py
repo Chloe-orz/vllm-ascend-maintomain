@@ -27,13 +27,14 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, pack_
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
+    from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 
-def select_token_batch(
-    logits: torch.Tensor, ranks: list[int]
-) -> list[int]:
+
+def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
     """Batched rank→token lookup: one sort, one D2H sync for all rows.
 
     logits [R,V] rows sorted together (NPU sorts rows in parallel);
@@ -49,9 +50,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
-        device: "torch.device",
-        worker: "LwdWorkerBase | None" = None,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        worker: LwdWorkerBase | None = None,
     ) -> None:
         super().__init__(vllm_config, device, worker)
         self.mm_cache = LwdEdgeMmCache()
@@ -91,11 +92,14 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if not use_safetensors:
             raise ValueError("LWD DeepSeek V4 tid2eid loading requires safetensors weights")
         self.tid2eid_tables = load_tid2eid_tables(
-            weight_files, num_hash_layers, config.vocab_size,
-            config.num_experts_per_tok, config.n_routed_experts,
+            weight_files,
+            num_hash_layers,
+            config.vocab_size,
+            config.num_experts_per_tok,
+            config.n_routed_experts,
         )
 
-    def get_kv_cache_spec(self) -> "dict[str, KVCacheSpec]":
+    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """The LWD edge runs no attention/transformer, so it needs no KV cache."""
         return {}
 
@@ -109,7 +113,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         ordering guarantees the embed kernel reads this chunk's values
         (H2D enqueues ahead of the embed)."""
         return self._lwd_staging(
-            "edge_ids", dtype=torch.int64, min_capacity=8192,
+            "edge_ids",
+            dtype=torch.int64,
+            min_capacity=8192,
         ).stage_to_device(flat_token_ids, len(flat_token_ids))
 
     @torch.inference_mode()
@@ -117,7 +123,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self,
         seqno: int,
         batch_meta: LwdEmbedBatch,
-        scheduler_output: "SchedulerOutput",
+        scheduler_output: SchedulerOutput,
     ) -> None:
         model = self.get_model()
         if not batch_meta.token_ids:
@@ -131,19 +137,13 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # image embeds and embed placeholder tokens as text, i.e. compute
         # garbage.
         for req_data in scheduler_output.scheduled_new_reqs:
-            feats = [
-                f
-                for f in req_data.mm_features
-                if f.modality != "prompt_embeds"
-            ]
+            feats = [f for f in req_data.mm_features if f.modality != "prompt_embeds"]
             if feats:
                 self.mm_cache.register(req_data.req_id, feats)
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
-        lwd_logger.debug(
-            "[Lwd][edge-worker] embed token_ids=%s", flat_token_ids
-        )
+        lwd_logger.debug("[Lwd][edge-worker] embed token_ids=%s", flat_token_ids)
         token_ids_tensor = self._lwd_embed_ids_h2d(flat_token_ids)
         _t0 = time.monotonic()
         # Multimodal merge: when any request in the batch carries mm data,
@@ -151,7 +151,10 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # is_multimodal mask and take the model's native embed_input_ids
         # merge branch; text-only batches take the original direct path.
         mm_embeds, is_mm = self.mm_cache.gather_chunk(
-            batch_meta, model, self.device, self.pin_memory,
+            batch_meta,
+            model,
+            self.device,
+            self.pin_memory,
         )
         if mm_embeds:
             embeds = model.embed_input_ids(
@@ -170,7 +173,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             payload = pack_hash_payload(embeds, expert_ids)
             lwd_logger.info(
                 "[lwd-edge] UP Hash MoE seqno=%d expert_shape=%s payload_numel=%d",
-                seqno, tuple(expert_ids.shape), payload.numel(),
+                seqno,
+                tuple(expert_ids.shape),
+                payload.numel(),
             )
 
         # mrope positions ride the control plane with the RangeNotify
@@ -181,6 +186,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             channel=LwdChannelType.UP,
             op="send",
             num_elements=payload.numel(),
+            dp_idx=batch_meta.dp_idx,
             tensor=payload,
             seqno=seqno,
         )
@@ -191,18 +197,16 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # the cloud's enqueue, this segment grows visibly (direct evidence
         # of chunk-level lockstep)
         lwd_logger.info(
-            "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f "
-            "total=%.2fms tokens=%d",
-            seqno, (_t_fwd - _t0) * 1000,
+            "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f total=%.2fms tokens=%d",
+            seqno,
+            (_t_fwd - _t0) * 1000,
             (time.monotonic() - _t_fwd) * 1000,
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
 
     @torch.inference_mode()
-    def execute_lwd_unembed(
-        self, seqno: int, batch_meta: LwdUnembedBatch
-    ) -> ModelRunnerOutput:
+    def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.req_ids:
             return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
@@ -213,6 +217,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 channel=LwdChannelType.DOWN,
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
+                dp_idx=batch_meta.dp_idx,
                 seqno=seqno,
             )
         )
@@ -226,7 +231,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # lm_head must not be called directly (ParallelLMHead.forward
         # forces the sampler path); compute_logits is the standard
         # interface present on both wrapper and monolithic models.
-        logits = model.compute_logits(hidden_states)   # (rows_total, V)
+        logits = model.compute_logits(hidden_states)  # (rows_total, V)
         _t_lm = time.monotonic()
         # L5 parity check: the first row's top-20 compared entrywise
         # against the cloud sampler's [layer-trace] top-20 — any rank
@@ -240,24 +245,20 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 row = logits[0].detach().float()
                 vals, tids = torch.topk(row, min(20, row.numel()))
                 lwd_logger.info(
-                    "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f "
-                    "top20=%s",
-                    tuple(logits.shape), row.norm().item(),
+                    "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f top20=%s",
+                    tuple(logits.shape),
+                    row.norm().item(),
                     list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
                 )
         except Exception:  # noqa: BLE001
             pass
 
-        flat_ids = select_token_batch(
-            logits, [r for ths in batch_meta.top_id_ths for r in ths]
-        )
+        flat_ids = select_token_batch(logits, [r for ranks in batch_meta.top_id_ths for r in ranks])
         sampled_token_ids = []
         off = 0
-        for accept, ths in zip(
-            batch_meta.num_accept_tokens, batch_meta.top_id_ths
-        ):
+        for accept, ranks in zip(batch_meta.num_accept_tokens, batch_meta.top_id_ths):
             sampled_token_ids.append(flat_ids[off : off + accept])
-            off += len(ths)
+            off += len(ranks)
         _t_sel = time.monotonic()
         # [Lwd][perf] Temporary probes attributing single-request latency:
         # post_recv = posting the irecv; wait_tensor = waiting for the
@@ -275,9 +276,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (_t_sel - _t0) * 1000,
             len(batch_meta.req_ids),
         )
-        req_id_to_index = {
-            req_id: index for index, req_id in enumerate(batch_meta.req_ids)
-        }
+        req_id_to_index = {req_id: index for index, req_id in enumerate(batch_meta.req_ids)}
         return ModelRunnerOutput(
             req_ids=batch_meta.req_ids,
             req_id_to_index=req_id_to_index,
