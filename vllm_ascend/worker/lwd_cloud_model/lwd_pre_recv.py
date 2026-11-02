@@ -1,53 +1,19 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LWD early receive: engine⇄worker bypass link + hint/watermark protocol.
+"""LWD early receive hints and completion watermarks.
 
-There is exactly one data path (same as the existing early receive; no new bypass)::
+The engine sends one hint per announced UP chunk over a dedicated message
+queue. The cloud endpoint plans per-request host staging from the hint's row
+tables, posts the receive, and reports each completed chunk as its channel
+watermark plus cumulative per-request arrival rows. A terminal comm failure is
+reported as ``("error", seqno, repr(exc))`` before the worker thread exits.
 
-    cloud engine IO thread                cloud endpoint comm thread
-    ───────────────                       ──────────────────────
-    RangeNotify arrives (edge announcement)
-      └─ post_irecv_hint ──hint MQ (downstream)──►  start_early_irecv
-                                              └─ submit_recv(UP, seqno, numel, aux)
-                                                    │  irecv already pre-posted
-                                              future.done() polling
-                                                    │
-    record_irecv_completions ◄──done MQ (upstream)── _report_irecv_completions
-      └─ watermark → is_irecv_complete(UP, seqno)
-           └─ PD_mix scheduler gate: release the prefill batch only once received
+Both queues bypass ``rpc_broadcast_mq``, whose single consumer can block in
+model execution. The hint reader handle travels through the environment; the
+engine obtains the done-writer handle through ``collective_rpc``. Handles use
+JSON rather than pickle.
 
-Both MQs are bypasses; neither may borrow ``rpc_broadcast_mq``: that queue
-is consumed single-threaded by ``worker_busy_loop``, which blocks for
-hundreds of milliseconds inside ``execute_model`` for a prefill batch — a
-hint queued there would never get its recv posted "early".
-
-* hint MQ: the engine creates the writer (handle exported to env before
-  worker creation); the cloud endpoint rank attaches the reader by handle;
-* done MQ: the cloud endpoint rank creates the writer; after the executor
-  is up, the engine fetches its handle over ``collective_rpc``
-  (``LwdCloudWorker.lwd_early_recv_done_handle``) and attaches the reader.
-
-Watermark semantics: ``is_irecv_complete(channel, seqno)`` ==
-``seqno <= watermark``. Per-channel completion order = seqno order
-(``channel.py`` FIFO: if the head has not completed, nothing behind it
-has), so the "completed set" is always a prefix and one max watermark
-represents it exactly. The watermark is only a **readiness predicate**;
-it plays no role in task priority.
-
-Hint fields on this branch (chunked prefill + mm/hash): ``num_tokens`` =
-the batch's (this chunk batch's) flat token count, ``aux_rows`` = the sum
-of token rows of **mrope-carrying** requests in the batch — the UP main
-frame numel is computed **worker-side** from the hash payload formula
-using local config (see
-``lwd_cloud_worker._lwd_build_up_recv_request``); the hint carries only
-"facts" (token count, mrope row count), never the size formula, so the
-two sides cannot compute it differently; aux frame numel = aux_rows*3
-(int64, [n,3], same seqno as the main frame).
-
-Non-endpoint ranks (the cloud's remaining TP ranks) hold no cross-node
-channel: their data arrives via the in-group TP broadcast at inject time
-(see ``lwd_cloud_model_runner._lwd_inject_remote_embeds``) — they post no
-recv and report nothing; this module's hint/report line runs on the
-endpoint rank only.
+Non-endpoint ranks own neither a cross-node receive nor host staging, so they
+do not participate in this protocol.
 """
 
 from __future__ import annotations
@@ -58,7 +24,7 @@ import os
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
@@ -70,46 +36,97 @@ if TYPE_CHECKING:
 #: ``init_device`` — both sides honor this single constant name.
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
-# Bypass MQ spec: 1KB per slot, 64 slots. One hint/report per batch; the
-# edge pending gate (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)
-# keeps unconsumed chunks in the single digits, and hints are a
-# correctness dependency (losing one = that recv is never pre-posted, the
-# watermark stalls, and the gated batch is never dispatched) — so plenty
-# of headroom, no flow control.
-_SIDEBAND_MAX_CHUNK_BYTES = 1024
+_SIDEBAND_MAX_CHUNK_BYTES = 4096
 _SIDEBAND_MAX_CHUNKS = 64
 
 
-# ---------------------------------------------------------------------- #
-# Hints: produced by the scheduler, consumed by the worker comm thread   #
-# ---------------------------------------------------------------------- #
-def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
-    """Build one UP early-recv hint.
+class LwdRecvHintFields(NamedTuple):
+    seqno: int
+    num_tokens: int
+    aux_rows: int
+    req_ids: list[str]
+    rows: list[int]
+    prompt_offsets: list[int]
+    prompt_lens: list[int]
+    refills: list[bool]
+    prefix_nonces: list[int]
 
-    * ``num_tokens``: the batch's flat token count (the main-frame size
-      is derived worker-side from the hash payload formula)
-    * ``aux_rows``: the batch's mrope-carrying token rows (0 = text-only
-      batch, zero aux traffic)
-    """
+
+def make_recv_hint(
+    seqno: int,
+    num_tokens: int,
+    aux_rows: int = 0,
+    *,
+    req_ids: list[str],
+    rows: list[int],
+    prompt_offsets: list[int],
+    prompt_lens: list[int],
+    refills: list[bool] | None = None,
+    prefix_nonces: list[int] | None = None,
+) -> dict[str, Any]:
+    """Build one UP hint with the complete per-request chunk geometry."""
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),
+        "req_ids": list(req_ids),
+        "rows": [int(value) for value in rows],
+        "prompt_offsets": [int(value) for value in prompt_offsets],
+        "prompt_lens": [int(value) for value in prompt_lens],
+        "refills": [bool(value) for value in (refills or ())],
+        "prefix_nonces": list(prefix_nonces or ()),
     }
 
 
-def hint_fields(hint: dict) -> tuple[int, int, int] | None:
-    """Hint self-check: returns (seqno, num_tokens, aux_rows); None for a malformed hint."""
+def hint_fields(hint: dict[str, Any]) -> LwdRecvHintFields | None:
+    """Return validated hint fields, or None for inconsistent geometry."""
+    if not isinstance(hint, dict):
+        return None
+    table_names = ("req_ids", "rows", "prompt_offsets", "prompt_lens")
+    if any(not isinstance(hint.get(name), list) for name in table_names):
+        return None
+    if any(not isinstance(hint.get(name, []), list) for name in ("refills", "prefix_nonces")):
+        return None
     try:
-        seqno = int(hint["seqno"])
-        num_tokens = int(hint["num_tokens"])
-        aux_rows = int(hint.get("aux_rows", 0))
+        fields = LwdRecvHintFields(
+            seqno=int(hint["seqno"]),
+            num_tokens=int(hint["num_tokens"]),
+            aux_rows=int(hint["aux_rows"]),
+            req_ids=list(hint["req_ids"]),
+            rows=[int(value) for value in hint["rows"]],
+            prompt_offsets=[int(value) for value in hint["prompt_offsets"]],
+            prompt_lens=[int(value) for value in hint["prompt_lens"]],
+            refills=[bool(value) for value in hint.get("refills", [])],
+            prefix_nonces=list(hint.get("prefix_nonces", [])),
+        )
     except (KeyError, TypeError, ValueError):
         return None
-    if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
+    tables = (fields.req_ids, fields.rows, fields.prompt_offsets, fields.prompt_lens)
+    if not fields.req_ids or len({len(table) for table in tables}) != 1:
         return None
-    return seqno, num_tokens, aux_rows
+    if any(not isinstance(req_id, str) or not req_id for req_id in fields.req_ids):
+        return None
+    if len(set(fields.req_ids)) != len(fields.req_ids):
+        return None
+    if fields.seqno < 0 or fields.num_tokens <= 0 or not 0 <= fields.aux_rows <= fields.num_tokens:
+        return None
+    if any(rows <= 0 or prompt_len <= 0 for rows, prompt_len in zip(fields.rows, fields.prompt_lens)):
+        return None
+    if any(offset < 0 for offset in fields.prompt_offsets) or sum(fields.rows) != fields.num_tokens:
+        return None
+    if any(
+        offset + rows > prompt_len
+        for offset, rows, prompt_len in zip(fields.prompt_offsets, fields.rows, fields.prompt_lens)
+    ):
+        return None
+    if any(not isinstance(nonce, int) or isinstance(nonce, bool) or nonce < 0 for nonce in fields.prefix_nonces):
+        return None
+    if len(fields.refills) > len(fields.req_ids) or len(fields.prefix_nonces) > len(fields.req_ids):
+        return None
+    fields.refills.extend([False] * (len(fields.req_ids) - len(fields.refills)))
+    fields.prefix_nonces.extend([0] * (len(fields.req_ids) - len(fields.prefix_nonces)))
+    return fields
 
 
 # ---------------------------------------------------------------------- #
@@ -187,12 +204,12 @@ def create_report_mq() -> MessageQueue:
 # ---------------------------------------------------------------------- #
 # Scheduler process side: hint dispatch + completion watermark           #
 # ---------------------------------------------------------------------- #
-_hint_sender: Callable[[dict], None] | None = None
+_hint_sender: Callable[[dict[str, Any]], None] | None = None
 _watermarks: dict[LwdChannelType, int] = {}
 _lock = threading.Lock()
 
 
-def register_hint_sender(sender: Callable[[dict], None]) -> None:
+def register_hint_sender(sender: Callable[[dict[str, Any]], None]) -> None:
     """Install the transport used to dispatch hints (once per engine
     process).
 
@@ -205,7 +222,7 @@ def register_hint_sender(sender: Callable[[dict], None]) -> None:
     _hint_sender = sender
 
 
-def post_irecv_hint(hint: dict) -> None:
+def post_irecv_hint(hint: dict[str, Any]) -> None:
     """Send one recv hint to the local worker's comm thread.
 
     The healthy path logs nothing (the caller ``lwd_cloud_engine`` logs

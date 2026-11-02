@@ -17,10 +17,10 @@ Pure AST scan over source files: no torch/NPU needed, runs on any checkout.
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
+import regex as re
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -30,7 +30,10 @@ LWD_WORKER_FILES = [
     "vllm_ascend/worker/lwd_edge_model/lwd_edge_mm_cache.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_worker.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py",
+    "vllm_ascend/worker/lwd_cloud_model/lwd_host_stage.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_mtp_proposer.py",
+    "vllm_ascend/worker/lwd_cloud_model/lwd_pre_recv.py",
+    "vllm_ascend/worker/lwd_cloud_model/lwd_token_rank.py",
     "vllm_ascend/worker/lwd_base_model/lwd_worker_base.py",
     "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py",
     "vllm_ascend/worker/lwd_base_model/lwd_pinned_staging.py",
@@ -52,11 +55,7 @@ def _parse(rel_path: str) -> ast.Module:
 def _functions(
     tree: ast.Module,
 ) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+    return [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
 
 
 @pytest.mark.parametrize("rel_path", LWD_WORKER_FILES)

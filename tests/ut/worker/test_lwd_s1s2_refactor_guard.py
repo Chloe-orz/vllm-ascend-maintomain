@@ -10,14 +10,11 @@ regressions:
   LwdPinnedStaging (slot-index variables stay zeroed);
 - R3: the endpoint predicate stays single-sourced (the runner never
   recomputes edge_npu_count);
-- F6a/R4: the harvest stays split per-seqno (_lwd_stage_up_batch ->
-  _lwd_harvest_tensors_one -> _lwd_check_up_windows) with an event order
-  matching the pre-split single loop point for point, wholly before
-  super()._prepare_inputs (the boundary of deferred item D1);
-- R4: the inject reuses the batch positions carried by the harvest
-  instead of re-querying req_id_to_index;
-- the three fail-fast messages (the silent-corruption defense) stay
-  verbatim;
+- arrival harvest follows native scheduled rows, with full M-RoPE priming and
+  H2D/broadcast ordering before super()._prepare_inputs;
+- the inject reuses prompt windows carried by the harvest instead of
+  re-querying req_id_to_index;
+- host consumed and native computed watermarks must match exactly;
 - F6b: after the DOWN-collect split, the runner records the event via
   worker.note_lwd_meta_ready instead of writing the worker's private
   attribute;
@@ -37,23 +34,9 @@ import ast
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_RUNNER = (
-    _REPO_ROOT
-    / "vllm_ascend"
-    / "worker"
-    / "lwd_cloud_model"
-    / "lwd_cloud_model_runner.py"
-)
-_WORKER = (
-    _REPO_ROOT
-    / "vllm_ascend"
-    / "worker"
-    / "lwd_cloud_model"
-    / "lwd_cloud_worker.py"
-)
-_EDGE = (
-    _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_edge_model" / "lwd_edge_worker.py"
-)
+_RUNNER = _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_cloud_model" / "lwd_cloud_model_runner.py"
+_WORKER = _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_cloud_model" / "lwd_cloud_worker.py"
+_EDGE = _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_edge_model" / "lwd_edge_worker.py"
 
 
 def _method(path: Path, name: str) -> ast.FunctionDef:
@@ -108,23 +91,20 @@ def test_draft_cache_weave_removed() -> None:
     the native max_tokens guard is depart-and-finish (the request
     necessarily finishes; no returning step), and the V2 cadence guard
     is dead on the cloud (V1 enforced). With the removal, the cloud
-    runner's speculative path is fully native (_update_states /
-    _prepare_input_ids stay unoverridden). If the phase arm
-    (phase_scheduler) is ever rewired, a departure-safe draft keeper
-    must return with it.
+    runner's draft state stays native (_prepare_input_ids remains
+    unoverridden). If the phase arm (phase_scheduler) is ever rewired,
+    a departure-safe draft keeper must return with it.
     """
     runner_src = _RUNNER.read_text(encoding="utf-8")
     for symbol in ("LwdDraftCache", "_lwd_draft_cache", "_lwd_restore_drafts"):
         assert symbol not in runner_src, f"draft-cache weave leaked back: {symbol}"
     # _prepare_input_ids must stay unoverridden (the draft-refill chain
-    # was removed wholesale); _update_states now carries the
-    # zero-weave placeholder rebuild wrap (prompt_embeds seam), a
-    # legitimate override whose shape is locked by
-    # test_lwd_prompt_embeds_seam.
+    # was removed wholesale); _update_states only rewinds the host read
+    # pointer and rebuilds prompt-embeds placeholders, never draft state.
     assert "def _prepare_input_ids(" not in runner_src
-    assert not (
-        _REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py"
-    ).exists(), "deleted module must not come back"
+    assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py").exists(), (
+        "deleted module must not come back"
+    )
 
 
 def test_pinned_staging_single_implementation() -> None:
@@ -133,9 +113,12 @@ def test_pinned_staging_single_implementation() -> None:
     base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
     assert base.count("LwdPinnedStaging(") == 1  # the named lazy factory is the sole constructor
     assert runner.count("LwdPinnedStaging(") == 0  # the cloud delegates via _lwd_staging
-    assert runner.count("self._lwd_staging(") == 2  # down_meta + down_index
+    assert runner.count("self._lwd_staging(") == 1  # down_index only; meta harvest lives on the worker
+    assert '"down_index"' in runner
+    assert '"down_meta"' not in runner
     assert edge.count("LwdPinnedStaging(") == 0  # the edge worker is pure dispatch
-    edge_runner = (_REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py").read_text(encoding="utf-8")
+    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
+    edge_runner = edge_runner_path.read_text(encoding="utf-8")
     assert edge_runner.count("self._lwd_staging(") == 1  # ids staging goes through the factory
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):
         assert stale not in runner, f"hand-rolled rotation leaked: {stale}"
@@ -144,81 +127,95 @@ def test_pinned_staging_single_implementation() -> None:
 
 def test_endpoint_single_source() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
-    assert "edge_npu_count" not in runner, (
-        "runner must reuse worker._lwd_early_recv_endpoint, not recompute"
-    )
+    assert "edge_npu_count" not in runner, "runner must reuse worker._lwd_early_recv_endpoint, not recompute"
     assert "_lwd_early_recv_endpoint" in runner
 
 
-def test_harvest_split_and_pre_super_order() -> None:
+def test_arrival_harvest_and_mrope_pre_super_order() -> None:
     prepare = _method(_RUNNER, "_prepare_inputs")
-    harvest_lineno = None
-    super_lineno = None
-    for lineno, name in _call_names(prepare):
-        if name == "_lwd_harvest_up_batches" and harvest_lineno is None:
-            harvest_lineno = lineno
-        if name == "_prepare_inputs" and super_lineno is None:
-            super_lineno = lineno
-    assert harvest_lineno is not None and super_lineno is not None
-    assert harvest_lineno < super_lineno, (
-        "harvest (both phases) must stay before super()._prepare_inputs; "
-        "moving the tensor phase is deferred item D1, not this refactor"
-    )
-
-    orch = _segment(_RUNNER, "_lwd_harvest_up_batches")
-    stage_pos = orch.index("_lwd_stage_up_batch")
-    tensor_pos = orch.index("_lwd_harvest_tensors_one")
-    window_pos = orch.index("_lwd_check_up_windows")
-    assert stage_pos < tensor_pos < window_pos, (
-        "per-seqno order must mirror the pre-split loop: length check, "
-        "host gate + broadcast, window check + mrope (log order included)"
-    )
-    for helper in ("_lwd_stage_up_batch", "_lwd_harvest_tensors_one",
-                   "_lwd_check_up_windows"):
-        assert f"def {helper}(" in _RUNNER.read_text(encoding="utf-8")
+    calls = _call_names(prepare)
+    prime = next(lineno for lineno, name in calls if name == "_lwd_prime_mrope_positions")
+    harvest = next(lineno for lineno, name in calls if name == "_lwd_harvest_up_batches")
+    native = next(lineno for lineno, name in calls if name == "_prepare_inputs")
+    inject = next(lineno for lineno, name in calls if name == "_lwd_inject_remote_embeds")
+    assert prime < harvest < native < inject
 
 
-def test_harvest_failfast_messages_preserved() -> None:
+def test_arrival_harvest_replaces_future_batches() -> None:
     src = _RUNNER.read_text(encoding="utf-8")
-    for fragment in (
-        "req not in input_batch",
-        "INJECT window mismatch",
-        "prompt chunk offset mismatch",
-        "mrope payload missing",
-        "LWD requires one prompt offset and mrope flag per request",
+    for stale in (
+        "LwdUpStagedBatch",
+        "_lwd_up_recv_futures",
+        "_lwd_stage_up_batch",
+        "_lwd_harvest_tensors_one",
+        "_lwd_check_up_windows",
+        "_lwd_inject_mrope_positions",
     ):
-        assert fragment in src, f"fail-fast line dropped: {fragment}"
+        assert stale not in src
+    harvest = _segment(_RUNNER, "_lwd_harvest_up_batches")
+    assert "_lwd_prompt_plan" in harvest
+    assert "_lwd_stage_window" in harvest
+    assert harvest.count("dist.broadcast(") == 1
+    assert "torch.empty(numel" in harvest
+
+
+def test_h2d_window_event_order() -> None:
+    stage = _segment(_RUNNER, "_lwd_stage_window")
+    assert stage.index("stream.wait_event(used_event)") < stage.index("_lwd_stage_one_request")
+    assert stage.index("_lwd_stage_one_request") < stage.index("ready_event.record(stream)")
+    assert stage.index("ready_event.record(stream)") < stage.index("current_stream().wait_event(ready_event)")
+    assert stage.index("current_stream().wait_event(ready_event)") < stage.index("stager.consume")
+    inject = _segment(_RUNNER, "_lwd_inject_remote_embeds")
+    assert inject.index("non_blocking=True") < inject.index("used_event.record()")
+
+
+def test_watermark_mrope_and_expert_failfast_contracts() -> None:
+    stage = _segment(_RUNNER, "_lwd_stage_one_request")
+    assert "consumed != expect" in stage
+    assert "STAGE POSITION MISMATCH" in stage
+    prime = _segment(_RUNNER, "_lwd_prime_mrope_positions")
+    assert "len(payload) != expected_numel * 8" in prime
+    assert "positions.max().item()" in prime
+    decode = _segment(_RUNNER, "_lwd_decode_expert_ids")
+    assert ".to(torch.uint8).view(torch.int32)" in decode
 
 
 def test_inject_reuses_carried_index() -> None:
     seg = _segment(_RUNNER, "_lwd_inject_remote_embeds")
-    assert "req_id_to_index" not in seg, (
-        "inject must reuse the index carried by the harvest meta phase"
-    )
-    assert "offsets[idx]" in seg
+    assert "req_id_to_index" not in seg
+    assert "offsets[window.req_index]" in seg
 
 
 def test_meta_ready_via_worker_api() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
-    worker = _WORKER.read_text(encoding="utf-8")
-    assert "note_lwd_meta_ready()" in runner
-    # The runner must not touch the worker's private attribute; the
-    # executor still reads it, so the writer stays on the worker.
-    assert "_lwd_meta_ready_event" not in runner
-    assert "def note_lwd_meta_ready" in worker
-    assert "_lwd_meta_ready_event" in _segment(_WORKER, "note_lwd_meta_ready")
+    worker = _segment(_WORKER, "sample_tokens")
+    assert "note_lwd_meta_ready" not in runner
+    collect = _segment(_RUNNER, "_lwd_collect_down_payload")
+    assert "ready_event = torch.npu.Event()" in collect
+    assert "ready_event.record()" in collect
+    # The worker fences the device meta D2H with ready/done events before
+    # publishing the carrier; the runner never performs the host wait.
+    wait = worker.index("stream.wait_event(ready_event)")
+    copy = worker.index("buf[:n_dev].copy_(meta_dev, non_blocking=True)")
+    done = worker.index("done.record()")
+    sync = worker.rindex("done.synchronize()")
+    carrier = worker.index("target.lwd_down_carrier = (")
+    assert wait < copy < done < sync < carrier
 
 
 def test_collect_split_and_payload_protocol() -> None:
     src = _RUNNER.read_text(encoding="utf-8")
-    for helper in ("_lwd_pack_plain_down_rows", "_lwd_pack_spec_down_rows",
-                   "_lwd_stage_down_meta"):
+    for helper in ("_lwd_pack_plain_down_rows", "_lwd_pack_spec_down_rows"):
         assert f"def {helper}(" in src
+        assert f"self.{helper}(" in _segment(_RUNNER, "_lwd_collect_down_payload")
+    assert "def _lwd_stage_down_meta(" not in src
     orch = _segment(_RUNNER, "_lwd_collect_down_payload")
-    assert "_lwd_stage_down_meta(" in orch
-    # The 5-tuple DOWN payload protocol (hidden, pinned, None, req_ids,
-    # None) with req_ids filtered by the captured snapshot mask.
-    assert "[r for i, r in enumerate(batch_req_ids) if valid[i]]" in orch
+    payload = orch[orch.rindex("return (") :]
+    # Payload: (hidden, device meta, host segment lengths, ready event,
+    # req_ids), with req_ids filtered by the captured snapshot mask.
+    for field in ("hidden_packet", "meta_dev", "seg_lens_host", "ready_event"):
+        assert field in payload
+    assert "[r for i, r in enumerate(batch_req_ids) if valid[i]]" in payload
 
 
 def test_finished_release_single_owner() -> None:
@@ -227,9 +224,8 @@ def test_finished_release_single_owner() -> None:
     assert "def lwd_release_finished" in runner_src
     flush = _segment(_WORKER, "_lwd_cloud_flush_finished")
     assert "lwd_release_finished" in flush
-    assert "hash_state.discard" not in worker_src, (
-        "release logic must live on the runner only"
-    )
+    assert "hash_state.discard" not in worker_src, "release logic must live on the runner only"
+
 
 def test_layer_trace_rehomed_and_installed() -> None:
     """The layer-trace parity instrumentation is homed in lwd_debug with its
@@ -240,14 +236,15 @@ def test_layer_trace_rehomed_and_installed() -> None:
     orphaning ~120 lines of hook/checksum machinery. Now rehomed: edge/cloud
     install from their own load_model (env-gated); centralized is manual opt-in.
     """
-    edge = _EDGE.read_text(encoding="utf-8")
     worker = _WORKER.read_text(encoding="utf-8")
-    edge_runner_src = (_REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py").read_text(encoding="utf-8")
+    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
+    edge_runner_src = edge_runner_path.read_text(encoding="utf-8")
     assert "install_lwd_layer_trace(self.get_model())" in edge_runner_src
     assert "install_lwd_layer_trace(self.model_runner.get_model())" in worker
     assert "vllm_ascend.worker.lwd_debug.lwd_layer_trace" in edge_runner_src
     assert (_REPO_ROOT / "vllm_ascend/worker/lwd_debug/lwd_layer_trace.py").exists()
     assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_layer_trace.py").exists()
+
 
 def test_v4_hash_wiring_on_main() -> None:
     """Guards for the V4 Hash expert-routing wiring on main new structure (B<->A).
@@ -264,12 +261,9 @@ def test_v4_hash_wiring_on_main() -> None:
     """
     model_src = (_REPO_ROOT / "vllm_ascend/models/deepseek_v4/model.py").read_text(encoding="utf-8")
     assert "get_forward_context().lwd_hash_layer_idx = self.layer_idx if self.hash else None" in model_src
-    for path in ("vllm_ascend/ops/fused_moe/fused_moe.py",
-                 "vllm_ascend/ops/fused_moe/routed_experts.py"):
+    for path in ("vllm_ascend/ops/fused_moe/fused_moe.py", "vllm_ascend/ops/fused_moe/routed_experts.py"):
         assert "lwd_hash_layer_idx" not in (_REPO_ROOT / path).read_text(encoding="utf-8"), path
-    router_src = (
-        _REPO_ROOT / "vllm_ascend/ops/fused_moe/router/fused_topk_router.py"
-    ).read_text(encoding="utf-8")
+    router_src = (_REPO_ROOT / "vllm_ascend/ops/fused_moe/router/fused_topk_router.py").read_text(encoding="utf-8")
     assert "merge_hash_expert_ids(" in router_src
     assert 'getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)' in router_src
     assert "routing rows do not match router logits" in router_src

@@ -25,11 +25,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
+from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
-    hash_payload_numel,
-    unpack_hash_payload,
 )
 
 if TYPE_CHECKING:
@@ -41,7 +40,6 @@ if TYPE_CHECKING:
     from vllm.sequence import IntermediateTensors
     from vllm.v1.core.sched.output import (
         GrammarOutput,
-        LwdEmbedBatch,
         NewRequestData,
         SchedulerOutput,
     )
@@ -51,31 +49,17 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
-    from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
     from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker import LwdCloudWorker
+    from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
 
 
-# Endpoint host-gate timeout for the UP harvest wait: exceeding it means the
-# matching isend never arrived (edge never posted or the wire stalled), so
-# fail loudly instead of waiting forever.
-_LWD_UP_HOST_GATE_TIMEOUT_S = 60.0
+class LwdPromptWindow(NamedTuple):
+    """One request's prompt rows in the current native scheduling window."""
 
-
-class LwdUpStagedBatch(NamedTuple):
-    """Per-batch harvest record flowing stage -> tensor phase.
-
-    ``t_wait`` carries the probe start so the tensor phase's
-    up-recv-wait window matches the pre-split single loop; the inject
-    pass receives ``rows`` from the window check instead of recomputing
-    indices (the duplicate existence check used to run twice per
-    request).
-    """
-
-    seqno: int
-    meta: LwdEmbedBatch
-    future: LwdTransferFuture | None
-    num_tokens: int
-    t_wait: float
+    req_id: str
+    req_index: int
+    start: int
+    rows: int
 
 
 class LwdDownSelection(NamedTuple):
@@ -103,6 +87,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         super().__init__(vllm_config, device, worker)
         self._lwd_pending_down_payload = None
+        self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         # Row-slot residue cleanup: flush reused rows as soon as a request
         # is admitted (2026-10-21 MTE root-cause closure)
         self._lwd_reset_reused_rows_on_admission()
@@ -233,38 +218,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self,
         scheduler_output: SchedulerOutput,
         num_scheduled_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
-        """UP harvest and mrope writes happen before super(); embeds
-        overwrite happens after it.
-
-        mrope timing contract (fixes a source-branch defect found during
-        the multimodal migration review): _calc_mrope_positions inside
-        super() copies the req_state.mrope_positions window rows to the
-        GPU within the same step in NPUModelRunner._prepare_inputs. If the
-        mrope write landed after super() (the original shape), the
-        current chunk's mrope rows would never be seen by its own
-        forward (every chunk uses the ids=None arange initialization,
-        so image rows would be wrong). Hence the harvest (endpoint host
-        gate + in-place TP-group broadcast) and the mrope/delta writes
-        are hoisted before super().
-
-        The embeds overwrite stays after super(): the base fill loop and
-        copy_to_gpu only see zero buffers, then the harvested UP embeds
-        are written straight into the inputs_embeds.gpu scheduling
-        window of the current step (last write wins), ordered on-stream
-        via the future completion event — non-blocking; the recv wait is
-        visible separately via the [Lwd][perf] up-recv-wait timer.
-        """
-        harvested = self._lwd_harvest_up_batches(num_scheduled_tokens)
-        # Skip the base fill loop's per-row copy for LWD placeholder rows
-        # (gpu_model_runner.py:952-996): it host-memcpys 84MB from the CPU
-        # assembly buffer (all zeros at this point) plus an H2D into
-        # inputs_embeds, which the inject then overwrites on the same
-        # window (last write wins) — pure waste, measured ~17-20ms per
-        # chunk in the super() segment. Clearing the map skips it
-        # wholesale; the inject/release logic restores the reference
-        # after super() returns. Every cloud-side LWD request is a
-        # placeholder row, so no real prompt-embeds consumer is hurt.
+    ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
+        """Prime full-prompt M-RoPE and harvest arrivals before native preparation."""
+        for new_req in scheduler_output.scheduled_new_reqs:
+            payload = new_req.lwd_mrope_positions or b""
+            if not payload:
+                continue
+            prompt_len = new_req.prompt_len
+            if prompt_len <= 0:
+                raise RuntimeError(f"[Lwd][cloud-runner] mrope prime req={new_req.req_id}: prompt length is missing")
+            self._lwd_prime_mrope_positions(new_req.req_id, payload, prompt_len)
+        dev, win_idx, plan = self._lwd_harvest_up_batches(num_scheduled_tokens)
+        # Native placeholder assembly contains only zeros. Skip its redundant
+        # host copy and H2D; the arrival window below is authoritative.
         embeds_map = self.input_batch.req_prompt_embeds
         self.input_batch.req_prompt_embeds = {}
         try:
@@ -273,7 +239,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.input_batch.req_prompt_embeds = embeds_map
         self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
         self._lwd_release_consumed_prompt_embeds()
-        self._lwd_inject_remote_embeds(harvested, num_scheduled_tokens)
+        self._lwd_inject_remote_embeds(dev, win_idx, plan, num_scheduled_tokens)
         if self.lwd_hash_state is not None:
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
         return out
@@ -389,9 +355,39 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # overrides; the base classes carry no seams.                       #
     # ------------------------------------------------------------------ #
 
+    def _lwd_rewind_preempted_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Align host read pointers with scheduler rollbacks and prefix hits."""
+        worker = self.worker
+        if worker is None or not worker._lwd_early_recv_endpoint:
+            return
+        stager = worker._lwd_stager
+        if stager is None:
+            return
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            consumed = stager.consumed_rows(req_id)
+            if consumed > new_computed:
+                stager.rewind_consumed(req_id, new_computed)
+                lwd_logger.info(
+                    "[LWD][cloud-runner] REWIND req=%s: host read pointer "
+                    "%d -> %d (preemption recompute; payload retained)",
+                    req_id,
+                    consumed,
+                    new_computed,
+                )
+            elif new_computed > consumed:
+                req = stager.take_req(req_id)
+                if req is not None and consumed < req.prompt_rows:
+                    stager.skip_consumed(req_id, new_computed)
+                    lwd_logger.info(
+                        "[LWD][cloud-runner] SKIP req=%s: host read pointer %d -> %d (re-admission hit)",
+                        req_id,
+                        consumed,
+                        new_computed,
+                    )
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable[[], None] | None:
-        """LWD: materialize meta placeholder embeds in place before they
-        reach the base (zero base seams).
+        """Align host reads and materialize meta placeholders.
 
         The engine attaches prompt embeds as meta tensors (shape only,
         empty storage), so the placeholder rides the MQ inline pickle
@@ -401,6 +397,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         allocations here, native path behavior unchanged.
         NOTE: a meta tensor still reports full nbytes (numel * element_size);
         do not infer transport cost from nbytes."""
+        self._lwd_rewind_preempted_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             embeds = new_req.prompt_embeds
             if embeds is not None and embeds.is_meta:
@@ -649,373 +646,242 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
     def _lwd_harvest_up_batches(
         self, num_scheduled_tokens: np.ndarray
-    ) -> list[tuple[int, LwdEmbedBatch, torch.Tensor, list[tuple[str, int, int]]]]:
-        """UP batch harvest (called before super()._prepare_inputs; timing
-        contract in _prepare_inputs). Three stages interleave per seqno with
-        an event order that matches the pre-split single loop point for
-        point: length check (_lwd_stage_up_batch) -> endpoint host gate +
-        TP broadcast (_lwd_harvest_tensors_one) -> window check + mrope
-        write (_lwd_check_up_windows).
-
-        Returns [(seqno, meta, up_flat, rows)] so the post-super() inject
-        reuses the validated batch positions. Moving the tensor stage
-        wholesale after super() to overlap host work is deferred item D1
-        (see docs/refactor/lwd_worker_packages_refactor_plan.md); at that
-        point only the _lwd_harvest_tensors_one call site leaves this
-        loop."""
+    ) -> tuple[torch.Tensor | None, int | None, list[LwdPromptWindow]]:
+        """Stage the native prompt windows and broadcast one complete payload."""
+        plan = self._lwd_prompt_plan(num_scheduled_tokens)
+        if not plan:
+            return None, None, plan
         worker = self.worker
         if worker is None:
-            return []
-        posted = getattr(worker, "_lwd_up_recv_futures", None)
-        if not posted:
-            return []
-        harvested = []
-        for batch_seqno in list(posted.keys()):
-            item = worker._lwd_up_recv_futures.pop(batch_seqno, None)
-            if item is None:
-                continue
-            future, meta = item
-            staged = self._lwd_stage_up_batch(batch_seqno, future, meta)
-            up_flat = self._lwd_harvest_tensors_one(staged)
-            if up_flat is None:
-                continue
-            rows = self._lwd_check_up_windows(
-                batch_seqno,
-                meta,
-                num_scheduled_tokens,
-            )
-            harvested.append((batch_seqno, meta, up_flat, rows))
-        return harvested
+            raise RuntimeError("[Lwd][cloud-runner] cloud runner has no worker")
+        hidden_size = self.model_config.get_hidden_size()
+        num_hash_layers, top_k = self._lwd_hash_dims()
+        tail_per_row = 4 * num_hash_layers * top_k
+        total_rows = sum(window.rows for window in plan)
+        numel = total_rows * (hidden_size + tail_per_row)
+        if worker._lwd_early_recv_endpoint:
+            stager = worker._lwd_stager
+            if stager is None:
+                raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
+            dev, win_idx = self._lwd_window_device(numel)
+            self._lwd_stage_window(stager, plan, dev, hidden_size, tail_per_row)
+        else:
+            dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
+            win_idx = None
 
-    def _lwd_stage_up_batch(
-        self,
-        batch_seqno: int,
-        future: LwdTransferFuture | None,
-        meta: LwdEmbedBatch,
-    ) -> LwdUpStagedBatch:
-        """Harvest staging: compute the batch token count and check the meta
-        length contract (sat before the host gate pre-split; order kept).
-        The probe start rides on the record so the tensor stage's
-        up-recv-wait window matches the pre-split one."""
-        t_wait = time.monotonic()
-        num_tokens = sum(len(t) for t in meta.token_ids)
-        if not (
-            len(meta.req_ids)
-            == len(meta.token_ids)
-            == len(meta.prompt_offsets)
-            == len(meta.has_mrope)
-            == len(meta.mrope_positions)
-        ):
-            raise ValueError("LWD requires one prompt offset and mrope flag per request")
-        return LwdUpStagedBatch(
-            seqno=batch_seqno,
-            meta=meta,
-            future=future,
-            num_tokens=num_tokens,
-            t_wait=t_wait,
-        )
-
-    def _lwd_check_up_windows(
-        self,
-        batch_seqno: int,
-        meta: LwdEmbedBatch,
-        num_scheduled_tokens: np.ndarray,
-    ) -> list[tuple[str, int, int]]:
-        """Per-request window check + mrope row write; returns one
-        (req_id, batch index, row count) per row.
-
-        The three fail-fasts match the pre-split code verbatim; proceeding
-        would decode on uninjected dirty embeds (silent corruption), so
-        each is exposed on the spot. Since wire_version 2, mrope
-        positions arrive via the control plane with the meta (per-request
-        [3,n] int64 bytes, frombuffer written straight into req_state
-        with zero transposition), no longer through data-plane aux frames
-        and a second TP broadcast; text-only requests carry empty bytes."""
-        num_prompt = self.input_batch.num_prompt_tokens
-        computed = self.input_batch.num_computed_tokens_cpu
-        mrope_rows = 0
-        _mrope_cpu_ms = _mrope_delta_ms = 0.0
-        rows: list[tuple[str, int, int]] = []
-        for k, (req_id, token_ids) in enumerate(zip(meta.req_ids, meta.token_ids)):
-            n = len(token_ids)
-            idx = self.input_batch.req_id_to_index.get(req_id)
-            if idx is None:
-                # Fail-fast: the embeds arrived but the request is not in
-                # this step's batch — proceeding would decode it on
-                # uninjected dirty embeds (silent corruption); expose on
-                # the spot instead of dropping. Seeing this means the
-                # scheduler/data-plane timing contract is broken; the fix
-                # belongs upstream, not here.
-                raise RuntimeError(
-                    f"[Lwd][cloud-runner] INJECT req={req_id} seqno="
-                    f"{batch_seqno} rows={n}: req not in input_batch "
-                    f"(batch={self.input_batch.req_ids})"
-                )
-            if n > 0:
-                # Fail-fast: the chunk row count must equal exactly the
-                # request's scheduled token count this step. When it does
-                # not (scheduled window != edge chunk, e.g. budget-squeeze
-                # truncation), injection would overrun into neighbor rows
-                # or leave an uninjected tail — a silent-corruption source;
-                # expose directly.
-                scheduled = int(num_scheduled_tokens[idx]) if idx < len(num_scheduled_tokens) else 0
-                if n != scheduled:
-                    raise RuntimeError(
-                        f"[Lwd][cloud-runner] INJECT window mismatch "
-                        f"req={req_id} seqno={batch_seqno}: chunk rows="
-                        f"{n} != scheduled={scheduled} (computed="
-                        f"{int(computed[idx])} prompt="
-                        f"{int(num_prompt[idx])})"
-                    )
-                start = int(meta.prompt_offsets[k])
-                prompt_len = int(num_prompt[idx])
-                if start != int(computed[idx]) or not 0 <= start <= start + n <= prompt_len:
-                    raise ValueError(
-                        f"LWD prompt chunk offset mismatch for {req_id}: "
-                        f"start={start}, computed={int(computed[idx])}, rows={n}, prompt={prompt_len}"
-                    )
-                if meta.has_mrope[k]:
-                    # Positions bytes arrive via the control plane with
-                    # the meta ([3,n] int64); frombuffer builds the CPU
-                    # tensor and writes req_state with zero transposition;
-                    # empty bytes = edge/cloud version mismatch, fail-fast
-                    payload = meta.mrope_positions[k]
-                    if not payload:
-                        raise RuntimeError(
-                            f"[Lwd][cloud-runner] mrope payload missing "
-                            f"req={req_id} seqno={batch_seqno}: "
-                            f"has_mrope=True but control-plane positions "
-                            f"are empty (edge/cloud version mismatch; deploy matching versions)"
-                        )
-                    cpu_ms, delta_ms = self._lwd_inject_mrope_positions(
-                        req_id,
-                        start,
-                        n,
-                        torch.frombuffer(bytearray(payload), dtype=torch.int64).view(3, n),
-                        int(num_prompt[idx]),
-                    )
-                    _mrope_cpu_ms += cpu_ms
-                    _mrope_delta_ms += delta_ms
-                    mrope_rows += n
-            rows.append((req_id, idx, n))
-        if mrope_rows > 0:
-            # [Lwd][perf] mrope inject probe: cpu = positions-byte
-            # frombuffer + direct CPU write into req_state (control-plane
-            # delivery, no device round-trip); delta = last-chunk max()
-            # self-derivation, accumulated per request
-            lwd_logger.info(
-                "[Lwd][perf] cloud mrope-inject seqno=%s rows=%d cpu=%.2f delta=%.2fms",
-                batch_seqno,
-                mrope_rows,
-                _mrope_cpu_ms,
-                _mrope_delta_ms,
-            )
-        return rows
-
-    def _lwd_harvest_tensors_one(
-        self,
-        staged: LwdUpStagedBatch,
-    ) -> torch.Tensor | None:
-        """Harvest tensor stage (single batch): endpoint passes the host gate,
-        then an in-place TP-group broadcast lands the main embeds frame
-        (each frame is its own launch+wait atomic pair on the current
-        stream — the demo_br discipline; unreliable
-        cross-stream ordering was the root cause of truncated broadcast
-        deliveries before). Returns None when the endpoint res.tensor is
-        None (the pre-split continue semantics)."""
-        # get_tp_group stays imported inside the function: the v4 migration
-        # tests stub parallel_state per call via sys.modules, so the
-        # module-level name is invisible in their trimmed namespace.
         import torch.distributed as dist
         from vllm.distributed.parallel_state import get_tp_group
 
         tp = get_tp_group()
-        is_endpoint = self.worker._lwd_early_recv_endpoint
-        hidden_size = self.model_config.get_hidden_size()
-        num_hash_layers, top_k = self._lwd_hash_dims()
-        numel = hash_payload_numel(
-            staged.num_tokens,
-            hidden_size,
-            num_hash_layers,
-            top_k,
-        )
-        if is_endpoint:
-            # Endpoint: pass the host readiness gate first (the demo's
-            # wait gate): once the done_event poll succeeds the P2P data
-            # has fully landed in the buffer; a timeout raises explicitly
-            # instead of silent corruption. Only after the gate does the
-            # broadcast read — guaranteed complete data.
-            res = staged.future.wait(timeout=_LWD_UP_HOST_GATE_TIMEOUT_S)
-            up_flat = res.tensor
-            if up_flat is None:
-                return None
-        else:
-            # Non-endpoint: allocate the receive buffer on the spot and wait for the endpoint's broadcast.
-            up_flat = torch.empty(numel, dtype=torch.bfloat16, device="npu")
         if tp.world_size > 1:
-            # Same as the demo: reuse the framework TP communication domain
-            # (group construction order guaranteed by the framework, verified
-            # on the PD-disaggregation path); no self-managed
-            # _LWD_EMBED_BCAST_GROUP.
             work = dist.broadcast(
-                up_flat,
+                dev,
                 src=tp.ranks[0],
                 group=tp.device_group,
                 async_op=True,
             )
-            work.wait()  # Bridge broadcast completion onto the current (compute) stream so later copies are ordered
+            work.wait()
+        return dev, win_idx, plan
+
+    def _lwd_prompt_plan(self, num_scheduled_tokens: np.ndarray) -> list[LwdPromptWindow]:
+        """Derive prompt-only rows from native request order and watermarks."""
+        plan: list[LwdPromptWindow] = []
+        computed = self.input_batch.num_computed_tokens_cpu
+        prompt_lens = self.input_batch.num_prompt_tokens
+        for idx, req_id in enumerate(self.input_batch.req_ids):
+            if idx >= len(num_scheduled_tokens):
+                break
+            start = int(computed[idx])
+            prompt_len = int(prompt_lens[idx])
+            scheduled = int(num_scheduled_tokens[idx])
+            rows = min(scheduled, prompt_len - start)
+            if rows > 0:
+                plan.append(LwdPromptWindow(req_id, idx, start, rows))
+        return plan
+
+    def _lwd_stage_window(
+        self,
+        stager: LwdHostStager,
+        plan: list[LwdPromptWindow],
+        dev: torch.Tensor,
+        hidden_size: int,
+        tail_per_row: int,
+    ) -> None:
+        """Reassemble host embeddings and expert tails on the dedicated H2D stream."""
+        started = time.monotonic()
+        embed_numel = sum(window.rows for window in plan) * hidden_size
+        stream = self._lwd_h2d_stream()
+        # _lwd_window_device has already advanced the flip for this window.
+        used_event = self._lwd_win_used_ev[self._lwd_win_flip ^ 1]
+        with torch.npu.stream(stream):
+            if used_event is not None:
+                stream.wait_event(used_event)
+            embed_offset = 0
+            tail_offset = embed_numel
+            for window in plan:
+                self._lwd_stage_one_request(stager, window, dev, embed_offset, hidden_size)
+                embed_offset += window.rows * hidden_size
+                if tail_per_row:
+                    req = stager.take_req(window.req_id)
+                    assert req is not None
+                    tail_start, _ = req.tail_range_at(window.start, window.rows)
+                    numel = window.rows * tail_per_row
+                    dev[tail_offset : tail_offset + numel].copy_(
+                        req.host[tail_start : tail_start + numel],
+                        non_blocking=True,
+                    )
+                    tail_offset += numel
+            ready_event = torch.npu.Event()
+            ready_event.record(stream)
+        torch.npu.current_stream().wait_event(ready_event)
+        for window in plan:
+            stager.consume(window.req_id, window.rows)
         lwd_logger.info(
-            "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
-            staged.seqno,
-            (time.monotonic() - staged.t_wait) * 1000,
+            "[Lwd][cloud-runner] CONSUME rows=%d reqs=%d stage=%.2fms",
+            sum(window.rows for window in plan),
+            len(plan),
+            (time.monotonic() - started) * 1000,
         )
-        lwd_logger.info(
-            "[Lwd][cloud-runner] UP embeds harvested seqno=%s rows=%d reqs=%s mrope_reqs=%s",
-            staged.seqno,
-            staged.num_tokens,
-            staged.meta.req_ids,
-            sum(staged.meta.has_mrope),
+
+    def _lwd_h2d_stream(self) -> torch.npu.Stream:
+        """Return the dedicated stream used for host-window copies."""
+        stream = getattr(self, "_lwd_h2d_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._lwd_h2d_copy_stream = stream
+        return stream
+
+    def _lwd_window_device(self, numel: int) -> tuple[torch.Tensor, int]:
+        """Return a rotating device window protected by a prior-use event."""
+        buffers = getattr(self, "_lwd_win_dev", None)
+        if buffers is None or buffers[0].numel() < numel:
+            hidden_size = self.model_config.get_hidden_size()
+            num_hash_layers, top_k = self._lwd_hash_dims()
+            per_row = hidden_size + 4 * num_hash_layers * top_k
+            budget = self.vllm_config.scheduler_config.max_num_batched_tokens
+            capacity = max(numel, per_row * budget)
+            buffers = [torch.empty(capacity, dtype=torch.bfloat16, device=self.device) for _ in range(2)]
+            self._lwd_win_dev = buffers
+            self._lwd_win_flip = 0
+            self._lwd_win_used_ev = [None, None]
+        win_idx = self._lwd_win_flip
+        self._lwd_win_flip ^= 1
+        return buffers[win_idx][:numel], win_idx
+
+    def _lwd_stage_one_request(
+        self,
+        stager: LwdHostStager,
+        window: LwdPromptWindow,
+        dev: torch.Tensor,
+        elem_offset: int,
+        hidden_size: int,
+    ) -> None:
+        """Copy one host window after enforcing the native read watermark."""
+        computed = self.input_batch.num_computed_tokens_cpu
+        expect = int(computed[window.req_index])
+        consumed = stager.consumed_rows(window.req_id)
+        if consumed != expect or consumed != window.start:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={window.req_id}: "
+                f"host read pointer consumed={consumed}, computed={expect}, "
+                f"window_start={window.start}"
+            )
+        host_start, numel, _ = stager.segment_for(window.req_id, window.rows)
+        if numel != window.rows * hidden_size:
+            raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
+        req = stager.take_req(window.req_id)
+        assert req is not None
+        dev[elem_offset : elem_offset + numel].copy_(
+            req.host[host_start : host_start + numel],
+            non_blocking=True,
         )
-        return up_flat
 
     def _lwd_inject_remote_embeds(
         self,
-        harvested: list[tuple[int, LwdEmbedBatch, torch.Tensor, list[tuple[str, int, int]]]] | None,
+        dev: torch.Tensor | None,
+        win_idx: int | None,
+        plan: list[LwdPromptWindow],
         num_scheduled_tokens: np.ndarray,
     ) -> None:
-        """Device-side inject (after super()): write the harvested UP embeds
-        straight into each request's current scheduling window in
-        ``inputs_embeds.gpu``.
-
-        The flattened output offsets reproduce the native fill loop's
-        accumulation (per-request scheduled segment start), so rows land
-        exactly where the prompt-embeds branch expects them.  The CPU
-        draft first-pass provider reads the SAME window straight from
-        ``inputs_embeds.gpu`` (llm_base_proposer), so the CPU assembly
-        buffer is no longer written at all — the per-chunk 84MB D2H is
-        gone.  The base fill loop is skipped for LWD placeholder rows
-        (see ``_prepare_inputs``); our device write is authoritative.
-
-        Batch positions reuse the rows carried by the harvest stage (the
-        duplicated "req not in batch" defense has been consolidated into
-        the harvest stage alone; indices here are pre-validated).
-        """
-        if not harvested:
+        """Inject the broadcast windows into native flattened embedding rows."""
+        if dev is None:
             return
-        num_prompt = self.input_batch.num_prompt_tokens
         hidden_size = self.model_config.get_hidden_size()
-        gpu_embeds = self.inputs_embeds.gpu
-
-        # Flattened output offset per request (same accumulation as the
-        # native fill loop): each request's scheduling-segment start in the
-        # flattened token sequence, indexed by batch position.
-        offsets: list[int] = []
-        off = 0
-        for i in range(len(self.input_batch.req_ids)):
-            offsets.append(off)
-            off += int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
-
         num_hash_layers, top_k = self._lwd_hash_dims()
-        for batch_seqno, meta, up_flat, rows in harvested:
-            num_tokens = sum(len(t) for t in meta.token_ids)
-            expert_ids = None
-            if num_hash_layers:
-                embeds, expert_ids = unpack_hash_payload(
-                    up_flat,
-                    num_tokens,
-                    hidden_size,
+        tail_per_row = 4 * num_hash_layers * top_k
+        embed_numel = sum(window.rows for window in plan) * hidden_size
+        embeds = dev[:embed_numel].view(-1, hidden_size)
+        offsets: list[int] = []
+        offset = 0
+        for idx in range(len(self.input_batch.req_ids)):
+            offsets.append(offset)
+            if idx < len(num_scheduled_tokens):
+                offset += int(num_scheduled_tokens[idx])
+        row = 0
+        for window in plan:
+            if self.lwd_hash_state is not None:
+                tail_start = embed_numel + row * tail_per_row
+                tail_end = embed_numel + (row + window.rows) * tail_per_row
+                expert_ids = self._lwd_decode_expert_ids(
+                    dev[tail_start:tail_end],
+                    window.rows,
                     num_hash_layers,
                     top_k,
                 )
-            else:
-                embeds = up_flat.view(num_tokens, hidden_size)
-            lwd_logger.info(
-                "[Lwd][cloud-runner] UP embeds injected seqno=%s rows=%s reqs=%s",
-                batch_seqno,
-                embeds.shape[0],
-                meta.req_ids,
+                self.lwd_hash_state.add_chunk(
+                    window.req_id,
+                    int(self.input_batch.num_prompt_tokens[window.req_index]),
+                    window.start,
+                    expert_ids,
+                )
+            output = offsets[window.req_index]
+            self.inputs_embeds.gpu[output : output + window.rows].copy_(
+                embeds[row : row + window.rows],
+                non_blocking=True,
             )
-            row = 0
-            for meta_idx, (req_id, idx, n) in enumerate(rows):
-                assert idx >= 0, f"LWD inject index missing for {req_id}"
-                if n > 0:
-                    start = int(meta.prompt_offsets[meta_idx])
-                    if self.lwd_hash_state is not None:
-                        if expert_ids is None:
-                            raise ValueError(f"Missing LWD V4 expert payload for {req_id}")
-                        self.lwd_hash_state.add_chunk(
-                            req_id,
-                            int(num_prompt[idx]),
-                            start,
-                            expert_ids[row : row + n],
-                        )
-                    out = offsets[idx]
-                    # Write the scheduling window of inputs_embeds.gpu directly on-stream
-                    gpu_embeds[out : out + n].copy_(embeds[row : row + n], non_blocking=True)
-                    # No D2H write into the CPU assembly buffer anymore:
-                    # the draft provider reads the same window straight from
-                    # inputs_embeds.gpu (this write is the authoritative
-                    # copy), eliminating the per-chunk 84MB synchronous
-                    # D2H tail
-                    self.input_batch.is_token_ids[idx, start : start + n] = False
-                row += n
-            # Cross-stream lifetime registration: the endpoint recv buffer
-            # is allocated and recycled by the channel stream (with
-            # same-size chunks the allocator nearly always hands back the
-            # same block), while this step's copy runs on the compute
-            # stream. Without record_stream the allocator could hand the
-            # block to the next seqno's irecv before this batch's copy has
-            # executed — under deep async queues this shows up as
-            # cross-seqno data bleeding (multi-request corruption).
-            # Registration orders the reuse correctly.
-            up_flat.record_stream(torch.npu.current_stream())
+            # The direct-GPU MTP first pass reads this same authoritative window.
+            self.input_batch.is_token_ids[
+                window.req_index,
+                window.start : window.start + window.rows,
+            ] = False
+            row += window.rows
+        if win_idx is not None:
+            used_event = torch.npu.Event()
+            used_event.record()
+            self._lwd_win_used_ev[win_idx] = used_event
+        else:
+            dev.record_stream(torch.npu.current_stream())
 
-    # ------------------------------------------------------------------ #
-    # Collect probe (measurement only; output discarded, protocol        #
-    # still returns token_ids directly)                                   #
-    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _lwd_decode_expert_ids(
+        seg: torch.Tensor,
+        rows: int,
+        num_layers: int,
+        top_k: int,
+    ) -> torch.Tensor:
+        """Decode numeric byte values into int32 IDs without losing values above 255."""
+        return seg.contiguous().to(torch.uint8).view(torch.int32).view(rows, num_layers, top_k)
 
-    def _lwd_inject_mrope_positions(
-        self,
-        req_id: str,
-        start: int,
-        n: int,
-        chunk_positions: torch.Tensor,
-        prompt_len: int,
-    ) -> tuple[float, float]:
-        """Write one chunk's mrope positions ([3,n] int64, CPU — frombuffer
-        of the control-plane RangeItem.mrope_positions bytes) into the
-        request's cached [3, prompt] window; when the last chunk lands,
-        self-derive delta (= positions.max()+1-prompt_len, value-identical
-        to the edge side) for the native _calc_mrope_positions to compute
-        completion-segment positions during decode.
-
-        req_state.mrope_positions is initialized pass-through with
-        ids=None (arange text-only positions) — multimodal requests have
-        their window overwritten chunk by chunk; text-only requests never
-        take this path (the edge sends them no positions).
-
-        Returns (cpu_ms, delta_ms): timings of the direct CPU write and
-        the last-chunk delta derivation, aggregated per seqno by the
-        caller."""
+    def _lwd_prime_mrope_positions(self, req_id: str, payload: bytes, prompt_len: int) -> None:
+        """Write full-prompt positions and derive the completion-position delta."""
         req_state = self.requests.get(req_id)
-        assert chunk_positions.shape == (3, n), (
-            f"mrope payload shape {tuple(chunk_positions.shape)} != (3, {n}) (req={req_id})"
-        )
-        _t_cpu = time.monotonic()
-        req_state.mrope_positions[:, start : start + n] = chunk_positions
-        cpu_ms = (time.monotonic() - _t_cpu) * 1000
-        delta_ms = 0.0
-        if start + n >= prompt_len:
-            positions = req_state.mrope_positions[:, :prompt_len]
-            req_state.mrope_position_delta = int(positions.max().item()) + 1 - prompt_len
-            lwd_logger.info(
-                "[Lwd][cloud-runner] mrope complete: req=%s prompt=%d delta=%d",
-                req_id,
-                prompt_len,
-                req_state.mrope_position_delta,
+        if req_state is None:
+            raise RuntimeError(f"[Lwd][cloud-runner] mrope prime req={req_id}: req_state not found")
+        expected_numel = 3 * prompt_len
+        if len(payload) != expected_numel * 8:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] mrope prime req={req_id}: payload bytes "
+                f"{len(payload)} != 3 * prompt_len * 8 ({expected_numel * 8})"
             )
-        return cpu_ms, delta_ms
+        positions = torch.frombuffer(bytearray(payload), dtype=torch.int64).view(3, prompt_len)
+        req_state.mrope_positions[:, :prompt_len] = positions
+        req_state.mrope_position_delta = int(positions.max().item()) + 1 - prompt_len
+        lwd_logger.info(
+            "[Lwd][cloud-runner] mrope primed: req=%s prompt=%d delta=%d",
+            req_id,
+            prompt_len,
+            req_state.mrope_position_delta,
+        )
 
     def _sample(
         self,
@@ -1188,8 +1054,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         full_cover = all(valid[: len(batch_req_ids)])
         lg_sel = logits if full_cover else logits[idx]
         sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
-        thresh = lg_sel.gather(1, sm_sel.long().unsqueeze(1))
-        ranks = [(lg_sel > thresh).sum(dim=1).to(torch.int32)]
+        ranks = [self._lwd_token_rank_encoder.encode(lg_sel, sm_sel)]
         hidden_packet = torch.cat([sample_hidden_states[i : i + 1] for i in idx])
         return LwdDownSelection(
             hidden_packet=hidden_packet,
@@ -1265,8 +1130,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         else:
             lg_rows = logits[sel_d]
             hidden_packet = sample_hidden_states[sel_d]
-        thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
-        ranks = [(lg_rows > thresh).sum(dim=1).to(torch.int32)]
+        ranks = [self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows)]
         # Stale sampled slots (requests the spec step skipped may retain
         # the previous spec step's tokens): accepted/ranks/seg_lens are
         # all capped by the actual hidden row count — the row count is

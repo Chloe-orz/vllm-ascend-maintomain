@@ -3,8 +3,8 @@
 
 The replay contract: for row ``i``, the returned token id is the
 ``ranks[i]``-th largest logit of that row (rank 0 = argmax, rank V-1 = the
-smallest logit). Ties are deliberately excluded: torch.sort is not stable by
-default, so tied logits have no deterministic rank order.
+smallest logit). Ties are resolved by ascending token ID, matching the cloud
+rank encoder.
 
 Execution needs the training stack; skipped on hosts without it.
 Rerun condition: python>=3.10 with vllm / vllm-ascend installed (CPU tensors
@@ -42,6 +42,9 @@ from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E
             [1, 0, 2, 1],
             [1, 2, 1, 1],
         ),
+        # Equal logits are ordered by ascending token ID.
+        ([[10, 10, 10], [5, 5, 5]], [0, 2], [0, 2]),
+        ([[10, 10, 0], [10, 10, 0]], [1, 2], [1, 2]),
     ],
     ids=[
         "rank0-argmax",
@@ -49,9 +52,9 @@ from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E
         "per-row-ranks",
         "min-at-last-column",
         "four-rows-mixed",
+        "all-equal",
+        "tied-max-and-lower-score",
     ],
 )
-def test_select_token_batch(
-    logits: list[list[int]], ranks: list[int], expected: list[int]
-) -> None:
+def test_select_token_batch(logits: list[list[int]], ranks: list[int], expected: list[int]) -> None:
     assert select_token_batch(torch.tensor(logits), ranks) == expected

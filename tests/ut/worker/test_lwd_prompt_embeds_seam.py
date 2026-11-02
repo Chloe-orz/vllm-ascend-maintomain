@@ -28,9 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-CLOUD = (
-    _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_cloud_model" / "lwd_cloud_model_runner.py"
-)
+CLOUD = _REPO_ROOT / "vllm_ascend" / "worker" / "lwd_cloud_model" / "lwd_cloud_model_runner.py"
 
 
 def test_zero_weave_overrides_present() -> None:
@@ -84,15 +82,15 @@ def test_runtime_meta_placeholder_materialization(
         return "STREAM_RET"
 
     runner = cls.__new__(cls)
+    runner.worker = NS(_lwd_early_recv_endpoint=False)
     base_cls = type(runner).__mro__[1]
     monkeypatch.setattr(base_cls, "_update_states", fake_base_update_states)
-    monkeypatch.setattr(
-        base_cls, "_update_streaming_request", fake_base_update_streaming
-    )
+    monkeypatch.setattr(base_cls, "_update_streaming_request", fake_base_update_streaming)
     meta_embeds = torch.empty(4, 8, dtype=torch.float32, device="meta")
     assert meta_embeds.is_meta
     new_req = NS(prompt_embeds=meta_embeds)
-    so = NS(scheduled_new_reqs=[new_req])
+    cached = NS(req_ids=[], num_computed_tokens=[])
+    so = NS(scheduled_new_reqs=[new_req], scheduled_cached_reqs=cached)
 
     ret = runner._update_states(so)
     assert ret == "BASE_RET" and runner._base_saw is so
@@ -106,19 +104,16 @@ def test_runtime_meta_placeholder_materialization(
     assert ret == "STREAM_RET"
     assert runner._base_streaming_saw[0] == "rid"
     assert not streaming_req.prompt_embeds.is_meta
-    assert torch.equal(
-        streaming_req.prompt_embeds, torch.zeros(4, 8, dtype=torch.float32)
-    )
+    assert torch.equal(streaming_req.prompt_embeds, torch.zeros(4, 8, dtype=torch.float32))
 
 
 def _cloud_cls():
     pytest_import = __import__("pytest")
-    pytest_import.importorskip(
-        "torch", reason="re-run on NPU env: python>=3.10 + torch + vllm"
-    )
+    pytest_import.importorskip("torch", reason="re-run on NPU env: python>=3.10 + torch + vllm")
     from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
         LwdCloudModelRunner,
     )
+
     return LwdCloudModelRunner
 
 
@@ -148,4 +143,4 @@ def test_runtime_supports_mm_inputs_property() -> None:
     runner.input_batch = NS(req_prompt_embeds={0: object()})
     assert runner.supports_mm_inputs is False  # injected batch: gate closed
     runner.input_batch = NS(req_prompt_embeds={})
-    assert runner.supports_mm_inputs is True   # empty batch: model true value
+    assert runner.supports_mm_inputs is True  # empty batch: model true value

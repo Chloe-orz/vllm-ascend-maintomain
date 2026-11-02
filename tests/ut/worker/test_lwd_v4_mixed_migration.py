@@ -4,15 +4,10 @@
 Run this file directly with a Python environment containing torch and numpy.
 These checks do not validate HCCL streams or NPU graph execution.
 
-Correspondence (refreshed after the S1/S2 split and the mrope
-control-plane migration): meta-stage check + tensor-stage broadcast =
-the original _lwd_harvest_up_batches single loop; the fake worker
-carries ``_lwd_early_recv_endpoint`` directly (single-source endpoint
-contract; the rank recomputation is gone); mrope positions arrive as
-control-plane bytes with the meta (the data-plane aux-frame path is
-retired; non-endpoint ranks get exactly one main-frame broadcast).
-Protocol names in method annotations are injected as placeholders via
-globals_, so the runner-side annotations stay unquoted.
+The fake endpoint owns per-request host buffers and derives every window from
+native scheduling watermarks. Non-endpoint ranks receive exactly one complete
+TP broadcast. Full-prompt M-RoPE bytes arrive with ``NewRequestData`` and are
+primed before the base preparation observes request state.
 """
 
 import ast
@@ -20,10 +15,11 @@ import importlib.util
 import sys
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace as NS
 from typing import NamedTuple
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -36,19 +32,16 @@ SPEC.loader.exec_module(routing)
 
 def load_methods(path, names, base=object, extra_classes=(), **globals_):
     """Compile real methods with a stub base to isolate hardware dependencies."""
-    tree = ast.parse((ROOT / path).read_text())
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
-    cls = next(
-        node
-        for node in classes
-        if any(isinstance(m, ast.FunctionDef) and m.name in names for m in node.body)
-    )
+    cls = next(node for node in classes if any(isinstance(m, ast.FunctionDef) and m.name in names for m in node.body))
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
     constants = [n for n in tree.body if isinstance(n, ast.Assign)]
     helpers = [n for n in classes if n.name in extra_classes]
     namespace = dict(Base=base, torch=torch, np=np, NamedTuple=NamedTuple, **globals_)
-    module = ast.fix_missing_locations(ast.Module(body=constants + helpers + [cls], type_ignores=[]))
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.fix_missing_locations(ast.Module(body=[future] + constants + helpers + [cls], type_ignores=[]))
     exec(compile(module, str(ROOT / path), "exec"), namespace)
     return namespace[cls.name]
 
@@ -115,6 +108,7 @@ class TestMixedEmbeddingMasks(unittest.TestCase):
         runner.model = NS(embed_input_ids=lambda input_ids: table[input_ids])
         runner.uses_mrope = False
         runner.uses_xdrope_dim = 0
+        runner.lwd_hash_state = None
         runner._init_model_kwargs = dict
         output = NS(total_num_scheduled_tokens=5)
         runner._lwd_refresh_decode_embedding_mask(output)
@@ -137,61 +131,202 @@ class TestMixedEmbeddingMasks(unittest.TestCase):
         self.assertEqual(runner.is_token_ids.np[:8].tolist(), [True, True, False, False, False, False, False, True])
 
 
+def expert_tail(ids):
+    return ids.contiguous().view(torch.uint8).to(torch.bfloat16).flatten()
+
+
+def host_request(embeds, ids, consumed):
+    prompt_rows = embeds.shape[0]
+    tail_per_row = 4 * ids.shape[1] * ids.shape[2]
+    tail_off = embeds.numel()
+    return NS(
+        host=torch.cat([embeds.flatten(), expert_tail(ids)]),
+        hidden_size=embeds.shape[1],
+        prompt_rows=prompt_rows,
+        recv_rows=prompt_rows,
+        consumed=consumed,
+        tail_off=tail_off,
+        tail_range_at=lambda base, rows: (
+            tail_off + base * tail_per_row,
+            tail_off + (base + rows) * tail_per_row,
+        ),
+    )
+
+
+class FakeHostStager:
+    def __init__(self, requests):
+        self.requests = requests
+        self.events = []
+
+    def consumed_rows(self, req_id):
+        req = self.requests.get(req_id)
+        return req.consumed if req is not None else 0
+
+    def rewind_consumed(self, req_id, to_rows):
+        req = self.requests.get(req_id)
+        if req is None:
+            return False
+        if to_rows < 0 or to_rows > req.consumed:
+            raise ValueError("invalid rewind target")
+        req.consumed = to_rows
+        self.events.append(("rewind", req_id, to_rows))
+        return True
+
+    def skip_consumed(self, req_id, to_rows):
+        req = self.requests.get(req_id)
+        if req is None:
+            return False
+        if to_rows < req.consumed or to_rows > req.recv_rows:
+            raise ValueError("invalid skip target")
+        req.consumed = to_rows
+        self.events.append(("skip", req_id, to_rows))
+        return True
+
+    def take_req(self, req_id):
+        return self.requests.get(req_id)
+
+    def segment_for(self, req_id, rows):
+        req = self.requests[req_id]
+        if req.consumed + rows > req.recv_rows:
+            raise RuntimeError("host arrival watermark exceeded")
+        start = req.consumed * req.hidden_size
+        return start, rows * req.hidden_size, -1
+
+    def consume(self, req_id, rows):
+        self.requests[req_id].consumed += rows
+
+
+class TestCloudPreemption(unittest.TestCase):
+    def setUp(self):
+        self.embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
+        self.ids = torch.zeros(4, 1, 2, dtype=torch.int32)
+        self.stager = FakeHostStager(
+            {
+                "a": host_request(self.embeds, self.ids, consumed=2),
+                "decode": host_request(self.embeds[:2], self.ids[:2], consumed=2),
+            }
+        )
+
+        class Base:
+            def _update_states(inner, scheduler_output):
+                self.stager.events.append(("base", self.stager.consumed_rows("a")))
+                return "base"
+
+        self.logger = Mock()
+        cls = load_methods(
+            RUNNER,
+            {"_update_states", "_lwd_rewind_preempted_requests"},
+            base=Base,
+            lwd_logger=self.logger,
+        )
+        self.runner = cls()
+        self.runner.worker = NS(_lwd_early_recv_endpoint=True, _lwd_stager=self.stager)
+
+    def output(self, *req_computed):
+        return NS(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=NS(
+                req_ids=[req_id for req_id, _ in req_computed],
+                num_computed_tokens=[computed for _, computed in req_computed],
+            ),
+        )
+
+    def test_rewind_precedes_base_update(self):
+        self.assertEqual(self.runner._update_states(self.output(("a", 1))), "base")
+        self.assertEqual(self.stager.events, [("rewind", "a", 1), ("base", 1)])
+        self.logger.info.assert_called_once_with(
+            "[LWD][cloud-runner] REWIND req=%s: host read pointer %d -> %d (preemption recompute; payload retained)",
+            "a",
+            2,
+            1,
+        )
+
+    def test_self_hit_skips_forward_and_decode_does_not_skip(self):
+        self.runner._update_states(self.output(("a", 3), ("decode", 9)))
+        self.assertEqual(self.stager.events, [("skip", "a", 3), ("base", 3)])
+        self.assertEqual(self.stager.consumed_rows("decode"), 2)
+        self.logger.info.assert_called_once_with(
+            "[LWD][cloud-runner] SKIP req=%s: host read pointer %d -> %d (re-admission hit)",
+            "a",
+            2,
+            3,
+        )
+
+        for worker in (
+            NS(_lwd_early_recv_endpoint=False, _lwd_stager=self.stager),
+            NS(_lwd_early_recv_endpoint=True, _lwd_stager=None),
+        ):
+            self.runner.worker = worker
+            self.runner._update_states(self.output(("a", 0)))
+            self.assertEqual(self.stager.consumed_rows("a"), 3)
+
+
 class TestMixedInjection(unittest.TestCase):
     def setUp(self):
         class Base:
+            def _update_states(self, scheduler_output):
+                self.base_update_consumed = self.worker._lwd_stager.consumed_rows("a")
+
             def _prepare_inputs(self, scheduler_output, counts):
                 self.positions_seen_by_base = {
                     rid: state.mrope_positions.clone() for rid, state in self.requests.items()
                 }
-                # The base input preparation must not overwrite remote embeds
-                # after injection, and must already see the current mrope chunk.
                 self.inputs_embeds.gpu.fill_(-42)
                 return "prepared"
 
         cls = load_methods(
             RUNNER,
             {
+                "_update_states",
+                "_lwd_rewind_preempted_requests",
                 "_prepare_inputs",
                 "_lwd_harvest_up_batches",
-                "_lwd_stage_up_batch",
-                "_lwd_check_up_windows",
-                "_lwd_harvest_tensors_one",
+                "_lwd_prompt_plan",
+                "_lwd_stage_window",
+                "_lwd_h2d_stream",
+                "_lwd_window_device",
+                "_lwd_stage_one_request",
                 "_lwd_hash_dims",
                 "_lwd_inject_remote_embeds",
-                "_lwd_inject_mrope_positions",
+                "_lwd_decode_expert_ids",
+                "_lwd_prime_mrope_positions",
                 "_lwd_prepare_hash_batch",
             },
             base=Base,
-            extra_classes=("LwdUpStagedBatch",),
+            extra_classes=("LwdPromptWindow",),
             time=time,
-            logger=NS(info=lambda *args: None),
+            lwd_logger=NS(info=lambda *args: None),
             hash_layer_count=routing.hash_layer_count,
-            hash_payload_numel=routing.hash_payload_numel,
-            unpack_hash_payload=routing.unpack_hash_payload,
-            # Protocol names in method annotations: the trimmed namespace has no
-            # module-level imports; placeholders suffice.
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
-            LwdEmbedBatch=object,
-            LwdTransferFuture=object,
+            LwdHostStager=object,
         )
         self.runner = cls()
-        self.embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
-        self.ids = torch.arange(8).reshape(4, 1, 2).int()
-        payload = routing.pack_hash_payload(self.embeds, self.ids)
-        self.meta = NS(
-            req_ids=["b", "a"],
-            token_ids=[[0, 0], [0, 0]],
-            prompt_offsets=[0, 2],
-            has_mrope=[False, False],
-            mrope_positions=[b"", b""],
+        self.runner._lwd_hash_dims_cached = None
+        self.a_embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
+        self.b_embeds = (torch.arange(4) + 20).reshape(2, 2).to(torch.bfloat16)
+        self.a_ids = torch.tensor(
+            [[[257, 511]], [[2, 3]], [[4, 5]], [[1023, 4095]]],
+            dtype=torch.int32,
         )
-        self.result = NS(tensor=payload, aux_tensor=None)
-        self.runner.worker = NS(
-            _lwd_early_recv_endpoint=True,
-            _lwd_up_recv_futures={7: (NS(wait=lambda timeout: self.result), self.meta)},
+        self.b_ids = torch.tensor([[[65535, 7]], [[8, 9]]], dtype=torch.int32)
+        self.stager = FakeHostStager(
+            {
+                "a": host_request(self.a_embeds, self.a_ids, consumed=2),
+                "b": host_request(self.b_embeds, self.b_ids, consumed=0),
+            }
         )
+        self.expected_payload = torch.cat(
+            [
+                self.a_embeds[2:].flatten(),
+                self.b_embeds.flatten(),
+                expert_tail(self.a_ids[2:]),
+                expert_tail(self.b_ids),
+            ]
+        )
+        self.runner.worker = NS(_lwd_early_recv_endpoint=True, _lwd_stager=self.stager)
+        self.runner.device = torch.device("cpu")
+        self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
         self.runner.model_config = NS(
             get_hidden_size=lambda: 2,
             hf_config=NS(model_type="deepseek_v4", num_hash_layers=1, num_experts_per_tok=2),
@@ -199,14 +334,13 @@ class TestMixedInjection(unittest.TestCase):
         self.runner.input_batch = NS(
             num_reqs=3,
             req_ids=["a", "decode", "b"],
-            req_id_to_index={"a": 0, "decode": 1, "b": 2},
             num_prompt_tokens=[4, 4, 2],
             num_computed_tokens_cpu=[2, 9, 0],
             req_prompt_embeds={0: torch.zeros(4, 2), 2: torch.zeros(2, 2)},
             is_token_ids=np.ones((3, 16), dtype=bool),
         )
         self.runner.inputs_embeds = NS(gpu=torch.full((6, 2), -42.0))
-        self.runner.lwd_hash_state = routing.LwdHashRoutingState(1, 2, 8)
+        self.runner.lwd_hash_state = routing.LwdHashRoutingState(1, 2, 65536)
         self.runner._lwd_hash_experts = torch.zeros(6, 1, 2, dtype=torch.int32)
         self.runner._lwd_hash_prompt_mask = torch.zeros(6, dtype=torch.bool)
         self.runner.requests = {
@@ -216,115 +350,151 @@ class TestMixedInjection(unittest.TestCase):
         self.runner._lwd_rebuild_is_token_ids_mask = lambda counts: None
         self.runner._lwd_release_consumed_prompt_embeds = lambda: None
 
-    def inject(self, tp_group=None):
+    def inject(self, tp_group=None, new_reqs=(), counts=(2, 2, 2)):
+        events = []
+
+        class Event:
+            def record(self, stream=None):
+                self.stream = stream
+                events.append(("record", self))
+
+        self.h2d_stream = NS(wait_event=lambda event: events.append(("h2d_wait", event)))
+        self.compute_stream = NS(wait_event=lambda event: events.append(("compute_wait", event)))
+        npu = NS(
+            Stream=lambda: self.h2d_stream,
+            stream=lambda stream: nullcontext(),
+            Event=Event,
+            current_stream=lambda: self.compute_stream,
+        )
         parallel = NS(get_tp_group=lambda: tp_group or NS(world_size=1))
+        output = NS(scheduled_new_reqs=list(new_reqs))
         with (
             patch.dict(sys.modules, {"vllm.distributed.parallel_state": parallel}),
-            patch.object(torch, "npu", NS(current_stream=lambda: None), create=True),
+            patch.object(torch, "npu", npu, create=True),
             patch.object(torch.Tensor, "record_stream", return_value=None),
         ):
-            self.assertEqual(self.runner._prepare_inputs(NS(), [2, 2, 2]), "prepared")
+            self.assertEqual(self.runner._prepare_inputs(output, counts), "prepared")
+        self.npu_events = events
 
-    def test_transport_order_differs_from_runner_order(self):
+    def test_arrival_windows_follow_native_request_order(self):
         self.inject()
         actual = self.runner.inputs_embeds.gpu
-        self.assertTrue(torch.equal(actual[:2], self.embeds[2:]))
+        self.assertTrue(torch.equal(actual[:2], self.a_embeds[2:]))
         self.assertTrue(torch.equal(actual[2:4], torch.full((2, 2), -42.0)))
-        self.assertTrue(torch.equal(actual[4:], self.embeds[:2]))
+        self.assertTrue(torch.equal(actual[4:], self.b_embeds))
+        window = self.runner._lwd_win_dev[0][: self.expected_payload.numel()]
+        self.assertTrue(torch.equal(window, self.expected_payload))
         batch, mask = self.runner.lwd_hash_state.build_batch(["a", "decode", "b"], [2, 2, 2], [2, 9, 0], [4, 4, 2])
-        self.assertTrue(torch.equal(batch[:2], self.ids[2:]))
-        self.assertTrue(torch.equal(batch[4:], self.ids[:2]))
+        self.assertTrue(torch.equal(batch[:2], self.a_ids[2:]))
+        self.assertTrue(torch.equal(batch[4:], self.b_ids))
         self.assertEqual(mask.tolist(), [True, True, False, False, True, True])
+        self.assertEqual(self.stager.consumed_rows("a"), 4)
+        self.assertEqual(self.stager.consumed_rows("b"), 2)
 
-    def test_missing_offsets_fail(self):
-        self.meta.prompt_offsets = []
-        with self.assertRaisesRegex(ValueError, "one prompt offset"):
-            self.inject()
+    def test_preemption_rereads_embeddings_and_dsv4_tail(self):
+        self.runner.input_batch.num_computed_tokens_cpu = [0, 9, 0]
+        self.runner.inputs_embeds = NS(gpu=torch.full((8, 2), -42.0))
+        self.runner._lwd_hash_experts = torch.zeros(8, 1, 2, dtype=torch.int32)
+        self.runner._lwd_hash_prompt_mask = torch.zeros(8, dtype=torch.bool)
+        output = NS(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=NS(req_ids=["a"], num_computed_tokens=[0]),
+        )
+        self.runner._update_states(output)
+        self.assertEqual(self.runner.base_update_consumed, 0)
 
-    def test_wrong_absolute_offset_fails(self):
-        self.meta.prompt_offsets = [1, 2]
-        with self.assertRaisesRegex(ValueError, "chunk offset mismatch"):
-            self.inject()
+        self.inject(counts=[4, 2, 2])
+        expected_payload = torch.cat(
+            [
+                self.a_embeds.flatten(),
+                self.b_embeds.flatten(),
+                expert_tail(self.a_ids),
+                expert_tail(self.b_ids),
+            ]
+        )
+        actual = self.runner.inputs_embeds.gpu
+        self.assertTrue(torch.equal(actual[:4], self.a_embeds))
+        self.assertTrue(torch.equal(actual[4:6], torch.full((2, 2), -42.0)))
+        self.assertTrue(torch.equal(actual[6:], self.b_embeds))
+        window = self.runner._lwd_win_dev[0][: expected_payload.numel()]
+        self.assertTrue(torch.equal(window, expected_payload))
+        batch, mask = self.runner.lwd_hash_state.build_batch(["a", "decode", "b"], [4, 2, 2], [0, 9, 0], [4, 4, 2])
+        expected_batch = torch.cat([self.a_ids, torch.zeros_like(self.b_ids), self.b_ids])
+        self.assertTrue(torch.equal(batch, expected_batch))
+        self.assertEqual(mask.tolist(), [True] * 4 + [False] * 2 + [True] * 2)
 
-    def test_control_plane_mrope_visible_before_base_preparation(self):
-        # b's mrope positions arrive as control-plane bytes with the meta ([3, n]
-        # int64); a is text-only with empty bytes and zero path change.
-        positions = torch.tensor([[3, 6], [4, 7], [5, 8]], dtype=torch.int64)
-        self.meta.mrope_positions = [positions.numpy().tobytes(), b""]
-        self.meta.has_mrope = [True, False]
+    def test_h2d_ready_precedes_compute_and_used_follows_injection(self):
         self.inject()
-        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["b"], positions))
-        self.assertFalse(self.runner.positions_seen_by_base["a"].any())
-        self.assertEqual(self.runner.requests["b"].mrope_position_delta, 7)
-        self.assertTrue(torch.equal(self.runner.inputs_embeds.gpu[:2], self.embeds[2:]))
-        self.assertTrue(torch.equal(self.runner.inputs_embeds.gpu[4:], self.embeds[:2]))
+        self.assertEqual([event[0] for event in self.npu_events], ["record", "compute_wait", "record"])
+        ready = self.npu_events[0][1]
+        self.assertIs(ready.stream, self.h2d_stream)
+        self.assertIs(self.npu_events[1][1], ready)
+        self.assertIs(self.runner._lwd_win_used_ev[0], self.npu_events[2][1])
 
-    def test_chunk_rows_must_match_scheduled_window(self):
-        self.meta.token_ids[0] = [0]
-        with self.assertRaisesRegex(RuntimeError, "window mismatch"):
+    def test_device_windows_rotate(self):
+        first, first_idx = self.runner._lwd_window_device(self.expected_payload.numel())
+        _, second_idx = self.runner._lwd_window_device(self.expected_payload.numel())
+        third, third_idx = self.runner._lwd_window_device(self.expected_payload.numel())
+        self.assertEqual((first_idx, second_idx, third_idx), (0, 1, 0))
+        self.assertEqual(first.data_ptr(), third.data_ptr())
+
+    def test_consumed_must_equal_native_watermark(self):
+        self.stager.requests["a"].consumed = 1
+        with self.assertRaisesRegex(RuntimeError, "STAGE POSITION MISMATCH"):
             self.inject()
+
+    def test_full_mrope_is_visible_before_base_preparation(self):
+        positions = torch.tensor(
+            [[1, 3, 6, 9], [2, 4, 7, 8], [0, 2, 5, 6]],
+            dtype=torch.int64,
+        )
+        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=positions.numpy().tobytes())
+        self.inject(new_reqs=[new_req])
+        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"], positions))
+        self.assertEqual(self.runner.requests["a"].mrope_position_delta, 6)
+        self.assertFalse(self.runner.positions_seen_by_base["b"].any())
+
+    def test_full_mrope_rejects_wrong_payload_length(self):
+        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=b"too-short")
+        with self.assertRaisesRegex(RuntimeError, "payload bytes"):
+            self.inject(new_reqs=[new_req])
 
     def test_hash_staging_runs_after_injection(self):
         self.inject()
-        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.ids[2:]))
-        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[4:], self.ids[:2]))
+        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.a_ids[2:]))
+        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[4:], self.b_ids))
         self.assertEqual(self.runner._lwd_hash_prompt_mask.tolist(), [True, True, False, False, True, True])
 
-    def test_tp_receiver_allocates_complete_hash_payload(self):
+    def test_tp_receiver_broadcasts_complete_payload_once(self):
         self.runner.worker._lwd_early_recv_endpoint = False
-        self.runner.worker._lwd_up_recv_futures[7] = (None, self.meta)
         native_empty = torch.empty
         sizes = []
+        broadcasts = []
 
         def allocate(size, **kwargs):
             sizes.append(size)
-            return native_empty(size, dtype=kwargs["dtype"])
+            return native_empty(size, dtype=kwargs["dtype"], device=kwargs.get("device"))
 
         def broadcast(tensor, **kwargs):
             self.assertEqual(kwargs["src"], 1)
-            tensor.copy_(self.result.tensor)
-            return NS(wait=lambda: None)
+            tensor.copy_(self.expected_payload)
+            broadcasts.append(("launch", tensor.numel()))
+            return NS(wait=lambda: broadcasts.append(("wait", tensor.numel())))
 
+        positions = torch.arange(12, dtype=torch.int64).view(3, 4)
+        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=positions.numpy().tobytes())
         with (
             patch.object(torch, "empty", side_effect=allocate),
             patch("torch.distributed.broadcast", side_effect=broadcast),
         ):
-            self.inject(NS(world_size=2, ranks=[1, 2], device_group=object()))
-        self.assertEqual(sizes, [routing.hash_payload_numel(4, 2, 1, 2)])
-        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.ids[2:]))
-
-    def test_tp_receiver_consumes_control_plane_mrope_only(self):
-        # Non-endpoint rank: exactly one broadcast (main frame); mrope rides
-        # control-plane bytes — no data-plane aux frame (that path is retired).
-        self.runner.worker._lwd_early_recv_endpoint = False
-        self.runner.worker._lwd_up_recv_futures[7] = (None, self.meta)
-        self.runner.model_config.hf_config = NS(model_type="qwen2_5_vl")
-        self.runner.lwd_hash_state = None
-        self.meta.has_mrope = [False, True]
-        positions = torch.tensor([[3, 6], [4, 7], [5, 8]], dtype=torch.int64)
-        self.meta.mrope_positions = [b"", positions.numpy().tobytes()]
-        frames = iter([self.embeds.flatten()])
-        events = []
-        native_empty = torch.empty
-
-        def allocate(size, **kwargs):
-            return native_empty(size, dtype=kwargs["dtype"])
-
-        def broadcast(tensor, **kwargs):
-            frame = next(frames)
-            self.assertEqual(tensor.dtype, frame.dtype)
-            tensor.copy_(frame)
-            events.append(("launch", tensor.numel()))
-            return NS(wait=lambda: events.append(("wait", tensor.numel())))
-
-        with (
-            patch.object(torch, "empty", side_effect=allocate),
-            patch("torch.distributed.broadcast", side_effect=broadcast),
-        ):
-            self.inject(NS(world_size=2, ranks=[1, 2], device_group=object()))
-        self.assertEqual(events, [("launch", 8), ("wait", 8)])
-        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"][:, 2:], positions))
-        self.assertFalse(self.runner.positions_seen_by_base["b"].any())
+            self.inject(NS(world_size=2, ranks=[1, 2], device_group=object()), [new_req])
+        self.assertEqual(sizes, [self.expected_payload.numel()])
+        self.assertEqual(
+            broadcasts,
+            [("launch", self.expected_payload.numel()), ("wait", self.expected_payload.numel())],
+        )
+        self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.a_ids[2:]))
+        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"], positions))
 
 
 class TestExternalEmbeddingSP(unittest.TestCase):

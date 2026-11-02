@@ -39,6 +39,7 @@ class LwdTransferFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: torch.npu.Event | None = None,
     ) -> None:
         self._request = request
         self._handles = handles
@@ -46,6 +47,7 @@ class LwdTransferFuture:
         self._tensor = tensor
         self._aux_tensor = aux_tensor
         self._keepalive = keepalive
+        self._staged_event = staged_event
         self._status = LwdTransferStatus.PENDING
         self._error: BaseException | None = None
         self._lock = threading.Lock()
@@ -70,6 +72,7 @@ class LwdTransferFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: torch.npu.Event | None = None,
     ) -> None:
         with self._done_cond:
             self._handles = handles
@@ -77,6 +80,7 @@ class LwdTransferFuture:
             self._tensor = tensor
             self._aux_tensor = aux_tensor
             self._keepalive = keepalive
+            self._staged_event = staged_event
             self._done_cond.notify_all()
 
     # ------------------------------------------------------------------ #
@@ -162,6 +166,32 @@ class LwdTransferFuture:
                 f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
             ) from error
         return LwdTransferResult(status=status, tensor=tensor, aux_tensor=aux_tensor)
+
+    # ------------------------------------------------------------------ #
+    # Host staging                                                        #
+    # ------------------------------------------------------------------ #
+
+    def staged_done(self) -> bool:
+        """Query D2H completion without blocking the communication thread."""
+        event = self._staged_event
+        if event is None:
+            return True
+        try:
+            return bool(event.query())
+        except Exception as exc:
+            with self._lock:
+                if self._status is not LwdTransferStatus.ERROR:
+                    self._status = LwdTransferStatus.ERROR
+                    self._error = exc
+                    self._done_cond.notify_all()
+            return True
+
+    def release_device_tensor(self) -> None:
+        """Release a staged receive's device slot, not a normal recv result."""
+        if self._staged_event is None:
+            return
+        with self._done_cond:
+            self._tensor = None
 
     # ------------------------------------------------------------------ #
     # Device-side ordering for consumers                                  #

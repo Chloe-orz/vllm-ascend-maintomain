@@ -12,6 +12,7 @@ unchanged, this only restores the native worker↔runner division.
 from __future__ import annotations
 
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import torch
@@ -20,6 +21,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.v1.core.sched.output import LwdEmbedBatch, LwdUnembedBatch
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
@@ -39,8 +41,9 @@ def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
 
     logits [R,V] rows sorted together (NPU sorts rows in parallel);
     sorted_idx[i, ranks[i]] is the token id at rank ranks[i] for row i.
+    Stable sorting preserves ascending token-ID order for equal logits.
     """
-    _, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+    _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
     row = torch.arange(len(ranks), device=logits.device)
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
 
@@ -57,6 +60,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         super().__init__(vllm_config, device, worker)
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
+        self._lwd_up_send_inflight: dict[int, deque[tuple[int, LwdTransferFuture]]] = {}
+        self._lwd_up_send_watermarks: dict[int, int] = {}
 
     def load_model(self) -> None:
         """Load the edge model and read the CPU Hash routing tables for
@@ -118,28 +123,70 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             min_capacity=8192,
         ).stage_to_device(flat_token_ids, len(flat_token_ids))
 
+    def _lwd_submit_up_send(self, request: LwdTransferRequest) -> None:
+        future = self.worker.comm_service.submit_send(request)
+        pending = self._lwd_up_send_inflight.setdefault(request.dp_idx, deque())
+        pending.append((request.seqno, future))
+
+    def _lwd_pop_completed_up_sends(self) -> None:
+        """Advance each DP watermark only across its successful FIFO prefix."""
+        for dp_idx, pending in self._lwd_up_send_inflight.items():
+            while pending and pending[0][1].done():
+                seqno, future = pending[0]
+                future.result()
+                pending.popleft()
+                self._lwd_up_send_watermarks[dp_idx] = seqno
+
+    def _lwd_watermarked_output(self, dp_idx: int | None = None) -> ModelRunnerOutput:
+        self._lwd_pop_completed_up_sends()
+        if dp_idx is None:
+            watermarks = {
+                known_dp_idx: self._lwd_up_send_watermarks.get(known_dp_idx, -1)
+                for known_dp_idx in self._lwd_up_send_inflight
+            }
+        else:
+            watermarks = {dp_idx: self._lwd_up_send_watermarks.get(dp_idx, -1)}
+        return ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            lwd_up_send_watermarks=watermarks,
+        )
+
+    def _lwd_gather_mm(
+        self,
+        batch_meta: LwdEmbedBatch,
+        scheduler_output: SchedulerOutput,
+        model: torch.nn.Module,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        is_refill = getattr(batch_meta, "is_refill", False)
+        new_reqs = scheduler_output.scheduled_new_reqs
+        snapshot = self.mm_cache.snapshot_features([req_data.req_id for req_data in new_reqs]) if is_refill else {}
+        try:
+            for req_data in new_reqs:
+                feats = [f for f in req_data.mm_features if f.modality != "prompt_embeds"]
+                if feats:
+                    self.mm_cache.register(req_data.req_id, feats)
+            return self.mm_cache.gather_chunk(
+                batch_meta,
+                model,
+                self.device,
+                self.pin_memory,
+            )
+        finally:
+            if is_refill:
+                self.mm_cache.restore_features(snapshot)
+
     @torch.inference_mode()
     def execute_lwd_embed(
         self,
         seqno: int,
         batch_meta: LwdEmbedBatch,
         scheduler_output: SchedulerOutput,
-    ) -> None:
+    ) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.token_ids:
-            return
-
-        # Register newly arrived requests' mm features (the first chunk
-        # carries data with scheduled_new_reqs; later chunks hit the
-        # cache). Registration deliberately does not filter data:None
-        # entries — the encoder execution point fails fast on them (see
-        # LwdEdgeMmCache.encoder_outputs); silently skipping would drop
-        # image embeds and embed placeholder tokens as text, i.e. compute
-        # garbage.
-        for req_data in scheduler_output.scheduled_new_reqs:
-            feats = [f for f in req_data.mm_features if f.modality != "prompt_embeds"]
-            if feats:
-                self.mm_cache.register(req_data.req_id, feats)
+            return self._lwd_watermarked_output(batch_meta.dp_idx)
 
         # Flatten all requests' prompt tokens into one batch (order = req_ids).
         flat_token_ids = [tid for token_ids in batch_meta.token_ids for tid in token_ids]
@@ -150,12 +197,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # collect vision-tower embeds for this chunk window + build the
         # is_multimodal mask and take the model's native embed_input_ids
         # merge branch; text-only batches take the original direct path.
-        mm_embeds, is_mm = self.mm_cache.gather_chunk(
-            batch_meta,
-            model,
-            self.device,
-            self.pin_memory,
-        )
+        mm_embeds, is_mm = self._lwd_gather_mm(batch_meta, scheduler_output, model)
         if mm_embeds:
             embeds = model.embed_input_ids(
                 token_ids_tensor,
@@ -190,7 +232,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             tensor=payload,
             seqno=seqno,
         )
-        self.worker.comm_service.submit_send(request)
+        self._lwd_submit_up_send(request)
         # [Lwd][perf] TTFT probes: forward = the embed forward;
         # submit_send = snapshot clone + broadcast submit (including the
         # bridge's handle.wait) — if the UP world broadcast is waiting on
@@ -204,12 +246,13 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
+        return self._lwd_watermarked_output(batch_meta.dp_idx)
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.req_ids:
-            return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+            return self._lwd_watermarked_output()
 
         _t0 = time.monotonic()
         recv_future = self.worker.comm_service.submit_recv(
@@ -276,9 +319,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (_t_sel - _t0) * 1000,
             len(batch_meta.req_ids),
         )
-        req_id_to_index = {req_id: index for index, req_id in enumerate(batch_meta.req_ids)}
-        return ModelRunnerOutput(
-            req_ids=batch_meta.req_ids,
-            req_id_to_index=req_id_to_index,
-            sampled_token_ids=sampled_token_ids,
-        )
+        output = self._lwd_watermarked_output()
+        output.req_ids = batch_meta.req_ids
+        output.req_id_to_index = {req_id: index for index, req_id in enumerate(batch_meta.req_ids)}
+        output.sampled_token_ids = sampled_token_ids
+        return output

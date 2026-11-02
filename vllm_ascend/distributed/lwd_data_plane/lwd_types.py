@@ -79,6 +79,12 @@ class LwdTransferRequest:
     # payload (e.g. a bf16 deepstack frame) only sets it, without changing
     # the channel structure.
     aux_dtype: Any | None = None
+    # recv: optional caller-owned device slot for the main frame. Its numel
+    # must exactly match num_elements; when omitted, the queue allocates it.
+    recv_buffer: Any | None = None
+    # recv: optional segmented D2H destinations. Each tuple contains a pinned
+    # host view, a flat source element offset, and the number of elements.
+    stage_segments: list[tuple[Any, int, int]] | None = None
 
 
 @dataclass
