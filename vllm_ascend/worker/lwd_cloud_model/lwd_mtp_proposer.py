@@ -9,7 +9,7 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context
 
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.worker.v1.spec_decode.eagle_proposer import AscendEagleProposer
 
 if TYPE_CHECKING:
     from typing import Any
