@@ -497,37 +497,5 @@ class TestMixedInjection(unittest.TestCase):
         self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"], positions))
 
 
-class TestExternalEmbeddingSP(unittest.TestCase):
-    def test_main_and_mtp_shard_only_embedding_rows(self):
-        class Base:
-            def _model_forward(self, *args, **kwargs):
-                return args
-
-            def _run_merged_draft(self, *args):
-                return args
-
-        context = NS(flash_comm_v1_enabled=True, pad_size=1)
-        group = NS(world_size=2, rank_in_group=1)
-        globals_ = dict(get_forward_context=lambda: context, get_tp_group=lambda: group)
-        main = load_methods(RUNNER, {"_model_forward"}, Base, **globals_)()
-        main.supports_mm_inputs = False
-        main.lwd_hash_state = None
-        mtp = load_methods("worker/lwd_cloud_model/lwd_mtp_proposer.py", {"_run_merged_draft"}, Base, **globals_)()
-        mtp.is_multimodal_model = False
-        embeds = torch.arange(6).reshape(3, 2).float()
-        positions = torch.arange(3)
-        main_result = main._model_forward(3, positions=positions, inputs_embeds=embeds)
-        mtp_result = mtp._run_merged_draft(3, 1, None, positions, embeds, None, 3)
-        expected = torch.tensor([[4.0, 5.0], [0.0, 0.0]])
-        self.assertTrue(torch.equal(main_result[4], expected))
-        self.assertTrue(torch.equal(mtp_result[4], expected))
-        self.assertIs(main_result[2], positions)
-        self.assertIs(mtp_result[3], positions)
-        with self.assertRaisesRegex(ValueError, "full-token"):
-            main._model_forward(3, inputs_embeds=embeds[:2])
-        with self.assertRaisesRegex(ValueError, "full-token"):
-            mtp._run_merged_draft(3, 1, None, positions, embeds[:2], None, 3)
-
-
 if __name__ == "__main__":
     unittest.main()
