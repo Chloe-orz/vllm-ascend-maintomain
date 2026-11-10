@@ -8,10 +8,17 @@ lazy staging factory that three call sites used to hand-roll.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
 from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
+    from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 
 
 class LwdBaseModelRunner(NPUModelRunner):
@@ -19,9 +26,9 @@ class LwdBaseModelRunner(NPUModelRunner):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
-        device: "torch.device",
-        worker: "LwdWorkerBase | None" = None,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        worker: LwdWorkerBase | None = None,
     ) -> None:
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdWorkerBase ref (comm service lives there)
@@ -32,7 +39,7 @@ class LwdBaseModelRunner(NPUModelRunner):
         self,
         name: str,
         *,
-        dtype: "torch.dtype",
+        dtype: torch.dtype,
         min_capacity: int,
         device_mirror: bool = True,
     ) -> LwdPinnedStaging:
