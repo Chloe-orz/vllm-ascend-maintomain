@@ -34,7 +34,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransf
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
-def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
+def lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
     """Derive the per-flight seed from the request's own fields, or None.
 
     The seed's three inputs (channel / seqno / num_elements) already live on
@@ -132,7 +132,7 @@ class LwdTransferQueue:
         """Give the data plane ownership of the send payload."""
         assert request.tensor is not None, "send requires tensor"
         owned = request.tensor.detach().clone()
-        seed = _lwd_scramble_seed_for(request)
+        seed = lwd_scramble_seed_for(request)
         if seed is not None:
             # Scramble the communication-owned snapshot (never the model
             # tensor the caller still owns).
@@ -310,7 +310,7 @@ class LwdTransferQueue:
             else:
                 tensor, aux_tensor, handles = self._post_recv(req)
             done_event = self._bridge_and_record(handles)
-            seed = _lwd_scramble_seed_for(req) if req.op == "recv" else None
+            seed = lwd_scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
                 # payload is already complete here; XOR is its own inverse,
@@ -384,8 +384,9 @@ class LwdTransferQueue:
                 raise ValueError(
                     f"invalid stage segment offset={src_offset} numel={numel} for recv num_elements={req.num_elements}"
                 )
-            if dst.numel() != numel:
-                raise ValueError(f"stage destination numel {dst.numel()} != segment numel {numel}")
+            dst_numel = dst.numel()  # symbolic-meta-ok: staging size check, not a meta shape
+            if dst_numel != numel:
+                raise ValueError(f"stage destination numel {dst_numel} != segment numel {numel}")
 
     def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
@@ -446,11 +447,14 @@ class LwdTransferQueue:
         buffer = req.recv_buffer
         if buffer is None:
             buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
-        elif buffer.numel() != req.num_elements:
-            raise RuntimeError(
-                f"recv_buffer numel {buffer.numel()} != requested num_elements {req.num_elements} "
-                f"on channel {self.channel_type.value} seqno={req.seqno}"
-            )
+        else:
+            buffer_elements = buffer.numel()  # symbolic-meta-ok: buffer size check
+            if buffer_elements != req.num_elements:
+                raise RuntimeError(
+                    f"recv_buffer numel {buffer_elements} != requested "
+                    f"num_elements {req.num_elements} on channel "
+                    f"{self.channel_type.value} seqno={req.seqno}"
+                )
         self._validate_stage_segments(req)
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
