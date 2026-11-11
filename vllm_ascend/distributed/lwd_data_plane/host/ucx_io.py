@@ -56,6 +56,10 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 # Blocks per channel: absorbs the early frames and provides send backpressure.
 BLOCKS_PER_CHANNEL = 4
+# Early frames that arrived before their receive was pre-posted. The old
+# branch allowed 4096; leaving this at LwdUcxConfig's default caps the store
+# at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
+_EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
 
 
@@ -117,6 +121,7 @@ class LwdNpuUcxChannelIo:
         cfg = LwdUcxConfig(
             block_mb=self._block_bytes >> 20,
             n_blocks=BLOCKS_PER_CHANNEL,
+            early_max=_EARLY_MAX,
             hs_timeout_s=_HS_TIMEOUT_S,
             token=config.token,
             # Send-only link: pool blocks are not attached to the

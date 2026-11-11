@@ -94,3 +94,26 @@ def test_send_waits_for_the_producer_before_queueing(producer_stream) -> None:
     io.submit_send(7, tensor, None, None, _Future())
 
     assert io._events == [("wait", producer_stream), ("put", 7)]
+
+
+def test_early_frame_capacity_is_passed_to_the_transport(monkeypatch) -> None:
+    """The old branch's 4096 early-frame budget must not fall back to 4."""
+    captured = {}
+
+    class Config:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(ucx_io, "LwdUcxConfig", Config)
+    monkeypatch.setattr(ucx_io, "open_transport", lambda *args, **kwargs: object())
+    monkeypatch.setattr(ucx_io.torch.npu, "Stream", lambda: object(), raising=False)
+    config = ucx_io.LwdNpuUcxChannelIoConfig(
+        op="recv",
+        up_block_mb=128,
+        down_block_mb=32,
+        token=1,
+    )
+
+    ucx_io.LwdNpuUcxChannelIo(ucx_io.LwdChannelType.UP, object(), config)
+
+    assert captured["early_max"] == 4096
