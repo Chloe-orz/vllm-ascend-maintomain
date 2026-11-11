@@ -199,6 +199,12 @@ class LwdNpuUcxChannelIo:
         # can never reach the cloud. Queueing it would leave the request
         # awaiting forever because _do_send only finalizes the future.
         self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
+        # The caller enqueues the snapshot clone asynchronously on the
+        # producer stream, while the sender thread D2Hs on this channel
+        # stream. Order the D2H after that producer work or it can read
+        # half-written bytes under back-to-back submits.
+        producer = torch.npu.current_stream()
+        self._stream.wait_stream(producer)
         if self._tr_submit_send:
             self._tr_submit_send = False
             logger.error(
