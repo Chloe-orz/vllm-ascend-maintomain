@@ -384,9 +384,8 @@ class LwdTransferQueue:
                 raise ValueError(
                     f"invalid stage segment offset={src_offset} numel={numel} for recv num_elements={req.num_elements}"
                 )
-            dst_numel = dst.numel()  # symbolic-meta-ok: staging size check, not a meta shape
-            if dst_numel != numel:
-                raise ValueError(f"stage destination numel {dst_numel} != segment numel {numel}")
+            if dst.numel() != numel:
+                raise ValueError(f"stage destination numel {dst.numel()} != segment numel {numel}")
 
     def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
@@ -447,14 +446,11 @@ class LwdTransferQueue:
         buffer = req.recv_buffer
         if buffer is None:
             buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
-        else:
-            buffer_elements = buffer.numel()  # symbolic-meta-ok: buffer size check
-            if buffer_elements != req.num_elements:
-                raise RuntimeError(
-                    f"recv_buffer numel {buffer_elements} != requested "
-                    f"num_elements {req.num_elements} on channel "
-                    f"{self.channel_type.value} seqno={req.seqno}"
-                )
+        elif buffer.numel() != req.num_elements:
+            raise RuntimeError(
+                f"recv_buffer numel {buffer.numel()} != requested num_elements {req.num_elements} "
+                f"on channel {self.channel_type.value} seqno={req.seqno}"
+            )
         self._validate_stage_segments(req)
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
