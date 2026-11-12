@@ -20,6 +20,30 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransfe
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
+def _queue_class() -> type[LwdTransferQueue]:
+    """Queue implementation selected by the topology's transport.
+
+    ``device`` keeps the HCCL queue; ``host`` needs the UCX queue. A host
+    topology that cannot load its queue must fail loudly here instead of
+    silently degrading to HCCL, which would break later with a misleading
+    "holds no channel" error. The import stays lazy so the host stack (and
+    its ctypes binding) is not loaded on the default path.
+    """
+    # The transport decision is cached at channel-init time, when the current
+    # config is set; it is not readable on the request path.
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+        lwd_data_plane_comm,
+    )
+
+    if lwd_data_plane_comm() != "host":
+        return LwdTransferQueue
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue import (
+        LwdHostTransferQueue,
+    )
+
+    return LwdHostTransferQueue
+
+
 class LwdDataPlane:
     """Process-wide singleton.  All public methods are thread-safe."""
 
@@ -124,7 +148,7 @@ class LwdDataPlane:
             key = (request.dp_idx, request.channel, request.op)
             queue = self._queues.get(key)
             if queue is None:
-                queue = LwdTransferQueue(request.dp_idx, request.channel, request.op)
+                queue = _queue_class()(request.dp_idx, request.channel, request.op)
                 self._queues[key] = queue
         return queue.submit(request)
 

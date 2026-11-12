@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_world_group, init_model_parallel_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 
@@ -114,7 +115,11 @@ def init_ascend_model_parallel(
                 global_dp_size * global_pp_size * global_pcp_size, -1, num_head_replica
             )  # [DP_size, num_head, num_head_replica]
             group_ranks = group_ranks.permute(0, 2, 1)
-            group_ranks = group_ranks.reshape(-1, group_ranks.size(-1))  # [DP_size * num_head_replica, num_head]
+            group_ranks = group_ranks.reshape(
+                -1,
+                group_ranks.size(-1),  # symbolic-meta-ok: rank table, not a model tensor
+            )  # [DP_size * num_head_replica, num_head]
+            # symbolic-meta-ok: rank table, not a model tensor
             alltoall_group_size = group_ranks.size(-1) // remote_tp_size
             group_ranks = group_ranks.unsqueeze(-1).view(
                 global_dp_size * global_pp_size * global_pcp_size,
@@ -192,6 +197,14 @@ def init_ascend_model_parallel(
 
 def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> None:
     """Build the Ascend groups of the HCCL world shared by the LWD edge and cloud."""
+    # Host comm (data_plane_comm=host) has NO global comm domain: the
+    # edge and cloud are separate torch worlds, so the cross-side MC2/EP
+    # rank groups cannot exist (and the topology declares no ranks).
+    # Each instance's intra-instance groups come from the regular
+    # (non-LWD) parallel init path; nothing to do here.
+    if lwd_config.topology.is_host_comm:
+        logger.info("[LWD] data_plane_comm=host: skip cross-side MC2/EPLB groups (no global comm domain)")
+        return
     from vllm_ascend.distributed.lwd_data_plane.lwd_parallel_groups import lwd_mc2_group_ranks
 
     global _MC2, _DYNAMIC_EPLB

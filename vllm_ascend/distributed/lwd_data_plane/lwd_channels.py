@@ -62,6 +62,24 @@ def lwd_init_channels() -> None:
         return
     lwd_config = get_current_vllm_config().lwd_config
     assert lwd_config is not None, "the data plane requires lwd_config"
+    # Transport comm dispatch: a host-comm topology builds host (UCX) links
+    # instead of HCCL groups (link endpoints derive deterministically from
+    # the topology; the queue factory in lwd_data_plane picks the matching
+    # LwdTransferQueue implementation). Lazy import keeps the UCX stack
+    # (libucp ctypes) out of the default HCCL path. The HCCL channel probe
+    # below is device-only: host comm has no HCCL channel to probe.
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+        lwd_data_plane_comm,
+    )
+
+    if lwd_data_plane_comm() == "host":  # caches the comm for the request path
+        from vllm_ascend.distributed.lwd_data_plane.host import (
+            lwd_init_host_channels,
+        )
+
+        lwd_init_host_channels()
+        _LWD_CHANNELS_INITIALIZED = True
+        return
     spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
@@ -268,6 +286,19 @@ def lwd_get_channel_stream(channel: LwdChannelType, dp_idx: int = 0) -> torch.np
 
 def lwd_destroy_channels() -> None:
     global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+        lwd_data_plane_comm,
+    )
+
+    if _LWD_CHANNELS_INITIALIZED and lwd_data_plane_comm() == "host":
+        # Host comm: no HCCL groups exist; tear down the host links.
+        from vllm_ascend.distributed.lwd_data_plane.host import (
+            lwd_destroy_host_channels,
+        )
+
+        lwd_destroy_host_channels()
+        _LWD_CHANNELS_INITIALIZED = False
+        return
     for (dp_idx, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
         try:
             dist.destroy_process_group(group)

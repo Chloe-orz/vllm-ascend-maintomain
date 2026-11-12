@@ -82,7 +82,7 @@ def test_runtime_meta_placeholder_materialization(
         return "STREAM_RET"
 
     runner = cls.__new__(cls)
-    runner.worker = NS(_lwd_early_recv_endpoint=False)
+    runner.worker = NS(_lwd_is_early_recv_endpoint=False)
     base_cls = type(runner).__mro__[1]
     monkeypatch.setattr(base_cls, "_update_states", fake_base_update_states)
     monkeypatch.setattr(base_cls, "_update_streaming_request", fake_base_update_streaming)

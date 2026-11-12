@@ -199,9 +199,24 @@ class LwdTransferFuture:
 
     def wait_on_current_stream(self) -> None:
         """Order the *current* stream after the channel-stream completion
-        event (pure device-side; CPU returns immediately)."""
+        event (pure device-side; CPU returns immediately).
+
+        UCX paths bind the event asynchronously (IO thread / sender
+        thread): first wait until the future is bound — reading
+        ``result()`` before the bind would surface ``tensor=None`` and
+        crash the consumer.  Host-side completion events (UCX sends)
+        carry no device ordering semantics; ordering after them is a
+        no-op (their data is host-staged, already readable when set).
+        """
+        with self._done_cond:
+            while self._done_event is None and self._status is LwdTransferStatus.PENDING:
+                self._done_cond.wait(timeout=0.01)
+            if self._status is LwdTransferStatus.ERROR:
+                raise RuntimeError(
+                    f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
+                ) from self._error
         event = self._done_event
-        if event is not None:
+        if event is not None and not getattr(event, "is_host_event", False):
             torch.npu.current_stream().wait_event(event)
 
     # ------------------------------------------------------------------ #

@@ -34,7 +34,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransf
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
-def _lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
+def lwd_scramble_seed_for(request: LwdTransferRequest) -> int | None:
     """Derive the per-flight seed from the request's own fields, or None.
 
     The seed's three inputs (channel / seqno / num_elements) already live on
@@ -132,7 +132,7 @@ class LwdTransferQueue:
         """Give the data plane ownership of the send payload."""
         assert request.tensor is not None, "send requires tensor"
         owned = request.tensor.detach().clone()
-        seed = _lwd_scramble_seed_for(request)
+        seed = lwd_scramble_seed_for(request)
         if seed is not None:
             # Scramble the communication-owned snapshot (never the model
             # tensor the caller still owns).
@@ -310,7 +310,7 @@ class LwdTransferQueue:
             else:
                 tensor, aux_tensor, handles = self._post_recv(req)
             done_event = self._bridge_and_record(handles)
-            seed = _lwd_scramble_seed_for(req) if req.op == "recv" else None
+            seed = lwd_scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
                 # payload is already complete here; XOR is its own inverse,
