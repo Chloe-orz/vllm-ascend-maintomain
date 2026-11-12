@@ -80,14 +80,14 @@ class LwdCloudWorker(LwdWorkerBase):
         global_rank = dist.get_rank()
         if lwd_config.topology.is_host_comm:
             # Host comm: the DP endpoint is TP rank 0 of this instance world.
-            self._lwd_early_recv_endpoint = get_tensor_model_parallel_rank() == 0
+            self._lwd_is_early_recv_endpoint = get_tensor_model_parallel_rank() == 0
         else:
             endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
-            self._lwd_early_recv_endpoint = global_rank == endpoint_rank
+            self._lwd_is_early_recv_endpoint = global_rank == endpoint_rank
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
-        if self._lwd_early_recv_endpoint:
+        if self._lwd_is_early_recv_endpoint:
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
         lwd_logger.info(
@@ -95,7 +95,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self.rank,
             global_rank,
             self._lwd_dp_idx,
-            self._lwd_early_recv_endpoint,
+            self._lwd_is_early_recv_endpoint,
             self._lwd_up_hidden_size,
         )
         self._register_lwd_prompt_embeds_provider()

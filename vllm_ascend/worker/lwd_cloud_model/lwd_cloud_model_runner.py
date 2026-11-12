@@ -360,7 +360,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_rewind_preempted_requests(self, scheduler_output: SchedulerOutput) -> None:
         """Align host read pointers with scheduler rollbacks and prefix hits."""
         worker = self.worker
-        if worker is None or not worker._lwd_early_recv_endpoint:
+        if worker is None or not worker._lwd_is_early_recv_endpoint:
             return
         stager = worker._lwd_stager
         if stager is None:
@@ -644,7 +644,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         tail_per_row = 4 * num_hash_layers * top_k
         total_rows = sum(window.rows for window in plan)
         numel = total_rows * (hidden_size + tail_per_row)
-        if worker._lwd_early_recv_endpoint:
+        if worker._lwd_is_early_recv_endpoint:
             stager = worker._lwd_stager
             if stager is None:
                 raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
