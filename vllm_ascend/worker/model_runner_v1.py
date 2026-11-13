@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from vllm import envs as vllm_envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -266,6 +267,12 @@ class ExecuteModelState(NamedTuple):
 
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        lwd_config = vllm_config.parallel_config.lwd_config
+        self._lwd_diag_enabled = (
+            lwd_config.enable_lwd
+            and not lwd_config.is_edge_node
+            and getattr(vllm_envs, "VLLM_LWD_DIAG", False)
+        )
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
         # the following PR is merged:
@@ -1081,7 +1088,22 @@ class NPUModelRunner(GPUModelRunner):
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
+            if self._lwd_diag_enabled:
+                logger.info(
+                    "[LWD][diag] accepted_tokens_sync_begin device=%s "
+                    "tokens=%d reqs=%d ts=%.3f",
+                    self.device,
+                    scheduler_output.total_num_scheduled_tokens,
+                    num_reqs,
+                    time.monotonic(),
+                )
             self.num_accepted_tokens_event.synchronize()
+            if self._lwd_diag_enabled:
+                logger.info(
+                    "[LWD][diag] accepted_tokens_sync_end device=%s ts=%.3f",
+                    self.device,
+                    time.monotonic(),
+                )
             # LWD-only: the event also covers the deferred persist copy;
             # landing the stashed values here keeps the phase-alternation
             # fallback below reading fresh per-request acceptance without a

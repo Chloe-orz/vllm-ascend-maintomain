@@ -27,12 +27,16 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from vllm import envs
 from vllm.logger import logger
 
 from vllm_ascend.distributed import lwd_wire
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
-from vllm_ascend.distributed.lwd_comm.types import LwdCommRequest, LwdChannelType
+from vllm_ascend.distributed.lwd_comm.types import (
+    LwdChannelType,
+    LwdCommRequest,
+    LwdCommStatus,
+)
 
 
 def _scramble_seed_for(request: LwdCommRequest) -> int | None:
@@ -67,6 +71,7 @@ class LwdChannel:
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self.engine_index = engine_index  # 目标/来源云 engine(= dp_rank)
+        self._diag_enabled = getattr(envs, "VLLM_LWD_DIAG", False)
         self._pending: deque[LwdCommFuture] = deque()
         self._lock = threading.Lock()
         # The pending-queue lock alone cannot prevent two host threads
@@ -218,7 +223,11 @@ class LwdChannel:
         """Execute one wire op as the channel's new tail."""
         with self._lock:
             predecessor = self._pending[-1] if self._pending else None
+        if self._diag_enabled:
+            self._log_wire_state("post_begin", request, LwdCommStatus.PENDING)
         future = self._execute(request, predecessor, into=into)
+        if self._diag_enabled:
+            self._log_wire_state("posted", request, future.status)
         with self._lock:
             self._pending.append(future)
         return future
@@ -278,10 +287,25 @@ class LwdChannel:
                 done.append(self._pending.popleft())
         return done
 
-    @staticmethod
-    def _finalize_many(futures: list[LwdCommFuture]) -> None:
+    def _finalize_many(self, futures: list[LwdCommFuture]) -> None:
         for future in futures:
             future._finalize()
+            if self._diag_enabled:
+                self._log_wire_state("reaped", future.request, future.status)
+
+    def _log_wire_state(
+        self, stage: str, request: LwdCommRequest, status: LwdCommStatus
+    ) -> None:
+        peer = request.src_dst
+        if peer is None:
+            peer = lwd_wire.get_lwd_channel_peer(self.channel_type, self.engine_index)
+        logger.info(
+            "[LWD][diag] wire_%s channel=%s op=%s engine=%d seqno=%s "
+            "rank=%d peer=%d numel=%d aux_numel=%d status=%s ts=%.3f",
+            stage, self.channel_type.value, self.op, self.engine_index,
+            request.seqno, dist.get_rank(), peer, request.num_elements,
+            request.aux_num_elements, status.value, time.monotonic(),
+        )
 
     # ------------------------------------------------------------------ #
     # Wire execution                                                      #

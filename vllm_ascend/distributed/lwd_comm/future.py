@@ -110,6 +110,11 @@ class LwdCommFuture:
     def request(self) -> LwdCommRequest:
         return self._request
 
+    @property
+    def status(self) -> LwdCommStatus:
+        with self._lock:
+            return self._status
+
     def done(self) -> bool:
         """Pure CPU query; never blocks, never touches the device."""
         with self._lock:

@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm import envs as vllm_envs
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -125,7 +126,7 @@ class LwdEdgeWorker(NPUWorker):
         init_lwd_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
-    def init_device(self):
+    def init_device(self) -> None:
         # The duplex channels MUST be built here, never in ``__init__``.
         # ``init_lwd_duplex_channels`` creates the HCCL process groups
         # (two ``dist.new_group`` per cloud engine) and then warms them up
@@ -141,6 +142,7 @@ class LwdEdgeWorker(NPUWorker):
         # DOWN), which only holds once every rank is past its distributed
         # init.
         super().init_device()
+        self._lwd_diag_enabled = getattr(vllm_envs, "VLLM_LWD_DIAG", False)
         # Payload scramble: bind the two static factors once; the per-flight
         # seed is derived by the comm layer from each request's own fields.
         self._build_payload_scrambler()
@@ -585,6 +587,11 @@ class LwdEdgeWorker(NPUWorker):
         else:
             # lm_head 不允许直接调用(ParallelLMHead.forward 强制经 sampler);
             # compute_logits 是标准接口,包装层/单体模型都有。
+            if self._lwd_diag_enabled:
+                logger.info(
+                    "[LWD][diag] unembed_logits_begin seqno=%d ts=%.3f",
+                    seqno, time.monotonic(),
+                )
             logits = model.compute_logits(hidden_states)   # (rows_total, V)
             _t_lm = time.monotonic()
             # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
@@ -606,6 +613,11 @@ class LwdEdgeWorker(NPUWorker):
             except Exception:  # noqa: BLE001
                 pass
 
+            if self._lwd_diag_enabled:
+                logger.info(
+                    "[LWD][diag] unembed_select_begin seqno=%d ts=%.3f",
+                    seqno, time.monotonic(),
+                )
             flat_ids = select_token_batch(
                 logits, [r for ths in batch_meta.top_id_ths for r in ths]
             )
