@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -76,13 +77,17 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
-        endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == endpoint_rank
+        if lwd_config.topology.is_host_comm:
+            # Host comm: the DP endpoint is TP rank 0 of this instance world.
+            self._lwd_is_early_recv_endpoint = get_tensor_model_parallel_rank() == 0
+        else:
+            endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
+            self._lwd_is_early_recv_endpoint = global_rank == endpoint_rank
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
-        if self._lwd_early_recv_endpoint:
+        if self._lwd_is_early_recv_endpoint:
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
         lwd_logger.info(
@@ -90,7 +95,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self.rank,
             global_rank,
             self._lwd_dp_idx,
-            self._lwd_early_recv_endpoint,
+            self._lwd_is_early_recv_endpoint,
             self._lwd_up_hidden_size,
         )
         self._register_lwd_prompt_embeds_provider()
@@ -454,16 +459,17 @@ class LwdCloudWorker(LwdWorkerBase):
         if payload is not None and output is not None:
             (hidden, meta_dev, seg_lens_host, ready_event, req_ids) = payload
             seqno = self._lwd_next_down_seqno()
+            hidden_elements = hidden.numel()  # symbolic-meta-ok: runtime size, not a meta shape
             lwd_logger.info(
                 "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
                 seqno,
-                hidden.numel(),
+                hidden_elements,
             )
             lwd_get_data_plane().submit_send(
                 LwdTransferRequest(
                     channel=LwdChannelType.DOWN,
                     op="send",
-                    num_elements=hidden.numel(),
+                    num_elements=hidden_elements,
                     dp_idx=self._lwd_dp_idx,
                     tensor=hidden,
                     seqno=seqno,
@@ -474,7 +480,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 meta_dev,
                 seg_lens_host,
                 req_ids,
-                hidden.numel(),
+                hidden_elements,
                 seqno,
             )
             # The event belongs to this output generation and must be consumed

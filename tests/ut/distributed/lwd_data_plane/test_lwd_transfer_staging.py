@@ -91,7 +91,7 @@ def npu_runtime(monkeypatch: pytest.MonkeyPatch) -> _NpuRuntime:
     monkeypatch.setattr(queue_module.torch.npu, "Stream", runtime.create_stream)
     monkeypatch.setattr(queue_module.torch.npu, "stream", runtime.activate_stream)
     monkeypatch.setattr(queue_module.torch.npu, "current_stream", lambda: runtime.current_stream)
-    monkeypatch.setattr(queue_module, "_lwd_scramble_seed_for", lambda request: None)
+    monkeypatch.setattr(queue_module, "lwd_scramble_seed_for", lambda request: None)
     monkeypatch.setattr(lwd_channels, "lwd_get_channel_stream", lambda channel, dp_idx: runtime.channel_stream)
     monkeypatch.setattr(lwd_channels, "lwd_get_channel_device_group", lambda channel, dp_idx: object())
     monkeypatch.setattr(lwd_channels, "lwd_get_channel_peer", lambda channel, dp_idx: 1)
@@ -165,7 +165,7 @@ def test_d2h_waits_for_post_descramble_event(
 
     scrambler = MagicMock()
     scrambler.descramble.side_effect = lambda tensor, seed: npu_runtime.operations.append(("descramble", seed))
-    monkeypatch.setattr(queue_module, "_lwd_scramble_seed_for", lambda request: 17)
+    monkeypatch.setattr(queue_module, "lwd_scramble_seed_for", lambda request: 17)
     monkeypatch.setattr(scrambler_module, "lwd_get_payload_scrambler", lambda: scrambler)
 
     future = _queue().submit(

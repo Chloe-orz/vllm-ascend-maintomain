@@ -127,8 +127,8 @@ def test_pinned_staging_single_implementation() -> None:
 
 def test_endpoint_single_source() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
-    assert "edge_npu_count" not in runner, "runner must reuse worker._lwd_early_recv_endpoint, not recompute"
-    assert "_lwd_early_recv_endpoint" in runner
+    assert "edge_npu_count" not in runner, "runner must reuse worker._lwd_is_early_recv_endpoint, not recompute"
+    assert "_lwd_is_early_recv_endpoint" in runner
 
 
 def test_arrival_harvest_and_mrope_pre_super_order() -> None:

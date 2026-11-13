@@ -220,7 +220,7 @@ class TestCloudPreemption(unittest.TestCase):
             lwd_logger=self.logger,
         )
         self.runner = cls()
-        self.runner.worker = NS(_lwd_early_recv_endpoint=True, _lwd_stager=self.stager)
+        self.runner.worker = NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=self.stager)
 
     def output(self, *req_computed):
         return NS(
@@ -253,8 +253,8 @@ class TestCloudPreemption(unittest.TestCase):
         )
 
         for worker in (
-            NS(_lwd_early_recv_endpoint=False, _lwd_stager=self.stager),
-            NS(_lwd_early_recv_endpoint=True, _lwd_stager=None),
+            NS(_lwd_is_early_recv_endpoint=False, _lwd_stager=self.stager),
+            NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=None),
         ):
             self.runner.worker = worker
             self.runner._update_states(self.output(("a", 0)))
@@ -324,7 +324,7 @@ class TestMixedInjection(unittest.TestCase):
                 expert_tail(self.b_ids),
             ]
         )
-        self.runner.worker = NS(_lwd_early_recv_endpoint=True, _lwd_stager=self.stager)
+        self.runner.worker = NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=self.stager)
         self.runner.device = torch.device("cpu")
         self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
         self.runner.model_config = NS(
@@ -466,7 +466,7 @@ class TestMixedInjection(unittest.TestCase):
         self.assertEqual(self.runner._lwd_hash_prompt_mask.tolist(), [True, True, False, False, True, True])
 
     def test_tp_receiver_broadcasts_complete_payload_once(self):
-        self.runner.worker._lwd_early_recv_endpoint = False
+        self.runner.worker._lwd_is_early_recv_endpoint = False
         native_empty = torch.empty
         sizes = []
         broadcasts = []
