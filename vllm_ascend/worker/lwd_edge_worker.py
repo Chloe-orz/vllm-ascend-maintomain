@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 # mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
 _LWD_MM_HASH_CACHE_MAX_ITEMS = 32
+_LWD_DIAG_UP_SEND_WAIT_THRESHOLD = 4
+_LWD_DIAG_UP_SEND_WAIT_SECONDS = 1.0
 
 # ---- token recovery / logit-rank lookup ----
 def select_token_batch(
@@ -360,6 +362,9 @@ class LwdEdgeWorker(NPUWorker):
             seqno=seqno,
             engine_index=getattr(batch_meta, "engine_index", 0),
         )
+        engine = request.engine_index
+        if self._lwd_diag_enabled:
+            self._lwd_wait_before_up_send(engine, seqno)
         # UP send 完成水位(供边侧 pending 闸门摘除,语义 = 云侧已收讫):
         # 逐 future.done() 轮询前缀;通道 FIFO ⇒ 完成序 = seqno 序,
         # 前缀水位即精确。水位随本批 execute 返回捎带给引擎。
@@ -367,7 +372,6 @@ class LwdEdgeWorker(NPUWorker):
         sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
         if sent_by_engine is None:
             sent_by_engine = self._lwd_up_send_futures = {}
-        engine = getattr(batch_meta, "engine_index", 0)
         sent_by_engine.setdefault(engine, []).append((seqno, fut))
         watermark = self._lwd_up_send_done_watermark(engine)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -392,6 +396,47 @@ class LwdEdgeWorker(NPUWorker):
             req_ids=[], req_id_to_index={}, sampled_token_ids=[],
             lwd_up_send_watermark=watermark,
         )
+
+    def _lwd_wait_before_up_send(self, engine: int, next_seqno: int) -> None:
+        sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
+        sent = sent_by_engine.get(engine, []) if sent_by_engine else []
+        # UP completion is FIFO. Leave the completed prefix for the watermark.
+        for index, (seqno, future) in enumerate(sent):
+            pending = len(sent) - index
+            if pending < _LWD_DIAG_UP_SEND_WAIT_THRESHOLD:
+                return
+            if future.done():
+                continue
+            started = time.monotonic()
+            logger.info(
+                "[LWD][diag] up_send_wait_begin engine=%d seqno=%d next_seqno=%d pending=%d ts=%.6f",
+                engine,
+                seqno,
+                next_seqno,
+                pending,
+                started,
+            )
+            try:
+                future.wait(timeout=_LWD_DIAG_UP_SEND_WAIT_SECONDS)
+            except TimeoutError:
+                logger.warning(
+                    "[LWD][diag] up_send_wait_timeout engine=%d seqno=%d next_seqno=%d pending=%d wait_ms=%.2f",
+                    engine,
+                    seqno,
+                    next_seqno,
+                    pending,
+                    (time.monotonic() - started) * 1000,
+                )
+            else:
+                logger.info(
+                    "[LWD][diag] up_send_wait_done engine=%d seqno=%d next_seqno=%d pending=%d wait_ms=%.2f",
+                    engine,
+                    seqno,
+                    next_seqno,
+                    pending,
+                    (time.monotonic() - started) * 1000,
+                )
+            return
 
     def _lwd_up_send_done_watermark(self, engine: int) -> int:
         """只推进指定 engine 的 UP FIFO,避免多 DP 跨通道误摘。"""
