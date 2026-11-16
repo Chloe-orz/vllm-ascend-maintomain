@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import time
+from functools import partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,12 +31,18 @@ from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.distributed.lwd_comm.types import (
+    LWD_DOWN_TRACE_SEQNOS,
+    LwdChannelType,
+    LwdCommRequest,
+)
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 from vllm_ascend.worker.worker import NPUWorker
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
@@ -45,7 +52,10 @@ _LWD_MM_HASH_CACHE_MAX_ITEMS = 32
 
 # ---- token recovery / logit-rank lookup ----
 def select_token_batch(
-    logits: torch.Tensor, ranks: list[int]
+    logits: torch.Tensor,
+    ranks: list[int],
+    *,
+    trace_event: Callable[[str], None] | None = None,
 ) -> list[int]:
     """Batched rank→token lookup: one sort, one D2H sync for all rows.
 
@@ -55,8 +65,14 @@ def select_token_batch(
     # 词表列按全局 token ID 升序排列；稳定降序排序保留同分候选的 ID 顺序。
     # 必须与云侧唯一排名同时更新，不能与旧版“严格更高分计数”协议混用。
     _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
+    if trace_event is not None:
+        trace_event("sort")
     row = torch.arange(len(ranks), device=logits.device)
-    return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
+    selected = sorted_idx[row, torch.tensor(ranks, device=logits.device)]
+    if trace_event is not None:
+        # Mark the last device operation before tolist waits for the host copy.
+        trace_event("gather")
+    return selected.tolist()
 
 
 def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
@@ -569,8 +585,14 @@ class LwdEdgeWorker(NPUWorker):
             )
         )
         _t_post = time.monotonic()
+        trace_event = None
+        if self._lwd_diag_enabled and seqno in LWD_DOWN_TRACE_SEQNOS:
+            trace_event = partial(self.comm_service.trace_down_recv_event, recv_future.request)
+            logger.info("[LWD][diag] unembed_recv_return seqno=%d ts=%.3f", seqno, _t_post)
         # wait_for_comm:device 序等待,主机不阻塞
         recv_future.wait_for_comm()
+        if trace_event is not None:
+            trace_event("consumer_ready")
         result = recv_future.result()
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
@@ -594,6 +616,8 @@ class LwdEdgeWorker(NPUWorker):
                 )
             logits = model.compute_logits(hidden_states)   # (rows_total, V)
             _t_lm = time.monotonic()
+            if trace_event is not None:
+                trace_event("logits")
             # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
             # top20 逐位对照——排名换位即重放漂移的直接视图。
             try:
@@ -619,7 +643,7 @@ class LwdEdgeWorker(NPUWorker):
                     seqno, time.monotonic(),
                 )
             flat_ids = select_token_batch(
-                logits, [r for ths in batch_meta.top_id_ths for r in ths]
+                logits, [r for ths in batch_meta.top_id_ths for r in ths], trace_event=trace_event
             )
             sampled_token_ids = []
             off = 0

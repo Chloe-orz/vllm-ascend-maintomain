@@ -59,6 +59,14 @@ class LwdCommService:
         assert request.op == "recv", "submit_recv requires op='recv'"
         return self._submit(request)
 
+    def trace_down_recv_event(self, request: LwdCommRequest, point: str) -> None:
+        """Observe a consumer milestone using the receive channel's probe."""
+        key = (request.engine_index, LwdChannelType.DOWN, "recv")
+        with self._lock:
+            channel = self._channels.get(key)
+        if channel is not None:
+            channel.trace_down_event(request, point)
+
     # ------------------------------------------------------------------ #
     # Completion driving                                                  #
     # ------------------------------------------------------------------ #
