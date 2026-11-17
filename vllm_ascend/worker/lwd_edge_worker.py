@@ -5,11 +5,9 @@
 from __future__ import annotations
 
 import time
-from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import torch
-from vllm import envs as vllm_envs
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -43,8 +41,6 @@ if TYPE_CHECKING:
 
 # mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
 _LWD_MM_HASH_CACHE_MAX_ITEMS = 32
-_LWD_UP_SEND_WAIT_THRESHOLD = 4
-_LWD_UP_SEND_WAIT_SECONDS = 1.0
 
 # ---- token recovery / logit-rank lookup ----
 def select_token_batch(
@@ -129,7 +125,7 @@ class LwdEdgeWorker(NPUWorker):
         init_lwd_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
-    def init_device(self) -> None:
+    def init_device(self):
         # The duplex channels MUST be built here, never in ``__init__``.
         # ``init_lwd_duplex_channels`` creates the HCCL process groups
         # (two ``dist.new_group`` per cloud engine) and then warms them up
@@ -145,7 +141,6 @@ class LwdEdgeWorker(NPUWorker):
         # DOWN), which only holds once every rank is past its distributed
         # init.
         super().init_device()
-        self._lwd_up_send_wait_enabled = getattr(vllm_envs, "VLLM_LWD_DIAG", False)
         # Payload scramble: bind the two static factors once; the per-flight
         # seed is derived by the comm layer from each request's own fields.
         self._build_payload_scrambler()
@@ -347,9 +342,6 @@ class LwdEdgeWorker(NPUWorker):
             seqno=seqno,
             engine_index=getattr(batch_meta, "engine_index", 0),
         )
-        engine = request.engine_index
-        if self._lwd_up_send_wait_enabled:
-            self._lwd_wait_before_up_send(engine)
         # UP send 完成水位(供边侧 pending 闸门摘除,语义 = 云侧已收讫):
         # 逐 future.done() 轮询前缀;通道 FIFO ⇒ 完成序 = seqno 序,
         # 前缀水位即精确。水位随本批 execute 返回捎带给引擎。
@@ -357,6 +349,7 @@ class LwdEdgeWorker(NPUWorker):
         sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
         if sent_by_engine is None:
             sent_by_engine = self._lwd_up_send_futures = {}
+        engine = getattr(batch_meta, "engine_index", 0)
         sent_by_engine.setdefault(engine, []).append((seqno, fut))
         watermark = self._lwd_up_send_done_watermark(engine)
         # [Lwd][perf] TTFT 探针:forward=embed 前向;submit_send=快照clone+
@@ -381,19 +374,6 @@ class LwdEdgeWorker(NPUWorker):
             req_ids=[], req_id_to_index={}, sampled_token_ids=[],
             lwd_up_send_watermark=watermark,
         )
-
-    def _lwd_wait_before_up_send(self, engine: int) -> None:
-        sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
-        sent = sent_by_engine.get(engine, []) if sent_by_engine else []
-        # Leave completed sends in the FIFO so the watermark still sees them.
-        for index, (_, future) in enumerate(sent):
-            if len(sent) - index < _LWD_UP_SEND_WAIT_THRESHOLD:
-                return
-            if future.done():
-                continue
-            with suppress(TimeoutError):
-                future.wait(timeout=_LWD_UP_SEND_WAIT_SECONDS)
-            return
 
     def _lwd_up_send_done_watermark(self, engine: int) -> int:
         """只推进指定 engine 的 UP FIFO,避免多 DP 跨通道误摘。"""
