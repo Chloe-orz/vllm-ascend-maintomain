@@ -7,10 +7,6 @@ import enum
 from dataclasses import dataclass
 from typing import Any, Literal
 
-# Trace the first normal and delayed batches and the last batches seen at the
-# plateau in the long-input runs.
-LWD_DOWN_TRACE_SEQNOS = frozenset({0, 1, 207, 208})
-
 
 class LwdChannelType(enum.Enum):
     """The two physical data-plane channels, direction-only.

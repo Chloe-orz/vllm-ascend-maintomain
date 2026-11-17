@@ -27,20 +27,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from vllm import envs
 from vllm.logger import logger
 
 from vllm_ascend.distributed import lwd_wire
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_comm.types import (
-    LWD_DOWN_TRACE_SEQNOS,
-    LwdChannelType,
-    LwdCommRequest,
-    LwdCommStatus,
-)
-
-LWD_DOWN_EVENT_POLL_SECONDS = 0.25
-LWD_DOWN_PENDING_LOG_SECONDS = 10.0
+from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+from vllm_ascend.distributed.lwd_comm.types import LwdCommRequest, LwdChannelType
 
 
 def _scramble_seed_for(request: LwdCommRequest) -> int | None:
@@ -75,10 +67,6 @@ class LwdChannel:
         self.channel_type = channel_type
         self.op = op  # one FIFO carries exactly one direction's seqno stream
         self.engine_index = engine_index  # 目标/来源云 engine(= dp_rank)
-        self._diag_enabled = getattr(envs, "VLLM_LWD_DIAG", False)
-        self._stop_down_probes = (
-            threading.Event() if self._diag_enabled and channel_type is LwdChannelType.DOWN else None
-        )
         self._pending: deque[LwdCommFuture] = deque()
         self._lock = threading.Lock()
         # The pending-queue lock alone cannot prevent two host threads
@@ -143,12 +131,7 @@ class LwdChannel:
         finalized = self._reap()
         self._finalize_many(finalized)
         if request.op == "send":
-            trace_down = self._trace_down(request.seqno)
-            if trace_down:
-                self._log_wire_state("snapshot_begin", request, LwdCommStatus.PENDING)
             request = self._snapshot_send(request)
-            if trace_down:
-                self.trace_down_event(request, "producer")
         with self._submission_lock:
             if request.seqno is not None:
                 return self._submit_sequenced(request)
@@ -214,10 +197,6 @@ class LwdChannel:
                 return self._held[seqno][1]
             future = LwdCommFuture.deferred(request)
             self._held[seqno] = (request, future)
-            if self._trace_down(seqno):
-                self._log_wire_state(
-                    "held", request, LwdCommStatus.PENDING, f"expected_seqno={self._next_seqno}"
-                )
             logger.debug(
                 "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
                 self.channel_type.value, request.op, seqno, self._next_seqno,
@@ -237,31 +216,9 @@ class LwdChannel:
         into: LwdCommFuture | None = None,
     ) -> LwdCommFuture:
         """Execute one wire op as the channel's new tail."""
-        trace_down = self._trace_down(request.seqno)
         with self._lock:
             predecessor = self._pending[-1] if self._pending else None
-            if trace_down:
-                pending = len(self._pending)
-                oldest = self._pending[0].request.seqno if self._pending else None
-        if trace_down:
-            predecessor_seqno = predecessor.request.seqno if predecessor is not None else None
-            self._log_wire_state(
-                "queue",
-                request,
-                LwdCommStatus.PENDING,
-                f"pending={pending} oldest_seqno={oldest} "
-                f"predecessor_seqno={predecessor_seqno} held={len(self._held)}",
-            )
-        if self._diag_enabled:
-            self._log_wire_state("post_begin", request, LwdCommStatus.PENDING)
-        try:
-            future = self._execute(request, predecessor, into=into)
-        except Exception as exc:
-            if trace_down:
-                self._log_wire_state("post_error", request, LwdCommStatus.ERROR, f"error={exc!r}")
-            raise
-        if self._diag_enabled:
-            self._log_wire_state("posted", request, future.status)
+        future = self._execute(request, predecessor, into=into)
         with self._lock:
             self._pending.append(future)
         return future
@@ -283,8 +240,6 @@ class LwdChannel:
 
     def shutdown(self, timeout: float | None = None) -> list[LwdCommFuture]:
         """Wait for pending operations before releasing owned buffers."""
-        if self._stop_down_probes is not None:
-            self._stop_down_probes.set()
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._submission_lock:
             if self._held:
@@ -323,86 +278,10 @@ class LwdChannel:
                 done.append(self._pending.popleft())
         return done
 
-    def _finalize_many(self, futures: list[LwdCommFuture]) -> None:
+    @staticmethod
+    def _finalize_many(futures: list[LwdCommFuture]) -> None:
         for future in futures:
             future._finalize()
-            if self._diag_enabled:
-                self._log_wire_state("reaped", future.request, future.status)
-
-    def _log_wire_state(
-        self, stage: str, request: LwdCommRequest, status: LwdCommStatus, details: str = ""
-    ) -> None:
-        peer = request.src_dst
-        if peer is None:
-            peer = lwd_wire.get_lwd_channel_peer(self.channel_type, self.engine_index)
-        logger.info(
-            "[LWD][diag] wire_%s channel=%s op=%s engine=%d seqno=%s "
-            "rank=%d peer=%d numel=%d aux_numel=%d status=%s ts=%.3f%s",
-            stage, self.channel_type.value, self.op, self.engine_index,
-            request.seqno, dist.get_rank(), peer, request.num_elements,
-            request.aux_num_elements, status.value, time.monotonic(),
-            f" {details}" if details else "",
-        )
-
-    def _trace_down(self, seqno: int | None) -> bool:
-        return self._stop_down_probes is not None and seqno in LWD_DOWN_TRACE_SEQNOS
-
-    def trace_down_event(self, request: LwdCommRequest, point: str) -> None:
-        """Observe a milestone on the caller's current NPU stream."""
-        if not self._trace_down(request.seqno):
-            return
-        try:
-            event = torch.npu.Event()
-            event.record()
-        except Exception:
-            self._log_down_probe_error(request, point)
-            return
-        self._start_down_probe(request, point, event)
-
-    def _start_down_probe(self, request: LwdCommRequest, point: str, event: torch.npu.Event) -> None:
-        self._log_wire_state(f"{point}_event_recorded", request, LwdCommStatus.PENDING)
-        try:
-            device = torch.npu.current_device()
-            metadata = replace(request, tensor=None, recv_buffer=None)
-            threading.Thread(
-                target=self._poll_down_event,
-                args=(metadata, point, event, device),
-                name=f"lwd-down-{self.op}-{point}-{request.seqno}",
-                daemon=True,
-            ).start()
-        except Exception:
-            self._log_down_probe_error(request, point)
-
-    def _poll_down_event(self, request: LwdCommRequest, point: str, event: torch.npu.Event, device: int) -> None:
-        stop = self._stop_down_probes
-        assert stop is not None
-        next_log = 0.0
-        # The worker can be stuck in UNEMBED or in HCCL submission. Poll
-        # this event from a diagnostic thread without changing FIFO state.
-        try:
-            with torch.npu.device(device):
-                while not stop.is_set():
-                    if event.query():
-                        self._log_wire_state(f"{point}_done", request, LwdCommStatus.OK)
-                        return
-                    now = time.monotonic()
-                    if now >= next_log:
-                        self._log_wire_state(f"{point}_pending", request, LwdCommStatus.PENDING)
-                        next_log = now + LWD_DOWN_PENDING_LOG_SECONDS
-                    stop.wait(LWD_DOWN_EVENT_POLL_SECONDS)
-        except Exception:
-            self._log_down_probe_error(request, point)
-
-    def _log_down_probe_error(self, request: LwdCommRequest, point: str) -> None:
-        logger.warning(
-            "[LWD][diag] wire_%s_probe_error channel=%s op=%s engine=%d seqno=%s",
-            point,
-            self.channel_type.value,
-            self.op,
-            self.engine_index,
-            request.seqno,
-            exc_info=True,
-        )
 
     # ------------------------------------------------------------------ #
     # Wire execution                                                      #
@@ -421,7 +300,6 @@ class LwdChannel:
         keepalive: Any = None
         staged_event: torch.npu.Event | None = None
         staged_tensor: torch.Tensor | None = None
-        trace_down = self._trace_down(req.seqno)
         stream = self._stream()
         # Capture the producer stream BEFORE entering the channel-stream
         # context: inside the `with` block torch.npu.current_stream() IS
@@ -439,19 +317,11 @@ class LwdChannel:
                 # The snapshot was produced on the producer stream; order
                 # the channel stream after it.
                 stream.wait_stream(producer_stream)
-            if trace_down:
-                # This marker covers the producer and FIFO waits before HCCL.
-                self.trace_down_event(req, "channel_ready")
-            if req.op == "send":
                 handles = self._wire_send(req)
                 keepalive = (req.tensor, req.aux_tensor)
             else:
                 tensor, aux_tensor, handles = self._wire_recv(req)
-            if trace_down:
-                self._log_wire_state("hccl_return", req, LwdCommStatus.PENDING)
-            done_event = self._bridge_and_record(handles, req if trace_down else None)
-            if trace_down and done_event is not None:
-                self._start_down_probe(req, "transfer", done_event)
+            done_event = self._bridge_and_record(handles)
             seed = _scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
@@ -467,8 +337,6 @@ class LwdChannel:
                 get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
-                if trace_down:
-                    self._start_down_probe(req, "payload", done_event)
             if req.op == "recv" and req.stage_segments is not None:
                 # Host staging(design v7 §4.3 改版):提交期已按行表把本批
                 # 载荷切成逐请求段,这里把各段异步 D2H 直接落进各请求自己
@@ -571,10 +439,7 @@ class LwdChannel:
             raise RuntimeError(
                 "aux payload is only supported on the UP channel"
             )
-        tensor = tensor.contiguous()
-        if self._trace_down(req.seqno):
-            self._log_down_hccl_call(req, tensor, group)
-        return [dist.isend(tensor, dst=peer, group=group)]
+        return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
 
     def _wire_recv(self, req: LwdCommRequest):
         group = lwd_wire.get_lwd_channel_device_group(
@@ -599,8 +464,6 @@ class LwdChannel:
         # pool owns and can reuse the moment the D2H completes.
         buffer = req.recv_buffer
         if buffer is None:
-            if self._trace_down(req.seqno):
-                self._log_wire_state("recv_alloc_begin", req, LwdCommStatus.PENDING)
             buffer = torch.empty(
                 req.num_elements, dtype=torch.bfloat16, device="npu"
             )
@@ -630,24 +493,9 @@ class LwdChannel:
             raise RuntimeError(
                 "aux payload is only supported on the UP channel"
             )
-        if self._trace_down(req.seqno):
-            self._log_down_hccl_call(req, buffer, group)
         return buffer, None, [dist.irecv(buffer, src=peer, group=group)]
 
-    def _log_down_hccl_call(
-        self, request: LwdCommRequest, tensor: torch.Tensor, group: dist.ProcessGroup
-    ) -> None:
-        self._log_wire_state(
-            "hccl_call",
-            request,
-            LwdCommStatus.PENDING,
-            f"dtype={tensor.dtype} tensor_numel={tensor.numel()} "
-            f"group_ranks={dist.get_process_group_ranks(group)}",
-        )
-
-    def _bridge_and_record(
-        self, handles: list[Any], trace_request: LwdCommRequest | None = None
-    ) -> torch.npu.Event | None:
+    def _bridge_and_record(self, handles: list[Any]):
         """Bridge HCCL completion onto the channel stream and record an
         event right behind it (CPU returns immediately).  Caller already
         holds the channel stream as current, so bridging binds to the
@@ -657,8 +505,6 @@ class LwdChannel:
         _t = time.monotonic()
         for handle in handles:
             handle.wait()
-        if trace_request is not None:
-            self._log_wire_state("hccl_wait_return", trace_request, LwdCommStatus.PENDING)
         # [Lwd][perf] 临时探针:测 handle.wait() 是否真如注释所述"CPU 立即
         # 返回"——dur 大 = 发送/接收 posting 阻塞主机(锁定步判定依据)
         logger.info(

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import time
-from functools import partial
+from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,33 +31,24 @@ from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
-from vllm_ascend.distributed.lwd_comm.types import (
-    LWD_DOWN_TRACE_SEQNOS,
-    LwdChannelType,
-    LwdCommRequest,
-)
+from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 from vllm_ascend.worker.worker import NPUWorker
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
 # mm_hash 编码缓存容量(条目数;1080p 单条约 26MB HBM)
 _LWD_MM_HASH_CACHE_MAX_ITEMS = 32
-_LWD_DIAG_UP_SEND_WAIT_THRESHOLD = 4
-_LWD_DIAG_UP_SEND_WAIT_SECONDS = 1.0
+_LWD_UP_SEND_WAIT_THRESHOLD = 4
+_LWD_UP_SEND_WAIT_SECONDS = 1.0
 
 # ---- token recovery / logit-rank lookup ----
 def select_token_batch(
-    logits: torch.Tensor,
-    ranks: list[int],
-    *,
-    trace_event: Callable[[str], None] | None = None,
+    logits: torch.Tensor, ranks: list[int]
 ) -> list[int]:
     """Batched rank→token lookup: one sort, one D2H sync for all rows.
 
@@ -67,14 +58,8 @@ def select_token_batch(
     # 词表列按全局 token ID 升序排列；稳定降序排序保留同分候选的 ID 顺序。
     # 必须与云侧唯一排名同时更新，不能与旧版“严格更高分计数”协议混用。
     _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
-    if trace_event is not None:
-        trace_event("sort")
     row = torch.arange(len(ranks), device=logits.device)
-    selected = sorted_idx[row, torch.tensor(ranks, device=logits.device)]
-    if trace_event is not None:
-        # Mark the last device operation before tolist waits for the host copy.
-        trace_event("gather")
-    return selected.tolist()
+    return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
 
 
 def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
@@ -160,7 +145,7 @@ class LwdEdgeWorker(NPUWorker):
         # DOWN), which only holds once every rank is past its distributed
         # init.
         super().init_device()
-        self._lwd_diag_enabled = getattr(vllm_envs, "VLLM_LWD_DIAG", False)
+        self._lwd_up_send_wait_enabled = getattr(vllm_envs, "VLLM_LWD_DIAG", False)
         # Payload scramble: bind the two static factors once; the per-flight
         # seed is derived by the comm layer from each request's own fields.
         self._build_payload_scrambler()
@@ -363,8 +348,8 @@ class LwdEdgeWorker(NPUWorker):
             engine_index=getattr(batch_meta, "engine_index", 0),
         )
         engine = request.engine_index
-        if self._lwd_diag_enabled:
-            self._lwd_wait_before_up_send(engine, seqno)
+        if self._lwd_up_send_wait_enabled:
+            self._lwd_wait_before_up_send(engine)
         # UP send 完成水位(供边侧 pending 闸门摘除,语义 = 云侧已收讫):
         # 逐 future.done() 轮询前缀;通道 FIFO ⇒ 完成序 = seqno 序,
         # 前缀水位即精确。水位随本批 execute 返回捎带给引擎。
@@ -397,45 +382,17 @@ class LwdEdgeWorker(NPUWorker):
             lwd_up_send_watermark=watermark,
         )
 
-    def _lwd_wait_before_up_send(self, engine: int, next_seqno: int) -> None:
+    def _lwd_wait_before_up_send(self, engine: int) -> None:
         sent_by_engine = getattr(self, "_lwd_up_send_futures", None)
         sent = sent_by_engine.get(engine, []) if sent_by_engine else []
-        # UP completion is FIFO. Leave the completed prefix for the watermark.
-        for index, (seqno, future) in enumerate(sent):
-            pending = len(sent) - index
-            if pending < _LWD_DIAG_UP_SEND_WAIT_THRESHOLD:
+        # Leave completed sends in the FIFO so the watermark still sees them.
+        for index, (_, future) in enumerate(sent):
+            if len(sent) - index < _LWD_UP_SEND_WAIT_THRESHOLD:
                 return
             if future.done():
                 continue
-            started = time.monotonic()
-            logger.info(
-                "[LWD][diag] up_send_wait_begin engine=%d seqno=%d next_seqno=%d pending=%d ts=%.6f",
-                engine,
-                seqno,
-                next_seqno,
-                pending,
-                started,
-            )
-            try:
-                future.wait(timeout=_LWD_DIAG_UP_SEND_WAIT_SECONDS)
-            except TimeoutError:
-                logger.warning(
-                    "[LWD][diag] up_send_wait_timeout engine=%d seqno=%d next_seqno=%d pending=%d wait_ms=%.2f",
-                    engine,
-                    seqno,
-                    next_seqno,
-                    pending,
-                    (time.monotonic() - started) * 1000,
-                )
-            else:
-                logger.info(
-                    "[LWD][diag] up_send_wait_done engine=%d seqno=%d next_seqno=%d pending=%d wait_ms=%.2f",
-                    engine,
-                    seqno,
-                    next_seqno,
-                    pending,
-                    (time.monotonic() - started) * 1000,
-                )
+            with suppress(TimeoutError):
+                future.wait(timeout=_LWD_UP_SEND_WAIT_SECONDS)
             return
 
     def _lwd_up_send_done_watermark(self, engine: int) -> int:
@@ -630,14 +587,8 @@ class LwdEdgeWorker(NPUWorker):
             )
         )
         _t_post = time.monotonic()
-        trace_event = None
-        if self._lwd_diag_enabled and seqno in LWD_DOWN_TRACE_SEQNOS:
-            trace_event = partial(self.comm_service.trace_down_recv_event, recv_future.request)
-            logger.info("[LWD][diag] unembed_recv_return seqno=%d ts=%.3f", seqno, _t_post)
         # wait_for_comm:device 序等待,主机不阻塞
         recv_future.wait_for_comm()
-        if trace_event is not None:
-            trace_event("consumer_ready")
         result = recv_future.result()
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
@@ -654,15 +605,8 @@ class LwdEdgeWorker(NPUWorker):
         else:
             # lm_head 不允许直接调用(ParallelLMHead.forward 强制经 sampler);
             # compute_logits 是标准接口,包装层/单体模型都有。
-            if self._lwd_diag_enabled:
-                logger.info(
-                    "[LWD][diag] unembed_logits_begin seqno=%d ts=%.3f",
-                    seqno, time.monotonic(),
-                )
             logits = model.compute_logits(hidden_states)   # (rows_total, V)
             _t_lm = time.monotonic()
-            if trace_event is not None:
-                trace_event("logits")
             # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
             # top20 逐位对照——排名换位即重放漂移的直接视图。
             try:
@@ -682,13 +626,8 @@ class LwdEdgeWorker(NPUWorker):
             except Exception:  # noqa: BLE001
                 pass
 
-            if self._lwd_diag_enabled:
-                logger.info(
-                    "[LWD][diag] unembed_select_begin seqno=%d ts=%.3f",
-                    seqno, time.monotonic(),
-                )
             flat_ids = select_token_batch(
-                logits, [r for ths in batch_meta.top_id_ths for r in ths], trace_event=trace_event
+                logits, [r for ths in batch_meta.top_id_ths for r in ths]
             )
             sampled_token_ids = []
             off = 0
