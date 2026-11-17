@@ -426,7 +426,11 @@ class LwdChannel:
         # aux 帧(mrope positions)为紧跟主帧的第二条 P2P op——同
         # seqno 管两帧,skip/drain 语义不变;第二段(云 TP 组内广播)
         # 由云 runner 在消费时刻对 aux 同样补发(见 lwd_cloud_model_runner)。
-        if self.channel_type == LwdChannelType.UP:
+        if self.channel_type != LwdChannelType.UP and req.aux_tensor is not None:
+            raise RuntimeError("aux payload is only supported on the UP channel")
+        with torch.profiler.record_function(
+            f"[LWD] wire channel={self.channel_type.value} op=send engine={self.engine_index} seqno={req.seqno}"
+        ):
             handles = [dist.isend(tensor.contiguous(), dst=peer, group=group)]
             if req.aux_tensor is not None:
                 handles.append(
@@ -434,14 +438,9 @@ class LwdChannel:
                         req.aux_tensor.contiguous(), dst=peer, group=group
                     )
                 )
-            return handles
-        if req.aux_tensor is not None:
-            raise RuntimeError(
-                "aux payload is only supported on the UP channel"
-            )
-        return [dist.isend(tensor.contiguous(), dst=peer, group=group)]
+        return handles
 
-    def _wire_recv(self, req: LwdCommRequest):
+    def _wire_recv(self, req: LwdCommRequest) -> tuple[torch.Tensor, torch.Tensor | None, list[Any]]:
         group = lwd_wire.get_lwd_channel_device_group(
             self.channel_type, self.engine_index
         )
@@ -485,15 +484,15 @@ class LwdChannel:
                 dtype=req.aux_dtype or torch.int64,
                 device="npu",
             )
-            return buffer, aux_buffer, [
-                dist.irecv(buffer, src=peer, group=group),
-                dist.irecv(aux_buffer, src=peer, group=group),
-            ]
-        if req.aux_num_elements > 0:
-            raise RuntimeError(
-                "aux payload is only supported on the UP channel"
-            )
-        return buffer, None, [dist.irecv(buffer, src=peer, group=group)]
+        elif req.aux_num_elements > 0:
+            raise RuntimeError("aux payload is only supported on the UP channel")
+        with torch.profiler.record_function(
+            f"[LWD] wire channel={self.channel_type.value} op=recv engine={self.engine_index} seqno={req.seqno}"
+        ):
+            handles = [dist.irecv(buffer, src=peer, group=group)]
+            if aux_buffer is not None:
+                handles.append(dist.irecv(aux_buffer, src=peer, group=group))
+        return buffer, aux_buffer, handles
 
     def _bridge_and_record(self, handles: list[Any]):
         """Bridge HCCL completion onto the channel stream and record an
