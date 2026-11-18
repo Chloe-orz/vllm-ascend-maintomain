@@ -123,6 +123,7 @@ class LwdChannel:
 
     def submit(self, request: LwdCommRequest) -> LwdCommFuture:
         """Execute the wire op and enqueue the future."""
+        self._log_down_recv_stage(request, "channel_submit")
         if request.op != self.op:
             raise RuntimeError(
                 f"op mismatch on {self.channel_type.value} FIFO: "
@@ -130,12 +131,33 @@ class LwdChannel:
             )
         finalized = self._reap()
         self._finalize_many(finalized)
+        self._log_down_recv_stage(request, "reap_return")
         if request.op == "send":
             request = self._snapshot_send(request)
+        self._log_down_recv_stage(request, "submit_lock_wait")
         with self._submission_lock:
+            self._log_down_recv_stage(request, "submit_lock_acquired")
             if request.seqno is not None:
                 return self._submit_sequenced(request)
             return self._execute_next(request)
+
+    def _log_down_recv_stage(self, request: LwdCommRequest, stage: str) -> None:
+        """Trace host milestones for DOWN 0/1 using host metadata only."""
+        if (
+            request.channel == LwdChannelType.DOWN
+            and request.op == "recv"
+            and request.seqno in (0, 1)
+        ):
+            logger.info(
+                "[LWD][diag] down_recv stage=%s engine=%d seqno=%s numel=%d "
+                "tid=%d ts=%.6f",
+                stage,
+                request.engine_index,
+                request.seqno,
+                request.num_elements,
+                threading.get_native_id(),
+                time.monotonic(),
+            )
 
     @staticmethod
     def _snapshot_send(request: LwdCommRequest) -> LwdCommRequest:
@@ -190,6 +212,7 @@ class LwdChannel:
             )
             return future
         if seqno > self._next_seqno:
+            self._log_down_recv_stage(request, "wait_seqno")
             if seqno in self._held:
                 # Duplicate submission of an already-held seqno: return
                 # the existing deferred future instead of overwriting it
@@ -300,6 +323,7 @@ class LwdChannel:
         keepalive: Any = None
         staged_event: torch.npu.Event | None = None
         staged_tensor: torch.Tensor | None = None
+        self._log_down_recv_stage(req, "execute_begin")
         stream = self._stream()
         # Capture the producer stream BEFORE entering the channel-stream
         # context: inside the `with` block torch.npu.current_stream() IS
@@ -311,7 +335,9 @@ class LwdChannel:
         # device stream (HCCL P2P has no tags; matching order = device
         # arrival order, not host submission order).
         with torch.npu.stream(stream):
+            self._log_down_recv_stage(req, "order_begin")
             self._order_after(predecessor)
+            self._log_down_recv_stage(req, "order_return")
             if req.op == "send":
                 assert req.tensor is not None, "send requires tensor"
                 # The snapshot was produced on the producer stream; order
@@ -321,7 +347,9 @@ class LwdChannel:
                 keepalive = (req.tensor, req.aux_tensor)
             else:
                 tensor, aux_tensor, handles = self._wire_recv(req)
+            self._log_down_recv_stage(req, "bridge_begin")
             done_event = self._bridge_and_record(handles)
+            self._log_down_recv_stage(req, "bridge_return")
             seed = _scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
@@ -441,6 +469,7 @@ class LwdChannel:
         return handles
 
     def _wire_recv(self, req: LwdCommRequest) -> tuple[torch.Tensor, torch.Tensor | None, list[Any]]:
+        self._log_down_recv_stage(req, "wire_recv_begin")
         group = lwd_wire.get_lwd_channel_device_group(
             self.channel_type, self.engine_index
         )
@@ -463,9 +492,11 @@ class LwdChannel:
         # pool owns and can reuse the moment the D2H completes.
         buffer = req.recv_buffer
         if buffer is None:
+            self._log_down_recv_stage(req, "alloc_begin")
             buffer = torch.empty(
                 req.num_elements, dtype=torch.bfloat16, device="npu"
             )
+            self._log_down_recv_stage(req, "alloc_return")
         elif buffer.numel() != req.num_elements:
             # HCCL P2P would fail on a mismatch, and a silent short/long
             # buffer desynchronises the counterpart's isend; assert here
@@ -489,7 +520,9 @@ class LwdChannel:
         with torch.profiler.record_function(
             f"[LWD] wire channel={self.channel_type.value} op=recv engine={self.engine_index} seqno={req.seqno}"
         ):
+            self._log_down_recv_stage(req, "irecv_begin")
             handles = [dist.irecv(buffer, src=peer, group=group)]
+            self._log_down_recv_stage(req, "irecv_return")
             if aux_buffer is not None:
                 handles.append(dist.irecv(aux_buffer, src=peer, group=group))
         return buffer, aux_buffer, handles

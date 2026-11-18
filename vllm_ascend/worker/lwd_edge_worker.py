@@ -557,6 +557,15 @@ class LwdEdgeWorker(NPUWorker):
             return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
 
         _t0 = time.monotonic()
+        if seqno in (0, 1):
+            logger.info(
+                "[LWD][diag] down_recv stage=submit_begin engine=%d "
+                "seqno=%d numel=%d ts=%.6f",
+                getattr(batch_meta, "engine_index", 0),
+                seqno,
+                batch_meta.recv_num_elements,
+                _t0,
+            )
         recv_future = self.comm_service.submit_recv(
             LwdCommRequest(
                 channel=LwdChannelType.DOWN,
@@ -567,6 +576,15 @@ class LwdEdgeWorker(NPUWorker):
             )
         )
         _t_post = time.monotonic()
+        if seqno in (0, 1):
+            logger.info(
+                "[LWD][diag] down_recv stage=submit_return engine=%d "
+                "seqno=%d numel=%d ts=%.6f",
+                getattr(batch_meta, "engine_index", 0),
+                seqno,
+                batch_meta.recv_num_elements,
+                _t_post,
+            )
         # wait_for_comm:device 序等待,主机不阻塞
         recv_future.wait_for_comm()
         result = recv_future.result()
