@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
+import torch
 from vllm.logger import logger
 
 from vllm_ascend.distributed.lwd_comm.channel import LwdChannel
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
+from vllm_ascend.distributed.lwd_comm.memory_diag import LwdMemoryDiagnostics, LwdReceiveMemorySample
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
 
@@ -44,6 +47,18 @@ class LwdCommService:
         self._channels: dict[tuple[int, LwdChannelType, str], LwdChannel] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
+        self._memory_diag: LwdMemoryDiagnostics | None = None
+
+    def start_memory_diagnostics(
+        self, role: str, rank: int, device: torch.device,
+        receive_snapshot: Callable[[], LwdReceiveMemorySample] | None = None,
+    ) -> None:
+        """Start process-local sampling after distributed device initialization."""
+        with self._lock:
+            if self._memory_diag is not None:
+                return
+            self._memory_diag = LwdMemoryDiagnostics(role, rank, device, receive_snapshot)
+        self._memory_diag.start()
 
     # ------------------------------------------------------------------ #
     # Submission                                                          #
@@ -100,6 +115,10 @@ class LwdCommService:
                 return
             self._shutting_down = True
             channels = list(self._channels.values())
+            memory_diag = self._memory_diag
+            self._memory_diag = None
+        if memory_diag is not None:
+            memory_diag.stop()
         try:
             for channel in channels:
                 channel.shutdown(timeout=timeout)
@@ -124,7 +143,17 @@ class LwdCommService:
                     request.channel, request.op, request.engine_index
                 )
                 self._channels[key] = channel
-        return channel.submit(request)
+        memory_diag = self._memory_diag
+        if memory_diag is None:
+            return channel.submit(request)
+        token = memory_diag.begin_transfer(request)
+        try:
+            future = channel.submit(request)
+        except Exception as error:
+            memory_diag.fail_transfer(token, error)
+            raise
+        memory_diag.finish_transfer(token, future)
+        return future
 
 
 def get_lwd_comm_service() -> LwdCommService:

@@ -157,6 +157,7 @@ class LwdEdgeWorker(NPUWorker):
 
         from vllm_ascend.distributed import lwd_wire
         lwd_wire.init_lwd_duplex_channels()
+        self.comm_service.start_memory_diagnostics("edge", self.rank, self.device)
         logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",

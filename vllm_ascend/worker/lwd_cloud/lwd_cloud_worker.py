@@ -34,6 +34,7 @@ from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
+from vllm_ascend.distributed.lwd_comm.memory_diag import LwdReceiveMemorySample
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
@@ -136,6 +137,9 @@ class LwdCloudWorker(NPUWorker):
             self._lwd_init_host_stager(self._lwd_up_hidden_size)
             self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
+        get_lwd_comm_service().start_memory_diagnostics(
+            "cloud", self.rank, self.device, self._lwd_recv_memory_snapshot
+        )
 
     def _build_payload_scrambler(self) -> None:
         """Initialize the process-wide scrambler when enabled (else no-op).
@@ -243,6 +247,48 @@ class LwdCloudWorker(NPUWorker):
     # ------------------------------------------------------------------ #
     # 提前收:通信线程(提示下发 -> 挂 recv -> 上报水位)                     #
     # ------------------------------------------------------------------ #
+
+    def _lwd_recv_memory_snapshot(self) -> LwdReceiveMemorySample:
+        state = LwdReceiveMemorySample(
+            engine=self._lwd_engine_index,
+            endpoint=self._lwd_early_recv_endpoint,
+            host_stage=self._lwd_host_stage_enabled,
+            recv_limit=self._early_recv_max_inflight,
+        )
+        if not self._lwd_early_recv_endpoint:
+            return replace(state, inflight=0, queued=0, inflight_main_bytes=0)
+        if self._early_recv_lock.acquire(blocking=False):
+            try:
+                futures = list(self._early_recv_futures.values())
+                state = replace(
+                    state,
+                    inflight=len(futures),
+                    queued=len(self._early_recv_pending),
+                    inflight_main_bytes=sum(future.request.num_elements * 2 for future in futures),
+                    oldest_seqno=futures[0].request.seqno if futures else None,
+                )
+            finally:
+                self._early_recv_lock.release()
+        else:
+            state = replace(state, recv_lock_busy=True)
+        stager = self._lwd_stager
+        if stager is not None:
+            pool = stager.memory_snapshot()
+            if pool is None:
+                return replace(
+                    state, slot_limit=stager.slots, allocated_slots=-1, busy_slots=-1,
+                    device_pool_bytes=-1, host_bytes=-1, stage_lock_busy=True,
+                )
+            state = replace(
+                state,
+                slot_limit=pool.slot_limit,
+                allocated_slots=pool.allocated_slots,
+                busy_slots=pool.busy_slots,
+                device_pool_bytes=pool.device_bytes,
+                host_bytes=pool.host_bytes,
+                slot_owners=pool.slot_owners,
+            )
+        return state
 
     def _init_lwd_early_recv_state(self) -> None:
         """提前收收单(与引擎下发的提示、上报的水位同一套键)。
