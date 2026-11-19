@@ -1,9 +1,14 @@
 # LWD communication backlog and NPU memory diagnostics
 
-This diagnostic branch starts sampling on every edge and cloud worker after
-distributed device initialization. It needs no additional environment variables.
-The sampling interval is two seconds. Both scheduling policies use the same
-instrumentation.
+This diagnostic branch prepares its observers after distributed device
+initialization but keeps both reporting and NPU memory queries dormant during
+startup, model loading, and graph capture. The first send/receive submission,
+valid cloud receive hint, or actual request execution activates them. The receive
+hint activates sampling before the receive buffer allocation. A cloud worker without a cross-machine
+channel activates on its first nonempty model step, so every cloud card remains
+covered. It needs no additional environment variables. Once activated, sampling
+continues every two seconds, including during a communication stall. Both
+scheduling policies use the same instrumentation.
 
 ```mermaid
 flowchart LR
@@ -19,8 +24,8 @@ flowchart LR
 
 Search for `[LWD][mem] send role=edge` and `channel=lwd_up` to inspect edge UP
 traffic. `pending` counts futures whose completion has not yet been confirmed by
-the existing communication code. The reporter never calls `done()`, `wait()`, or
-NPU event queries. Consequently, a device operation can finish before the cached
+the existing communication code. The reporter never calls communication-future
+`done()`/`wait()` or NPU event queries. Consequently, a device operation can finish before the cached
 status changes.
 
 `pending_mib` counts the payload bytes retained by those pending futures.
@@ -89,7 +94,7 @@ CPU backlog logs. An increasing `query_running_s`, old `memory_age_s`, or
 
 ## Interpretation
 
-Compare a startup baseline, backlog growth, and the first stall. Growing edge UP
+Compare the first traffic samples, backlog growth, and the first stall. Growing edge UP
 retained bytes accompanied by rising allocation and falling available HBM
 supports send-backlog memory pressure. A large reserved/allocated gap can instead
 mean memory remains in the allocator cache. Correlation alone does not establish
@@ -134,8 +139,13 @@ and purposes are listed for human review:
 | Borrowed receive view | Avoid counting the same tensor twice through future and request references. |
 | Receive submission error | Preserve the original exception and record the affected sequence. |
 | Concurrent submission types | Keep send and receive submission counts separate. |
+| Quiet startup and shutdown | Emit no memory logs or NPU queries before traffic; release dormant threads on stop. |
+| First transfer activation | Activate the observer when the first real communication is submitted. |
+| Non-endpoint cloud activation | Keep empty steps quiet and enable every cloud card on nonempty execution. |
+| Edge activation | Enable sampling before the first embedding while empty steps remain quiet. |
+| Receive-hint activation | Enable sampling before cloud receive-buffer allocation and skip malformed hints. |
 
-All 24 temporary cases and the existing 9 edge-worker, 4 cloud-worker, and 43
+All 29 temporary cases and the existing 9 edge-worker, 4 cloud-worker, and 43
 host-staging CPU tests passed. The repository test files are unchanged. The new module passes
 Ruff check and format; comparison with HEAD found no introduced Ruff diagnostics
 in the touched files. The repository's `bash format.sh ci` / pre-commit checks
@@ -148,3 +158,5 @@ No NPU execution or performance validation has been performed.
 The intent comments and docstrings requiring human review explain why metadata
 must use weak references, why device-memory queries run separately from the
 reporter, and why receive snapshots acquire accounting locks without waiting.
+The traffic gate waits only on diagnostic threads so it cannot stall request
+execution while waiting for the first input.

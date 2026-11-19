@@ -191,6 +191,8 @@ class LwdCloudWorker(NPUWorker):
     # ------------------------------------------------------------------ #
 
     def execute_model(self, scheduler_output):
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            get_lwd_comm_service().activate_memory_diagnostics()
         # [Lwd][perf] worker 开工时刻(与引擎 rpc-enqueue ts 对减 =
         # 下达-开工延迟;各卡开工离散 = 集合对齐成本)
         logger.info(
@@ -575,6 +577,7 @@ class LwdCloudWorker(NPUWorker):
             ):
                 return
             self._early_recv_pending[key] = hint
+        get_lwd_comm_service().activate_memory_diagnostics()
         self._early_recv_pump()
 
     def _early_recv_pump(self) -> None:

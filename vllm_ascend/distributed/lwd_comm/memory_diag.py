@@ -109,6 +109,7 @@ class LwdMemoryDiagnostics:
         self._receive_snapshot = receive_snapshot
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._traffic_started = threading.Event()
         self._submitting: dict[int, _LwdTransferRecord] = {}
         # Weak references must not extend the payload lifetime being measured.
         self._sends: dict[int, _LwdTransferRecord] = {}
@@ -124,6 +125,16 @@ class LwdMemoryDiagnostics:
 
     def stop(self) -> None:
         self._stop.set()
+        self._traffic_started.set()
+
+    def mark_traffic_started(self) -> None:
+        if not self._traffic_started.is_set():
+            self._traffic_started.set()
+
+    def _wait_for_traffic(self) -> bool:
+        """Wait only on diagnostic threads; request execution just signals the gate."""
+        self._traffic_started.wait()
+        return not self._stop.is_set()
 
     def begin_transfer(self, request: LwdCommRequest) -> int:
         if request.op == "send":
@@ -147,6 +158,7 @@ class LwdMemoryDiagnostics:
             token = self._next_token
             self._next_token += 1
             self._submitting[token] = record
+        self.mark_traffic_started()
         return token
 
     def finish_transfer(self, token: int, future: LwdCommFuture) -> None:
@@ -198,6 +210,8 @@ class LwdMemoryDiagnostics:
         return backlogs
 
     def _report_loop(self) -> None:
+        if not self._wait_for_traffic():
+            return
         sample = 0
         while not self._stop.is_set():
             try:
@@ -317,6 +331,8 @@ class LwdMemoryDiagnostics:
         )
 
     def _memory_loop(self) -> None:
+        if not self._wait_for_traffic():
+            return
         # Keep reporting CPU metadata even if a Runtime memory query stalls.
         try:
             torch.npu.set_device(self.device)

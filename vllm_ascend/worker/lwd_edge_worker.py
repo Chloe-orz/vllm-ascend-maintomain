@@ -211,6 +211,7 @@ class LwdEdgeWorker(NPUWorker):
             logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
 
+        self.comm_service.activate_memory_diagnostics()
         batch_meta = lwd_batch.batch_meta
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
             logger.info(

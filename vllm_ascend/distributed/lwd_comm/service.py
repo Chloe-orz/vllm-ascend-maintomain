@@ -60,6 +60,11 @@ class LwdCommService:
             self._memory_diag = LwdMemoryDiagnostics(role, rank, device, receive_snapshot)
         self._memory_diag.start()
 
+    def activate_memory_diagnostics(self) -> None:
+        """Activate all-rank sampling when request execution first begins."""
+        if self._memory_diag is not None:
+            self._memory_diag.mark_traffic_started()
+
     # ------------------------------------------------------------------ #
     # Submission                                                          #
     # ------------------------------------------------------------------ #
