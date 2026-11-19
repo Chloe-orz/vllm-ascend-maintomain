@@ -34,7 +34,7 @@ from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
-from vllm_ascend.distributed.lwd_comm.memory_diag import LwdReceiveMemorySample
+from vllm_ascend.distributed.lwd_comm.memory_diag import log_lwd_memory
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
@@ -137,9 +137,6 @@ class LwdCloudWorker(NPUWorker):
             self._lwd_init_host_stager(self._lwd_up_hidden_size)
             self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
-        get_lwd_comm_service().start_memory_diagnostics(
-            "cloud", self.rank, self.device, self._lwd_recv_memory_snapshot
-        )
 
     def _build_payload_scrambler(self) -> None:
         """Initialize the process-wide scrambler when enabled (else no-op).
@@ -191,8 +188,6 @@ class LwdCloudWorker(NPUWorker):
     # ------------------------------------------------------------------ #
 
     def execute_model(self, scheduler_output):
-        if scheduler_output.total_num_scheduled_tokens > 0:
-            get_lwd_comm_service().activate_memory_diagnostics()
         # [Lwd][perf] worker 开工时刻(与引擎 rpc-enqueue ts 对减 =
         # 下达-开工延迟;各卡开工离散 = 集合对齐成本)
         logger.info(
@@ -225,6 +220,8 @@ class LwdCloudWorker(NPUWorker):
             scheduler_output.total_num_scheduled_tokens,
             len(scheduler_output.num_scheduled_tokens),
         )
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            log_lwd_memory("cloud_forward", device=self.device, role="cloud")
         return output
 
     def _lwd_up_post_recvs(self, scheduler_output) -> None:
@@ -249,48 +246,6 @@ class LwdCloudWorker(NPUWorker):
     # ------------------------------------------------------------------ #
     # 提前收:通信线程(提示下发 -> 挂 recv -> 上报水位)                     #
     # ------------------------------------------------------------------ #
-
-    def _lwd_recv_memory_snapshot(self) -> LwdReceiveMemorySample:
-        state = LwdReceiveMemorySample(
-            engine=self._lwd_engine_index,
-            endpoint=self._lwd_early_recv_endpoint,
-            host_stage=self._lwd_host_stage_enabled,
-            recv_limit=self._early_recv_max_inflight,
-        )
-        if not self._lwd_early_recv_endpoint:
-            return replace(state, inflight=0, queued=0, inflight_main_bytes=0)
-        if self._early_recv_lock.acquire(blocking=False):
-            try:
-                futures = list(self._early_recv_futures.values())
-                state = replace(
-                    state,
-                    inflight=len(futures),
-                    queued=len(self._early_recv_pending),
-                    inflight_main_bytes=sum(future.request.num_elements * 2 for future in futures),
-                    oldest_seqno=futures[0].request.seqno if futures else None,
-                )
-            finally:
-                self._early_recv_lock.release()
-        else:
-            state = replace(state, recv_lock_busy=True)
-        stager = self._lwd_stager
-        if stager is not None:
-            pool = stager.memory_snapshot()
-            if pool is None:
-                return replace(
-                    state, slot_limit=stager.slots, allocated_slots=-1, busy_slots=-1,
-                    device_pool_bytes=-1, host_bytes=-1, stage_lock_busy=True,
-                )
-            state = replace(
-                state,
-                slot_limit=pool.slot_limit,
-                allocated_slots=pool.allocated_slots,
-                busy_slots=pool.busy_slots,
-                device_pool_bytes=pool.device_bytes,
-                host_bytes=pool.host_bytes,
-                slot_owners=pool.slot_owners,
-            )
-        return state
 
     def _init_lwd_early_recv_state(self) -> None:
         """提前收收单(与引擎下发的提示、上报的水位同一套键)。
@@ -577,7 +532,6 @@ class LwdCloudWorker(NPUWorker):
             ):
                 return
             self._early_recv_pending[key] = hint
-        get_lwd_comm_service().activate_memory_diagnostics()
         self._early_recv_pump()
 
     def _early_recv_pump(self) -> None:
@@ -635,6 +589,7 @@ class LwdCloudWorker(NPUWorker):
                     )
                     del self._early_recv_pending[key]
                     continue
+                log_lwd_memory("up_recv_buffer", device=self.device, request=request)
                 del self._early_recv_pending[key]
                 future = get_lwd_comm_service().submit_recv(request)
                 self._early_recv_futures[key] = future
@@ -685,6 +640,7 @@ class LwdCloudWorker(NPUWorker):
                 # ② 已收完、暂存未就绪:继续轮询,不阻塞本线程
                 continue
             arrived = self._lwd_commit_received(future)
+            log_lwd_memory("up_recv_publish", device=self.device, request=future.request)
             # ③ 上报:水位推进 + 逐请求已收行数(两者同时送达)
             done_mq.enqueue((key, arrived) if arrived else key)
             logger.info(

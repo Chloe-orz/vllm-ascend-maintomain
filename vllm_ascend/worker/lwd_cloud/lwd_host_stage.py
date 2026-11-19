@@ -464,16 +464,6 @@ class LwdStagedBatch:
 # ---------------------------------------------------------------------- #
 # The pool                                                                #
 # ---------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class LwdHostStageMemory:
-    slot_limit: int
-    allocated_slots: int
-    busy_slots: int
-    device_bytes: int
-    slot_owners: tuple[int, ...]
-    host_bytes: int
-
-
 class LwdHostStager:
     """Device ping-pong slots + per-request pinned storage.
 
@@ -562,23 +552,6 @@ class LwdHostStager:
     def busy_slots(self) -> list[int]:
         with self._lock:
             return [s for s, owner in self._slot_owner.items() if owner >= 0]
-
-    def memory_snapshot(self) -> LwdHostStageMemory | None:
-        """Read scalar pool accounting without waiting behind an allocation."""
-        if not self._lock.acquire(blocking=False):
-            return None
-        try:
-            owners = tuple(sorted(owner for owner in self._slot_owner.values() if owner >= 0))
-            return LwdHostStageMemory(
-                slot_limit=self.slots,
-                allocated_slots=len(self._slot_buffers),
-                busy_slots=len(owners),
-                device_bytes=sum(buffer.numel() * 2 for buffer in self._slot_buffers.values()),
-                slot_owners=owners,
-                host_bytes=self._host_bytes,
-            )
-        finally:
-            self._lock.release()
 
     def staged_seqnos(self) -> list[int]:
         """Seqnos currently holding a batch descriptor (abort path)."""

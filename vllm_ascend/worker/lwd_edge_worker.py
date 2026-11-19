@@ -28,6 +28,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
     init_lwd_ascend_model_parallel,
 )
+from vllm_ascend.distributed.lwd_comm.memory_diag import log_lwd_memory
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
@@ -157,7 +158,6 @@ class LwdEdgeWorker(NPUWorker):
 
         from vllm_ascend.distributed import lwd_wire
         lwd_wire.init_lwd_duplex_channels()
-        self.comm_service.start_memory_diagnostics("edge", self.rank, self.device)
         logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
@@ -211,7 +211,6 @@ class LwdEdgeWorker(NPUWorker):
             logger.debug("[lwd-edge] step carries no LWD batch; nothing to do")
             return None
 
-        self.comm_service.activate_memory_diagnostics()
         batch_meta = lwd_batch.batch_meta
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
             logger.info(
@@ -607,6 +606,7 @@ class LwdEdgeWorker(NPUWorker):
             # compute_logits 是标准接口,包装层/单体模型都有。
             logits = model.compute_logits(hidden_states)   # (rows_total, V)
             _t_lm = time.monotonic()
+            log_lwd_memory("edge_logits", device=self.device, request=recv_future.request)
             # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
             # top20 逐位对照——排名换位即重放漂移的直接视图。
             try:

@@ -110,22 +110,6 @@ class LwdCommFuture:
     def request(self) -> LwdCommRequest:
         return self._request
 
-    def retained_payload_state(self) -> tuple[LwdCommStatus, int]:
-        """Read cached completion and payload ownership without querying NPU events."""
-        with self._lock:
-            tensors = (
-                (*(self._keepalive or ()), self._request.tensor, self._request.aux_tensor)
-                if self._request.op == "send"
-                else (self._tensor, self._aux_tensor, self._request.recv_buffer)
-            )
-            payloads = {
-                id(tensor): tensor
-                for tensor in tensors
-                if tensor is not None
-            }
-            payload_bytes = sum(tensor.numel() * tensor.element_size() for tensor in payloads.values())
-            return self._status, payload_bytes
-
     def done(self) -> bool:
         """Pure CPU query; never blocks, never touches the device."""
         with self._lock:

@@ -31,8 +31,8 @@ from vllm.logger import logger
 
 from vllm_ascend.distributed import lwd_wire
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
-from vllm_ascend.distributed.lwd_comm.types import LwdCommRequest, LwdChannelType
+from vllm_ascend.distributed.lwd_comm.memory_diag import log_lwd_memory
+from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
 
 def _scramble_seed_for(request: LwdCommRequest) -> int | None:
@@ -178,6 +178,7 @@ class LwdChannel:
             if request.aux_tensor is not None
             else None
         )
+        log_lwd_memory("send_clone", request=request)
         return replace(request, tensor=owned, aux_tensor=aux_owned)
 
     # ------------------------------------------------------------------ #
@@ -305,6 +306,8 @@ class LwdChannel:
     def _finalize_many(futures: list[LwdCommFuture]) -> None:
         for future in futures:
             future._finalize()
+            if future.request.op == "send":
+                log_lwd_memory("send_reap", request=future.request)
 
     # ------------------------------------------------------------------ #
     # Wire execution                                                      #
@@ -497,6 +500,7 @@ class LwdChannel:
                 req.num_elements, dtype=torch.bfloat16, device="npu"
             )
             self._log_down_recv_stage(req, "alloc_return")
+            log_lwd_memory("recv_alloc", request=req)
         elif buffer.numel() != req.num_elements:
             # HCCL P2P would fail on a mismatch, and a silent short/long
             # buffer desynchronises the counterpart's isend; assert here
@@ -515,6 +519,7 @@ class LwdChannel:
                 dtype=req.aux_dtype or torch.int64,
                 device="npu",
             )
+            log_lwd_memory("recv_aux_alloc", request=req)
         elif req.aux_num_elements > 0:
             raise RuntimeError("aux payload is only supported on the UP channel")
         with torch.profiler.record_function(
