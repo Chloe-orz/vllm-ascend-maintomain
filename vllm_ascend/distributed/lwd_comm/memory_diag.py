@@ -51,11 +51,13 @@ def log_lwd_memory(
             time.monotonic(),
         )
         return
+    used_bytes = total_bytes - free_bytes
+    reserved_bytes = stats.get("reserved_bytes.all.current", -_MIB)
+    non_torch_est_mib = (used_bytes - reserved_bytes) / _MIB if reserved_bytes >= 0 else -1.0
     logger.info(
         "[LWD][mem] event stage=%s role=%s rank=%d device=%s channel=%s "
-        "op=%s engine=%s seqno=%s numel=%s hbm_free_mib=%.3f hbm_total_mib=%.3f "
-        "allocated_mib=%.3f reserved_mib=%.3f active_mib=%.3f "
-        "peak_allocated_mib=%.3f allocation_retries=%d ooms=%d "
+        "op=%s engine=%s seqno=%s numel=%s reserved_mib=%.3f "
+        "non_torch_est_mib=%.3f hbm_used_mib=%.3f "
         "query_ms=%.3f wall=%.3f ts=%.6f",
         stage,
         role,
@@ -66,14 +68,9 @@ def log_lwd_memory(
         engine,
         seqno,
         numel,
-        free_bytes / _MIB,
-        total_bytes / _MIB,
-        stats.get("allocated_bytes.all.current", -_MIB) / _MIB,
-        stats.get("reserved_bytes.all.current", -_MIB) / _MIB,
-        stats.get("active_bytes.all.current", -_MIB) / _MIB,
-        stats.get("allocated_bytes.all.peak", -_MIB) / _MIB,
-        stats.get("num_alloc_retries", -1),
-        stats.get("num_ooms", -1),
+        reserved_bytes / _MIB,
+        non_torch_est_mib,
+        used_bytes / _MIB,
         (time.monotonic() - started) * 1000,
         time.time(),
         time.monotonic(),
